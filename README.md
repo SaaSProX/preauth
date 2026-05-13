@@ -1,12 +1,14 @@
-# Aman HMO Pre-Authorization Agent
+# PreAuth
 
-An AI-powered system that automates pre-authorization processing for Aman HMO. The agent evaluates requests against plan rules, patient eligibility, and utilization limits to deliver instant approve/deny/escalate decisions.
+AI-powered pre-authorization automation for Health Maintenance Organizations (HMOs) in Nigeria.
 
 ## Overview
 
+PreAuth is an intelligent agent that automates the pre-authorization workflow for health insurance claims. It evaluates requests against plan rules, patient eligibility, and utilization limits to deliver instant approve/deny/escalate decisions — reducing processing time from hours to seconds.
+
 ```
 ┌─────────────────┐      ┌─────────────────┐      ┌─────────────────┐
-│   Aman System   │ ───▶ │  Webhook API    │ ───▶ │  Claude Agent   │
+│   HMO System    │ ───▶ │  Webhook API    │ ───▶ │   AI Agent      │
 │  (Pre-Auth Req) │      │  (FastAPI)      │      │  (Decision)     │
 └─────────────────┘      └─────────────────┘      └────────┬────────┘
                                                            │
@@ -14,49 +16,49 @@ An AI-powered system that automates pre-authorization processing for Aman HMO. T
                     │                                      │                  │
                     ▼                                      ▼                  ▼
            ┌───────────────┐                    ┌─────────────────┐   ┌──────────────┐
-           │   Aman DB     │                    │  Dashboard DB   │   │    Email     │
-           │   (MySQL)     │                    │  (PostgreSQL)   │   │ Notification │
+           │    HMO DB     │                    │  Dashboard DB   │   │ Notification │
+           │   (MySQL)     │                    │  (PostgreSQL)   │   │   Service    │
            └───────────────┘                    └─────────────────┘   └──────────────┘
 ```
 
 ## How It Works
 
-1. **Receive** — Webhook receives pre-auth request from Aman's system
-2. **Fetch** — Agent retrieves patient data, plan details, and utilization from Aman DB
-3. **Evaluate** — Agent applies plan rules from the knowledge base
-4. **Decide** — Returns `approved`, `denied`, or `escalated` with reasoning
-5. **Notify** — Sends email notification to the provider
-6. **Log** — Records all steps for audit trail and dashboard
+1. **Receive** — Webhook receives pre-auth request from HMO's existing system
+2. **Fetch** — Agent retrieves patient data, plan details, and utilization history
+3. **Evaluate** — Agent applies plan-specific rules from the knowledge base
+4. **Decide** — Returns `approved`, `denied`, or `escalated` with clear reasoning
+5. **Notify** — Sends notification to the healthcare provider
+6. **Log** — Records all steps for audit trail and analytics
 
-## Plan Tiers
+## Features
 
-| Plan | Annual Max | Pre-Auth Required |
-|------|------------|-------------------|
-| Bronze | ₦1,000,000 | Yes |
-| Silver | ₦1,700,000 | Yes |
-| Gold | ₦2,500,000 | Yes |
-| Platinum | ₦3,500,000 | Yes |
-| Platinum Plus | ₦5,000,000 | No (Express Card) |
+- **Instant Decisions** — Sub-minute processing vs hours of manual review
+- **Configurable Rules** — Each HMO defines their own plans, limits, and exclusions
+- **Full Audit Trail** — Every decision logged with reasoning for compliance
+- **Escalation Handling** — Edge cases flagged for human review
+- **Multi-HMO Support** — Single deployment, multiple HMO configurations
 
-## Decision Rules
+## Decision Logic
 
-**Auto-Approve:**
+The agent evaluates each request against the HMO's knowledge base:
+
+**Auto-Approve when:**
 - Procedure is covered under patient's plan
-- Amount is within remaining limit
+- Amount is within remaining benefit limit
 - No waiting period or exclusion applies
-- Platinum Plus members (no pre-auth required)
+- Plan type allows automatic approval
 
-**Auto-Deny:**
+**Auto-Deny when:**
 - Procedure is globally excluded
-- Exceeds plan limit or benefit cap
-- Within waiting period (chronic: 6mo, pregnancy: 9mo, surgery: 12mo)
-- Session/frequency limits exceeded (ICU days, CT/MRI scans, etc.)
+- Benefit limit exceeded
+- Within waiting period for the service category
+- Session/frequency limits exceeded
 
-**Escalate:**
-- High-cost major surgery
-- Remaining annual limit below 20%
+**Escalate when:**
+- High-cost procedures requiring review
+- Patient near annual limit threshold
 - Ambiguous procedure mapping
-- Multiple risk flags
+- Multiple risk indicators present
 
 ## Project Structure
 
@@ -65,16 +67,18 @@ preauth/
 ├── main.py              # FastAPI application entry point
 ├── requirements.txt     # Python dependencies
 ├── migrate.sql          # Dashboard database schema
+├── kb/                  # Knowledge base configs (per HMO)
+│   └── {hmo}_plans.json
 ├── agent/
-│   ├── agent.py         # Claude agent loop and tool execution
-│   ├── prompts.py       # System prompt with knowledge base
-│   └── tools.py         # Tool definitions for the agent
+│   ├── agent.py         # AI agent loop and tool execution
+│   ├── prompts.py       # System prompt builder
+│   └── tools.py         # Tool definitions
 ├── config/
 │   └── settings.py      # Environment configuration
 ├── models/
 │   └── schemas.py       # Pydantic models
 ├── services/
-│   └── db.py            # Database connection utilities
+│   └── db.py            # Database utilities
 └── webhook/
     └── router.py        # Webhook endpoint handler
 ```
@@ -84,26 +88,23 @@ preauth/
 ### Prerequisites
 
 - Python 3.11+
-- Access to Aman MySQL database
-- PostgreSQL for dashboard logging
+- PostgreSQL (dashboard/logging)
+- Access to HMO's patient database
 - Anthropic API key
 
 ### Installation
 
 ```bash
-# Clone the repository
 git clone https://github.com/SaaSProX/preauth.git
 cd preauth
 
-# Create virtual environment
 python -m venv venv
 source venv/bin/activate
 
-# Install dependencies
 pip install -r requirements.txt
 
-# Set up dashboard database
-psql -d your_dashboard_db -f migrate.sql
+# Initialize dashboard database
+psql -d preauth_dashboard -f migrate.sql
 ```
 
 ### Configuration
@@ -111,20 +112,20 @@ psql -d your_dashboard_db -f migrate.sql
 Create a `.env` file:
 
 ```env
-# Anthropic
+# AI Provider
 ANTHROPIC_API_KEY=sk-ant-...
 
-# Aman Database (MySQL)
-AMAN_DB_HOST=
-AMAN_DB_PORT=3306
-AMAN_DB_USER=
-AMAN_DB_PASSWORD=
-AMAN_DB_NAME=
+# HMO Database (MySQL)
+HMO_DB_HOST=
+HMO_DB_PORT=3306
+HMO_DB_USER=
+HMO_DB_PASSWORD=
+HMO_DB_NAME=
 
 # Webhook Security
-WEBHOOK_SECRET=your-shared-secret
+WEBHOOK_SECRET=
 
-# Email (Gmail)
+# Notifications (Gmail)
 GMAIL_CLIENT_ID=
 GMAIL_CLIENT_SECRET=
 GMAIL_REFRESH_TOKEN=
@@ -142,29 +143,28 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
 
 ## API
 
-### Webhook Endpoint
+### Submit Pre-Auth Request
 
 ```
 POST /webhook/preauth
 ```
 
-**Request:**
 ```json
 {
   "request_id": "REQ-2024-001234",
   "patient_id": "PAT-5678",
-  "secret": "your-shared-secret"
+  "secret": "webhook-secret"
 }
 ```
 
-**Response:**
+Response (immediate):
 ```json
 {
   "status": "received"
 }
 ```
 
-The request is acknowledged immediately and processed in the background.
+Processing happens asynchronously. Results are written to the HMO database and notifications sent to providers.
 
 ### Health Check
 
@@ -172,6 +172,19 @@ The request is acknowledged immediately and processed in the background.
 GET /health
 ```
 
+## Adding a New HMO
+
+1. Create knowledge base file: `kb/{hmo_name}_plans.json`
+2. Define plans, limits, exclusions, and decision rules
+3. Configure database connection for the HMO
+4. Set up webhook integration with HMO's system
+
+See `kb/example_plans.json` for the schema structure.
+
+## Current Pilot
+
+**Aman HMO** — First integration partner for pilot testing.
+
 ## License
 
-Proprietary — Aman HMO / SaaSProX
+Proprietary — SaaSProX
