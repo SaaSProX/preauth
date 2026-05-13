@@ -187,4 +187,4 @@ See `kb/example_plans.json` for the schema structure.
 
 ## License
 
-Proprietary — SaaSProX
+Proprietary — Saaspro Labs
