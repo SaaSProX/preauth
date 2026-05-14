@@ -1,12 +1,17 @@
-from fastapi import APIRouter, HTTPException, Depends
+import json
+import secrets
+import asyncio
+
+from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel
-from services.db import pg_execute, pg_query_one
+from services.db import pg_execute, pg_query_all, pg_query_one
+from services.invites import build_invite_link
+from services.notifier import EmailDeliveryError, send_invite_email
 from auth.utils import (
     hash_password, verify_password,
     generate_api_key, generate_session_token,
     verify_session_token
 )
-import secrets
 
 router = APIRouter(prefix="/auth")
 
@@ -27,6 +32,12 @@ class LoginPayload(BaseModel):
 
 class TeamInvitePayload(BaseModel):
     email: str
+
+
+def parse_json_field(value):
+    if isinstance(value, str):
+        return json.loads(value)
+    return value
 
 
 # ─────────────────────────────────────────────
@@ -64,7 +75,12 @@ async def register(payload: RegisterPayload):
     # Mark invite used
     await pg_execute("UPDATE invites SET used = TRUE WHERE token = $1", payload.invite_token)
 
-    return {"message": "Registration successful"}
+    org = await pg_query_one("SELECT name FROM organizations WHERE id = $1", invite["org_id"])
+
+    return {
+        "message": "Registration successful",
+        "org_name": org["name"] if org else None
+    }
 
 
 # ─────────────────────────────────────────────
@@ -73,7 +89,15 @@ async def register(payload: RegisterPayload):
 
 @router.post("/login")
 async def login(payload: LoginPayload):
-    client = await pg_query_one("SELECT * FROM clients WHERE email = $1", payload.email)
+    client = await pg_query_one(
+        """
+        SELECT clients.*, organizations.name AS org_name
+        FROM clients
+        LEFT JOIN organizations ON organizations.id = clients.org_id
+        WHERE clients.email = $1
+        """,
+        payload.email
+    )
 
     if not client or not verify_password(payload.password, client["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -86,44 +110,120 @@ async def login(payload: LoginPayload):
     return {
         "token": token,
         "role": client["role"],
-        "name": client["name"]
+        "name": client["name"],
+        "org_name": client["org_name"]
     }
 
 
 # ─────────────────────────────────────────────
-# Generate API key (admin only)
+# Generate API key (user-owned)
 # ─────────────────────────────────────────────
 
+@router.get("/api-key")
+async def get_user_api_key(claims: dict = Depends(verify_session_token)):
+    api_client = await pg_query_one(
+        """
+        SELECT id, created_at
+        FROM api_clients
+        WHERE org_id = $1 AND user_id = $2 AND is_active = TRUE
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        claims["org_id"], int(claims["sub"])
+    )
+
+    if not api_client:
+        return {"has_api_key": False}
+
+    return {
+        "has_api_key": True,
+        "masked_api_key": "*****",
+        "created_at": api_client["created_at"],
+    }
+
+
 @router.post("/api-key/generate")
-async def generate_org_api_key(claims: dict = Depends(verify_session_token)):
-    if claims["role"] != "admin":
-        raise HTTPException(status_code=403, detail="Only admins can generate API keys")
-
+async def generate_user_api_key(claims: dict = Depends(verify_session_token)):
     org_id = claims["org_id"]
-    existing_api_key = await pg_query_one(
-        "SELECT id FROM api_clients WHERE org_id = $1 AND is_active = TRUE",
-        org_id
+    user_id = int(claims["sub"])
+    client = await pg_query_one(
+        """
+        SELECT clients.name, clients.email, organizations.name AS org_name
+        FROM clients
+        JOIN organizations ON organizations.id = clients.org_id
+        WHERE clients.id = $1 AND clients.org_id = $2
+          AND clients.is_active = TRUE AND organizations.is_active = TRUE
+        """,
+        user_id, org_id
     )
-    if existing_api_key:
-        raise HTTPException(status_code=409, detail="API key already generated for this organization")
+    if not client:
+        raise HTTPException(status_code=404, detail="User or organization not found")
 
-    org = await pg_query_one(
-        "SELECT name FROM organizations WHERE id = $1 AND is_active = TRUE",
-        org_id
+    await pg_execute(
+        "DELETE FROM api_clients WHERE org_id = $1 AND user_id = $2 AND is_active = TRUE",
+        org_id, user_id
     )
-    if not org:
-        raise HTTPException(status_code=404, detail="Organization not found")
 
     api_key = generate_api_key()
-    await pg_execute(
-        "INSERT INTO api_clients (org_id, client_name, api_key) VALUES ($1, $2, $3)",
-        org_id, org["name"], api_key
+    api_client = await pg_query_one(
+        """
+        INSERT INTO api_clients (org_id, user_id, client_name, api_key)
+        VALUES ($1, $2, $3, $4)
+        RETURNING created_at
+        """,
+        org_id, user_id, f"{client['name']} ({client['email']})", api_key
     )
 
     return {
         "message": "API key generated",
         "api_key": api_key,
+        "created_at": api_client["created_at"],
         "note": "Save your API key — it won't be shown again"
+    }
+
+
+@router.delete("/api-key")
+async def revoke_user_api_key(claims: dict = Depends(verify_session_token)):
+    await pg_execute(
+        "DELETE FROM api_clients WHERE org_id = $1 AND user_id = $2 AND is_active = TRUE",
+        claims["org_id"], int(claims["sub"])
+    )
+
+    return {"message": "API key revoked"}
+
+
+# ─────────────────────────────────────────────
+# Incoming pre-auth payloads (admin only)
+# ─────────────────────────────────────────────
+
+@router.get("/preauth-payloads")
+async def list_preauth_payloads(claims: dict = Depends(verify_session_token)):
+    if claims["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can view incoming payloads")
+
+    rows = await pg_query_all(
+        """
+        SELECT request_id, patient_id, status, received_at, raw_payload, extracted_fields
+        FROM preauth_logs
+        WHERE org_id = $1
+        ORDER BY received_at DESC
+        LIMIT 20
+        """,
+        claims["org_id"]
+    )
+
+    return {
+        "payloads": [
+            {
+                "request_id": row["request_id"],
+                "patient_id": row["patient_id"],
+                "status": row["status"],
+                "received_at": row["received_at"],
+                "raw_payload": parse_json_field(row["raw_payload"]) if row["raw_payload"] else None,
+                "extracted_fields": parse_json_field(row["extracted_fields"]) if row["extracted_fields"] else None,
+            }
+            for row in rows
+        ]
     }
 
 
@@ -131,11 +231,90 @@ async def generate_org_api_key(claims: dict = Depends(verify_session_token)):
 # Invite team member (admin only)
 # ─────────────────────────────────────────────
 
+@router.get("/team")
+async def list_team_members(claims: dict = Depends(verify_session_token)):
+    if claims["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can view team members")
+
+    rows = await pg_query_all(
+        """
+        SELECT name, email, role, created_at, 'active' AS status
+        FROM clients
+        WHERE org_id = $1 AND is_active = TRUE
+
+        UNION ALL
+
+        SELECT email AS name, email, role, created_at, 'pending' AS status
+        FROM invites
+        WHERE org_id = $1 AND used = FALSE
+
+        ORDER BY created_at DESC
+        """,
+        claims["org_id"]
+    )
+
+    return {
+        "members": [
+            {
+                "name": row["name"],
+                "email": row["email"],
+                "role": row["role"],
+                "status": row["status"],
+                "created_at": row["created_at"],
+                "can_delete": row["email"] != claims["email"],
+            }
+            for row in rows
+        ]
+    }
+
+
+@router.delete("/team-member/{email}")
+async def delete_team_member(email: str, claims: dict = Depends(verify_session_token)):
+    if claims["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can delete team members")
+
+    if email == claims["email"]:
+        raise HTTPException(status_code=400, detail="You cannot delete your own account")
+
+    deleted_invite = await pg_query_one(
+        "DELETE FROM invites WHERE org_id = $1 AND email = $2 AND used = FALSE RETURNING id",
+        claims["org_id"], email
+    )
+    if deleted_invite:
+        return {"message": f"Pending invite deleted for {email}"}
+
+    member = await pg_query_one(
+        "SELECT id FROM clients WHERE org_id = $1 AND email = $2 AND is_active = TRUE",
+        claims["org_id"], email
+    )
+    if not member:
+        raise HTTPException(status_code=404, detail="Team member not found")
+
+    await pg_execute(
+        "DELETE FROM api_clients WHERE org_id = $1 AND user_id = $2",
+        claims["org_id"], member["id"]
+    )
+    await pg_execute(
+        "UPDATE clients SET is_active = FALSE WHERE id = $1",
+        member["id"]
+    )
+
+    return {"message": f"Team member deleted: {email}"}
+
+
 @router.post("/invite-member")
-async def invite_member(payload: TeamInvitePayload, claims: dict = Depends(verify_session_token)):
+async def invite_member(request: Request, claims: dict = Depends(verify_session_token)):
     # Only admins can invite
     if claims["role"] != "admin":
         raise HTTPException(status_code=403, detail="Only admins can invite team members")
+
+    try:
+        body = await request.json()
+        if isinstance(body, str):
+            body = json.loads(body)
+        payload = TeamInvitePayload(**body)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Request body must include an email")
 
     # Check not already invited or registered
     existing_invite = await pg_query_one("SELECT id FROM invites WHERE email = $1", payload.email)
@@ -156,14 +335,35 @@ async def invite_member(payload: TeamInvitePayload, claims: dict = Depends(verif
         claims["org_id"], payload.email, token, int(claims["sub"])
     )
 
-    invite_link = f"https://your-dashboard.com/register?token={token}&email={payload.email}"
+    invite_link = build_invite_link(token, payload.email)
+    inviter = await pg_query_one(
+        """
+        SELECT clients.name AS inviter_name, organizations.name AS org_name
+        FROM clients
+        JOIN organizations ON organizations.id = clients.org_id
+        WHERE clients.id = $1 AND clients.org_id = $2
+        """,
+        int(claims["sub"]), claims["org_id"]
+    )
 
-    # TODO: send invite_link via email to payload.email
-    print(f"[Invite] {payload.email} → {invite_link}")
+    try:
+        email_result = await asyncio.to_thread(
+            send_invite_email,
+            payload.email,
+            invite_link,
+            inviter["org_name"] if inviter else "your organization",
+            inviter["inviter_name"] if inviter else None
+        )
+    except EmailDeliveryError as exc:
+        return {
+            "message": f"Invite created for {payload.email}, but email was not sent: {exc}",
+            "email_sent": False,
+        }
 
     return {
-        "message": f"Invite sent to {payload.email}",
-        "invite_link": invite_link  # remove this in production, send via email only
+        "message": f"Invite email sent to {payload.email}",
+        "email_sent": True,
+        "email_id": email_result.get("id")
     }
 
 
@@ -174,7 +374,13 @@ async def invite_member(payload: TeamInvitePayload, claims: dict = Depends(verif
 @router.get("/me")
 async def me(claims: dict = Depends(verify_session_token)):
     client = await pg_query_one(
-        "SELECT id, name, email, role, created_at FROM clients WHERE id = $1",
+        """
+        SELECT clients.id, clients.name, clients.email, clients.role, clients.created_at,
+               organizations.name AS org_name
+        FROM clients
+        LEFT JOIN organizations ON organizations.id = clients.org_id
+        WHERE clients.id = $1
+        """,
         int(claims["sub"])
     )
     if not client:

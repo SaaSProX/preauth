@@ -37,11 +37,14 @@ CREATE TABLE IF NOT EXISTS invites (
 CREATE TABLE IF NOT EXISTS api_clients (
     id              SERIAL PRIMARY KEY,
     org_id          INT REFERENCES organizations(id),
+    user_id         INT REFERENCES clients(id),
     client_name     VARCHAR(100) NOT NULL,
     api_key         VARCHAR(100) NOT NULL UNIQUE,
     is_active       BOOLEAN DEFAULT TRUE,
     created_at      TIMESTAMP DEFAULT NOW()
 );
+
+ALTER TABLE api_clients ADD COLUMN IF NOT EXISTS user_id INT REFERENCES clients(id);
 
 -- Every incoming webhook request
 CREATE TABLE IF NOT EXISTS preauth_logs (
@@ -49,9 +52,14 @@ CREATE TABLE IF NOT EXISTS preauth_logs (
     org_id          INT REFERENCES organizations(id),
     request_id      VARCHAR(100) NOT NULL UNIQUE,
     patient_id      VARCHAR(100) NOT NULL,
+    raw_payload     JSONB,
+    extracted_fields JSONB,
     received_at     TIMESTAMP DEFAULT NOW(),
     status          VARCHAR(20) DEFAULT 'pending'   -- pending | processing | completed | failed
 );
+
+ALTER TABLE preauth_logs ADD COLUMN IF NOT EXISTS raw_payload JSONB;
+ALTER TABLE preauth_logs ADD COLUMN IF NOT EXISTS extracted_fields JSONB;
 
 -- Every agent tool call (for dashboard timeline)
 CREATE TABLE IF NOT EXISTS agent_steps (
@@ -89,4 +97,6 @@ CREATE INDEX IF NOT EXISTS idx_agent_steps_request_id ON agent_steps(request_id)
 CREATE INDEX IF NOT EXISTS idx_decisions_decided_at ON decisions(decided_at DESC);
 CREATE INDEX IF NOT EXISTS idx_preauth_logs_status ON preauth_logs(status);
 CREATE INDEX IF NOT EXISTS idx_preauth_logs_org_id ON preauth_logs(org_id);
+CREATE INDEX IF NOT EXISTS idx_preauth_logs_received_at ON preauth_logs(received_at DESC);
 CREATE INDEX IF NOT EXISTS idx_clients_org_id ON clients(org_id);
+CREATE INDEX IF NOT EXISTS idx_api_clients_user_id ON api_clients(user_id);

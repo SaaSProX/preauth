@@ -136,10 +136,12 @@ HMO_DB_NAME=
 # Webhook Security
 WEBHOOK_SECRET=
 
-# Notifications (Gmail)
-GMAIL_CLIENT_ID=
-GMAIL_CLIENT_SECRET=
-GMAIL_REFRESH_TOKEN=
+# Dashboard
+DASHBOARD_BASE_URL=http://localhost:3000
+
+# Notifications (Resend)
+RESEND_API_KEY=
+RESEND_FROM_EMAIL="Saaspro Lab <no-reply@saasprolabs.io>"
 ```
 
 ### Running Locally

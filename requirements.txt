@@ -10,3 +10,4 @@ pyjwt
 bcrypt
 pyjwt
 python-multipart
+certifi

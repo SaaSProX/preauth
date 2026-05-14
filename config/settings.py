@@ -19,11 +19,12 @@ class Settings(BaseSettings):
 
     jwt_secret: str = ""
 
- 
-    # Email (Gmail OAuth)
-    gmail_client_id: str = ""
-    gmail_client_secret: str = ""
-    gmail_refresh_token: str = ""
+    # Dashboard
+    dashboard_base_url: str = "http://localhost:3000"
+
+    # Email (Resend)
+    resend_api_key: str = ""
+    resend_from_email: str = ""
  
     model_config = {"env_file": ".env", "extra": "ignore"}
  
