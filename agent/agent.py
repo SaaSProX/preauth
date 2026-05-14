@@ -3,7 +3,7 @@ import anthropic
 from agent.tools import TOOLS
 from agent.prompts import SYSTEM_PROMPT
 from services import db
-from services import email
+from services import notifier
 
 client = anthropic.Anthropic()
 
@@ -29,7 +29,7 @@ async def execute_tool(name: str, inputs: dict):
         return {"status": "updated"}
 
     elif name == "send_notification":
-        email.send_email(inputs["to"], inputs["subject"], inputs["body"])
+        notifier.send_email(inputs["to"], inputs["subject"], inputs["body"])
         return {"status": "sent"}
 
 async def run(patient_id: str, request_id: str):

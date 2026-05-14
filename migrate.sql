@@ -41,6 +41,14 @@ CREATE TABLE IF NOT EXISTS notifications (
     sent_at         TIMESTAMP DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS api_clients (
+    id          SERIAL PRIMARY KEY,
+    client_name VARCHAR(100) NOT NULL,
+    api_key     VARCHAR(100) NOT NULL UNIQUE,
+    is_active   BOOLEAN DEFAULT TRUE,
+    created_at  TIMESTAMP DEFAULT NOW()
+);
+
 -- Indexes for dashboard queries
 CREATE INDEX IF NOT EXISTS idx_agent_steps_request_id ON agent_steps(request_id);
 CREATE INDEX IF NOT EXISTS idx_decisions_decided_at ON decisions(decided_at DESC);
