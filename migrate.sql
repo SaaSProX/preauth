@@ -1,13 +1,56 @@
 -- Our PostgreSQL schema
 -- Run once to set up the dashboard DB
 
+-- Organizations (Aman HMO and future clients)
+CREATE TABLE IF NOT EXISTS organizations (
+    id              SERIAL PRIMARY KEY,
+    name            VARCHAR(100) NOT NULL,
+    is_active       BOOLEAN DEFAULT TRUE,
+    created_at      TIMESTAMP DEFAULT NOW()
+);
+
+-- Clients (users — admin or member)
+CREATE TABLE IF NOT EXISTS clients (
+    id              SERIAL PRIMARY KEY,
+    org_id          INT REFERENCES organizations(id),
+    name            VARCHAR(100) NOT NULL,
+    email           VARCHAR(100) NOT NULL UNIQUE,
+    password_hash   VARCHAR(255) NOT NULL,
+    role            VARCHAR(20) DEFAULT 'member',  -- admin | member
+    is_active       BOOLEAN DEFAULT TRUE,
+    created_at      TIMESTAMP DEFAULT NOW()
+);
+
+-- Invites (you invite admin, admin invites members)
+CREATE TABLE IF NOT EXISTS invites (
+    id              SERIAL PRIMARY KEY,
+    org_id          INT REFERENCES organizations(id),
+    email           VARCHAR(100) NOT NULL UNIQUE,
+    token           VARCHAR(100) NOT NULL UNIQUE,
+    role            VARCHAR(20) DEFAULT 'member',       -- admin | member
+    invited_by      INT REFERENCES clients(id),         -- NULL if you invited the admin
+    used            BOOLEAN DEFAULT FALSE,
+    created_at      TIMESTAMP DEFAULT NOW()
+);
+
+-- API keys (one per org)
+CREATE TABLE IF NOT EXISTS api_clients (
+    id              SERIAL PRIMARY KEY,
+    org_id          INT REFERENCES organizations(id),
+    client_name     VARCHAR(100) NOT NULL,
+    api_key         VARCHAR(100) NOT NULL UNIQUE,
+    is_active       BOOLEAN DEFAULT TRUE,
+    created_at      TIMESTAMP DEFAULT NOW()
+);
+
 -- Every incoming webhook request
 CREATE TABLE IF NOT EXISTS preauth_logs (
     id              SERIAL PRIMARY KEY,
+    org_id          INT REFERENCES organizations(id),
     request_id      VARCHAR(100) NOT NULL UNIQUE,
     patient_id      VARCHAR(100) NOT NULL,
     received_at     TIMESTAMP DEFAULT NOW(),
-    status          VARCHAR(20) DEFAULT 'processing'  -- processing | completed | failed
+    status          VARCHAR(20) DEFAULT 'pending'   -- pending | processing | completed | failed
 );
 
 -- Every agent tool call (for dashboard timeline)
@@ -41,15 +84,9 @@ CREATE TABLE IF NOT EXISTS notifications (
     sent_at         TIMESTAMP DEFAULT NOW()
 );
 
-CREATE TABLE IF NOT EXISTS api_clients (
-    id          SERIAL PRIMARY KEY,
-    client_name VARCHAR(100) NOT NULL,
-    api_key     VARCHAR(100) NOT NULL UNIQUE,
-    is_active   BOOLEAN DEFAULT TRUE,
-    created_at  TIMESTAMP DEFAULT NOW()
-);
-
--- Indexes for dashboard queries
+-- Indexes
 CREATE INDEX IF NOT EXISTS idx_agent_steps_request_id ON agent_steps(request_id);
 CREATE INDEX IF NOT EXISTS idx_decisions_decided_at ON decisions(decided_at DESC);
 CREATE INDEX IF NOT EXISTS idx_preauth_logs_status ON preauth_logs(status);
+CREATE INDEX IF NOT EXISTS idx_preauth_logs_org_id ON preauth_logs(org_id);
+CREATE INDEX IF NOT EXISTS idx_clients_org_id ON clients(org_id);
