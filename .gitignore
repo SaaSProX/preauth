@@ -17,8 +17,6 @@ venv/
 .venv/
 env/
 
-# KB (contains sensitive plan data)
-kb/
 
 # IDE
 .vscode/
