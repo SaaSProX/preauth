@@ -1,0 +1,36 @@
+# Production compose file for the droplet
+# Copy to /opt/preauth/docker-compose.yml on the server
+
+services:
+  preauth:
+    image: ghcr.io/saasprox/preauth:latest
+    container_name: preauth
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - preauth
+
+volumes:
+  caddy_data:
+  caddy_config:

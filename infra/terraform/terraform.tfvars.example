@@ -1,0 +1,11 @@
+# Copy this to terraform.tfvars and fill in values
+# DO NOT commit terraform.tfvars to git
+
+do_token     = "dop_v1_xxx"
+ssh_key_name = "my-ssh-key"
+region       = "lon1"         # London
+droplet_size = "s-1vcpu-1gb"  # $6/mo
+environment  = "prod"
+
+# Restrict SSH access to your IP
+ssh_allowed_ips = ["YOUR_IP/32"]

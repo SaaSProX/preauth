@@ -1,0 +1,9 @@
+# Replace with your domain
+# preauth.yourdomain.com {
+#     reverse_proxy preauth:8000
+# }
+
+# For IP-only access (no HTTPS)
+:80 {
+    reverse_proxy preauth:8000
+}
