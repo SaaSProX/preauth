@@ -78,7 +78,7 @@ async def receive_preauth(
     )
 
     # Kick off agent in background
-    # background.add_task(agent.run, patient_id, request_id)
+    background.add_task(agent.run, patient_id, request_id)
     return {
         "status": "received",
         "request_id": str(request_id),

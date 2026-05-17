@@ -60,6 +60,11 @@ CREATE TABLE IF NOT EXISTS preauth_logs (
 
 ALTER TABLE preauth_logs ADD COLUMN IF NOT EXISTS raw_payload JSONB;
 ALTER TABLE preauth_logs ADD COLUMN IF NOT EXISTS extracted_fields JSONB;
+ALTER TABLE preauth_logs ADD COLUMN IF NOT EXISTS agent_step TEXT;
+ALTER TABLE preauth_logs ADD COLUMN IF NOT EXISTS decision TEXT;
+ALTER TABLE preauth_logs ADD COLUMN IF NOT EXISTS agent_result JSONB;
+ALTER TABLE preauth_logs ADD COLUMN IF NOT EXISTS error_message TEXT;
+ALTER TABLE preauth_logs ADD COLUMN IF NOT EXISTS processed_at TIMESTAMPTZ;
 
 -- Every agent tool call (for dashboard timeline)
 CREATE TABLE IF NOT EXISTS agent_steps (
@@ -70,6 +75,17 @@ CREATE TABLE IF NOT EXISTS agent_steps (
     tool_input      JSONB,
     tool_result     JSONB,
     executed_at     TIMESTAMP DEFAULT NOW()
+);
+
+-- Every agent pipeline result (for dashboard timeline)
+CREATE TABLE IF NOT EXISTS agent_logs (
+    id              SERIAL PRIMARY KEY,
+    request_id      VARCHAR(100) NOT NULL REFERENCES preauth_logs(request_id),
+    agent_num       INT NOT NULL,
+    agent_name      VARCHAR(100) NOT NULL,
+    status          VARCHAR(20) NOT NULL,
+    result          JSONB,
+    logged_at       TIMESTAMPTZ DEFAULT NOW()
 );
 
 -- Final decision per request
@@ -94,9 +110,12 @@ CREATE TABLE IF NOT EXISTS notifications (
 
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_agent_steps_request_id ON agent_steps(request_id);
+CREATE INDEX IF NOT EXISTS idx_agent_logs_request_id ON agent_logs(request_id);
+CREATE INDEX IF NOT EXISTS idx_agent_logs_logged_at ON agent_logs(logged_at DESC);
 CREATE INDEX IF NOT EXISTS idx_decisions_decided_at ON decisions(decided_at DESC);
 CREATE INDEX IF NOT EXISTS idx_preauth_logs_status ON preauth_logs(status);
 CREATE INDEX IF NOT EXISTS idx_preauth_logs_org_id ON preauth_logs(org_id);
 CREATE INDEX IF NOT EXISTS idx_preauth_logs_received_at ON preauth_logs(received_at DESC);
+CREATE INDEX IF NOT EXISTS idx_preauth_logs_processed_at ON preauth_logs(processed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_clients_org_id ON clients(org_id);
 CREATE INDEX IF NOT EXISTS idx_api_clients_user_id ON api_clients(user_id);
