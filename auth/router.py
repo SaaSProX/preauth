@@ -1,6 +1,7 @@
 import json
 import secrets
 import asyncio
+from datetime import date, datetime, time, timedelta
 
 from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel
@@ -36,8 +37,86 @@ class TeamInvitePayload(BaseModel):
 
 def parse_json_field(value):
     if isinstance(value, str):
-        return json.loads(value)
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError:
+            return value
     return value
+
+
+def _first_item(fields):
+    if not isinstance(fields, dict):
+        return {}
+
+    items = (
+        fields.get("items")
+        or fields.get("requested_items")
+        or fields.get("requestedItems")
+        or fields.get("services")
+        or fields.get("procedures")
+        or fields.get("line_items")
+        or []
+    )
+    items = parse_json_field(items)
+
+    if isinstance(items, list) and items and isinstance(items[0], dict):
+        return items[0]
+    return {}
+
+
+def _dashboard_request(row):
+    raw_payload = parse_json_field(row["raw_payload"]) if row["raw_payload"] else None
+    extracted_fields = parse_json_field(row["extracted_fields"]) if row["extracted_fields"] else None
+    agent_result = parse_json_field(row["agent_result"]) if row["agent_result"] else None
+    agent_logs = parse_json_field(row["agent_logs"]) if row["agent_logs"] else []
+
+    source = extracted_fields if isinstance(extracted_fields, dict) else raw_payload
+    item = _first_item(source)
+
+    reason = None
+    confidence = None
+    amount_approved = None
+    if isinstance(agent_result, dict):
+        reason = (
+            agent_result.get("reasoning")
+            or agent_result.get("denial_reason")
+            or agent_result.get("escalation_reason")
+        )
+        confidence = agent_result.get("confidence")
+        amount_approved = agent_result.get("amount_approved")
+
+    processing_seconds = None
+    if row["processed_at"] and row["received_at"]:
+        processed_at = row["processed_at"]
+        received_at = row["received_at"]
+        if processed_at.tzinfo and not received_at.tzinfo:
+            processed_at = processed_at.replace(tzinfo=None)
+        processing_seconds = int((processed_at - received_at).total_seconds())
+
+    return {
+        "request_id": row["request_id"],
+        "patient_id": row["patient_id"],
+        "status": row["status"],
+        "decision": row["decision"],
+        "agent_step": row["agent_step"],
+        "received_at": row["received_at"],
+        "processed_at": row["processed_at"],
+        "processing_seconds": processing_seconds,
+        "error_message": row["error_message"],
+        "plan": source.get("plan") if isinstance(source, dict) else None,
+        "item_type": item.get("type"),
+        "item_description": item.get("description") or item.get("name"),
+        "estimated_cost": item.get("estimated_cost") or item.get("amount"),
+        "facility": item.get("facility"),
+        "requesting_provider": item.get("requesting_provider") or item.get("provider"),
+        "reason": reason or row["error_message"],
+        "confidence": confidence,
+        "amount_approved": amount_approved,
+        "raw_payload": raw_payload,
+        "extracted_fields": extracted_fields,
+        "agent_result": agent_result,
+        "agent_logs": agent_logs or [],
+    }
 
 
 # ─────────────────────────────────────────────
@@ -224,6 +303,125 @@ async def list_preauth_payloads(claims: dict = Depends(verify_session_token)):
             }
             for row in rows
         ]
+    }
+
+
+@router.get("/preauth-dashboard")
+async def preauth_dashboard(
+    date_from: date | None = None,
+    date_to: date | None = None,
+    claims: dict = Depends(verify_session_token)
+):
+    if claims["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can view pre-auth dashboard")
+
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(status_code=400, detail="Start date cannot be after end date")
+
+    date_from_start = datetime.combine(date_from, time.min) if date_from else None
+    date_to_end = datetime.combine(date_to + timedelta(days=1), time.min) if date_to else None
+
+    summary = await pg_query_one(
+        """
+        SELECT
+            COUNT(*)::int AS total,
+            COUNT(*) FILTER (WHERE LOWER(status) = 'pending')::int AS pending,
+            COUNT(*) FILTER (WHERE LOWER(status) = 'processing')::int AS processing,
+            COUNT(*) FILTER (WHERE LOWER(status) IN ('approve', 'approved'))::int AS approved,
+            COUNT(*) FILTER (WHERE LOWER(status) IN ('deny', 'denied', 'reject', 'rejected'))::int AS denied,
+            COUNT(*) FILTER (WHERE LOWER(status) IN ('escalate', 'escalated'))::int AS escalated,
+            COUNT(*) FILTER (WHERE LOWER(status) = 'error')::int AS errors,
+            COUNT(*) FILTER (WHERE received_at >= NOW() - INTERVAL '24 hours')::int AS received_24h,
+            COALESCE(
+                SUM(
+                    CASE
+                        WHEN LOWER(COALESCE(decision, status, '')) IN ('approve', 'approved')
+                            AND (agent_result->>'amount_approved') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                        THEN (agent_result->>'amount_approved')::numeric
+                        ELSE 0
+                    END
+                ),
+                0
+            )::float AS total_amount_approved,
+            (AVG(EXTRACT(EPOCH FROM (processed_at::timestamp - received_at)))
+                FILTER (WHERE processed_at IS NOT NULL))::float AS avg_processing_seconds
+        FROM preauth_logs
+        WHERE org_id = $1
+          AND ($2::timestamp IS NULL OR received_at >= $2::timestamp)
+          AND ($3::timestamp IS NULL OR received_at < $3::timestamp)
+        """,
+        claims["org_id"], date_from_start, date_to_end
+    )
+
+    rows = await pg_query_all(
+        """
+        SELECT
+            p.request_id,
+            p.patient_id,
+            p.status,
+            p.received_at,
+            p.raw_payload,
+            p.extracted_fields,
+            p.agent_step,
+            p.decision,
+            p.agent_result,
+            p.error_message,
+            p.processed_at,
+            COALESCE(
+                jsonb_agg(
+                    jsonb_build_object(
+                        'agent_num', al.agent_num,
+                        'agent_name', al.agent_name,
+                        'status', al.status,
+                        'result', al.result,
+                        'logged_at', al.logged_at
+                    )
+                    ORDER BY al.agent_num, al.logged_at
+                ) FILTER (WHERE al.id IS NOT NULL),
+                '[]'::jsonb
+            ) AS agent_logs
+        FROM preauth_logs p
+        LEFT JOIN agent_logs al ON al.request_id = p.request_id
+        WHERE p.org_id = $1
+          AND ($2::timestamp IS NULL OR p.received_at >= $2::timestamp)
+          AND ($3::timestamp IS NULL OR p.received_at < $3::timestamp)
+        GROUP BY
+            p.id,
+            p.request_id,
+            p.patient_id,
+            p.status,
+            p.received_at,
+            p.raw_payload,
+            p.extracted_fields,
+            p.agent_step,
+            p.decision,
+            p.agent_result,
+            p.error_message,
+            p.processed_at
+        ORDER BY p.received_at DESC
+        LIMIT 100
+        """,
+        claims["org_id"], date_from_start, date_to_end
+    )
+
+    return {
+        "filters": {
+            "date_from": date_from.isoformat() if date_from else None,
+            "date_to": date_to.isoformat() if date_to else None,
+        },
+        "summary": {
+            "total": summary["total"] if summary else 0,
+            "pending": summary["pending"] if summary else 0,
+            "processing": summary["processing"] if summary else 0,
+            "approved": summary["approved"] if summary else 0,
+            "denied": summary["denied"] if summary else 0,
+            "escalated": summary["escalated"] if summary else 0,
+            "errors": summary["errors"] if summary else 0,
+            "received_24h": summary["received_24h"] if summary else 0,
+            "total_amount_approved": summary["total_amount_approved"] if summary else 0,
+            "avg_processing_seconds": summary["avg_processing_seconds"] if summary else None,
+        },
+        "requests": [_dashboard_request(row) for row in rows],
     }
 
 
