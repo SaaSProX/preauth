@@ -46,11 +46,19 @@ def parse_json_field(value):
 
 
 def _first_item(fields):
+    items = _items_from_payload(fields)
+    if items and isinstance(items[0], dict):
+        return items[0]
+    return {}
+
+
+def _items_from_payload(fields):
     if not isinstance(fields, dict):
-        return {}
+        return []
 
     items = (
-        fields.get("items")
+        fields.get("pa_items")
+        or fields.get("items")
         or fields.get("requested_items")
         or fields.get("requestedItems")
         or fields.get("services")
@@ -60,9 +68,66 @@ def _first_item(fields):
     )
     items = parse_json_field(items)
 
-    if isinstance(items, list) and items and isinstance(items[0], dict):
-        return items[0]
-    return {}
+    if isinstance(items, list):
+        return [item for item in items if isinstance(item, dict)]
+    return []
+
+
+def _number(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _item_requested_cost(item):
+    amount = (
+        _number(item.get("requested_cost"))
+        or _number(item.get("estimated_cost"))
+        or _number(item.get("cost"))
+        or _number(item.get("amount"))
+    )
+    if amount is not None:
+        return amount
+
+    unit_cost = _number(item.get("unit_cost"))
+    quantity = _number(item.get("quantity")) or 1
+    return unit_cost * quantity if unit_cost is not None else 0
+
+
+def _total_requested_cost(fields):
+    if not isinstance(fields, dict):
+        return None
+
+    total = _number(fields.get("total_requested_cost"))
+    if total is not None:
+        return total
+
+    items = _items_from_payload(fields)
+    if not items:
+        return None
+
+    return sum(_item_requested_cost(item) for item in items)
+
+
+def _has_dashboard_data(fields):
+    if not isinstance(fields, dict):
+        return False
+
+    scalar_fields = ("request_id", "patient_id", "plan", "facility", "submitted_by", "total_requested_cost")
+    if any(fields.get(key) not in (None, "", []) for key in scalar_fields):
+        return True
+
+    return bool(_items_from_payload(fields))
+
+
+def _nested_value(fields, *path):
+    current = fields
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
 
 
 def _dashboard_request(row):
@@ -71,8 +136,19 @@ def _dashboard_request(row):
     agent_result = parse_json_field(row["agent_result"]) if row["agent_result"] else None
     agent_logs = parse_json_field(row["agent_logs"]) if row["agent_logs"] else []
 
-    source = extracted_fields if isinstance(extracted_fields, dict) else raw_payload
+    source = extracted_fields if _has_dashboard_data(extracted_fields) else raw_payload
+    source = source if isinstance(source, dict) else {}
+    raw_source = raw_payload if isinstance(raw_payload, dict) else {}
+    item_count = len(_items_from_payload(source))
     item = _first_item(source)
+    item_description = (
+        f"{item_count} requested items"
+        if item_count > 1
+        else item.get("description") or item.get("name") or item.get("item_name")
+    )
+    patient_id = row["patient_id"]
+    if not patient_id or patient_id == "unknown":
+        patient_id = _nested_value(raw_source, "enrollee", "insurance_no") or patient_id
 
     reason = None
     confidence = None
@@ -96,7 +172,16 @@ def _dashboard_request(row):
 
     return {
         "request_id": row["request_id"],
-        "patient_id": row["patient_id"],
+        "display_request_id": _nested_value(raw_source, "encounter", "checkin_id") or row["request_id"],
+        "patient_id": patient_id,
+        "patient_name": " ".join(
+            value.strip()
+            for value in [
+                _nested_value(raw_source, "enrollee", "first_name") or "",
+                _nested_value(raw_source, "enrollee", "surname") or "",
+            ]
+            if value and value.strip()
+        ),
         "status": row["status"],
         "decision": row["decision"],
         "agent_step": row["agent_step"],
@@ -104,18 +189,17 @@ def _dashboard_request(row):
         "processed_at": row["processed_at"],
         "processing_seconds": processing_seconds,
         "error_message": row["error_message"],
-        "plan": source.get("plan") if isinstance(source, dict) else None,
-        "item_type": item.get("type"),
-        "item_description": item.get("description") or item.get("name") or item.get("item_name"),
-        "estimated_cost": (
-            source.get("total_requested_cost")
-            if isinstance(source, dict) else None
-        ) or item.get("estimated_cost") or item.get("requested_cost") or item.get("amount"),
-        "facility": item.get("facility") or (source.get("facility") if isinstance(source, dict) else None),
+        "plan": source.get("plan") or _nested_value(raw_source, "policy", "plan_name") or _nested_value(raw_source, "policy", "insurance_package"),
+        "item_type": item.get("type") or item.get("category_id"),
+        "item_description": item_description,
+        "estimated_cost": _total_requested_cost(source),
+        "line_item_count": item_count,
+        "facility": item.get("facility") or source.get("facility") or _nested_value(raw_source, "encounter", "facility_name"),
         "requesting_provider": (
             item.get("requesting_provider")
             or item.get("provider")
-            or (source.get("submitted_by") if isinstance(source, dict) else None)
+            or source.get("submitted_by")
+            or _nested_value(raw_source, "submission", "submitted_by", "role")
         ),
         "reason": reason or row["error_message"],
         "confidence": confidence,
