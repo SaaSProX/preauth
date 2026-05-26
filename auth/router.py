@@ -530,6 +530,325 @@ async def preauth_dashboard(
     }
 
 
+@router.get("/webhook-delivery-logs")
+async def webhook_delivery_logs(
+    date_from: date | None = None,
+    date_to: date | None = None,
+    failed_only: bool = False,
+    limit: int = 100,
+    claims: dict = Depends(verify_session_token)
+):
+    if claims["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can view webhook delivery logs")
+
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(status_code=400, detail="Start date cannot be after end date")
+
+    org_id = _dashboard_org_id(claims)
+    can_view_all = str(claims.get("email", "")).lower() == "kalycodes@gmail.com"
+    safe_limit = min(max(limit, 1), 250)
+    date_from_start = datetime.combine(date_from, time.min) if date_from else None
+    date_to_end = datetime.combine(date_to + timedelta(days=1), time.min) if date_to else None
+
+    summary = await pg_query_one(
+        """
+        SELECT
+            COUNT(*)::int AS total_received,
+            (COUNT(event_id) - COUNT(DISTINCT event_id))::int AS duplicate_event_attempts,
+            (COUNT(checkin_id) - COUNT(DISTINCT checkin_id))::int AS repeated_checkin_attempts,
+            COUNT(*) FILTER (WHERE auth_status = 'auth_success')::int AS auth_success,
+            COUNT(*) FILTER (
+                WHERE auth_status IN ('missing_api_key', 'invalid_api_key', 'auth_error')
+            )::int AS auth_failed,
+            COUNT(*) FILTER (WHERE payload_valid = TRUE)::int AS payload_valid,
+            COUNT(*) FILTER (
+                WHERE payload_status IN ('invalid_json', 'not_json_object')
+            )::int AS payload_invalid,
+            COUNT(*) FILTER (WHERE db_insert_status = 'db_upsert_success')::int AS db_saved,
+            COUNT(*) FILTER (WHERE db_insert_status = 'db_insert_failed')::int AS db_failed,
+            COUNT(*) FILTER (WHERE http_status_returned BETWEEN 200 AND 299)::int AS http_success,
+            COUNT(*) FILTER (WHERE http_status_returned >= 400)::int AS http_failed,
+            AVG(processing_time_ms)::float AS avg_processing_time_ms,
+            MAX(created_at) AS latest_received_at
+        FROM webhook_delivery_logs
+        WHERE ($1::boolean = TRUE OR org_id = $2)
+          AND ($3::timestamp IS NULL OR created_at >= $3::timestamp)
+          AND ($4::timestamp IS NULL OR created_at < $4::timestamp)
+        """,
+        can_view_all, org_id, date_from_start, date_to_end
+    )
+
+    rows = await pg_query_all(
+        """
+        SELECT
+            delivery_id,
+            provider,
+            org_id,
+            api_client_id,
+            api_key_hint,
+            request_method,
+            request_path,
+            request_ip,
+            event_id,
+            event_type,
+            correlation_id,
+            checkin_id,
+            facility_name,
+            insurance_no,
+            policy_no,
+            plan_name,
+            auth_status,
+            payload_received,
+            payload_valid,
+            payload_status,
+            payload_size_bytes,
+            payload_summary,
+            db_insert_status,
+            preauth_request_id,
+            preauth_log_id,
+            http_status_returned,
+            final_status,
+            error_message,
+            processing_time_ms,
+            created_at,
+            updated_at
+        FROM webhook_delivery_logs
+        WHERE ($1::boolean = TRUE OR org_id = $2)
+          AND ($3::timestamp IS NULL OR created_at >= $3::timestamp)
+          AND ($4::timestamp IS NULL OR created_at < $4::timestamp)
+          AND (
+              $5::boolean = FALSE
+              OR final_status <> 'accepted'
+              OR http_status_returned >= 400
+              OR auth_status <> 'auth_success'
+              OR payload_valid = FALSE
+              OR db_insert_status = 'db_insert_failed'
+          )
+        ORDER BY created_at DESC
+        LIMIT $6
+        """,
+        can_view_all, org_id, date_from_start, date_to_end, failed_only, safe_limit
+    )
+
+    return {
+        "filters": {
+            "date_from": date_from.isoformat() if date_from else None,
+            "date_to": date_to.isoformat() if date_to else None,
+            "failed_only": failed_only,
+            "limit": safe_limit,
+        },
+        "summary": {
+            "total_received": summary["total_received"] if summary else 0,
+            "duplicate_event_attempts": summary["duplicate_event_attempts"] if summary else 0,
+            "repeated_checkin_attempts": summary["repeated_checkin_attempts"] if summary else 0,
+            "auth_success": summary["auth_success"] if summary else 0,
+            "auth_failed": summary["auth_failed"] if summary else 0,
+            "payload_valid": summary["payload_valid"] if summary else 0,
+            "payload_invalid": summary["payload_invalid"] if summary else 0,
+            "db_saved": summary["db_saved"] if summary else 0,
+            "db_failed": summary["db_failed"] if summary else 0,
+            "http_success": summary["http_success"] if summary else 0,
+            "http_failed": summary["http_failed"] if summary else 0,
+            "avg_processing_time_ms": summary["avg_processing_time_ms"] if summary else None,
+            "latest_received_at": summary["latest_received_at"] if summary else None,
+        },
+        "logs": [
+            {
+                "delivery_id": str(row["delivery_id"]),
+                "provider": row["provider"],
+                "org_id": row["org_id"],
+                "api_client_id": row["api_client_id"],
+                "api_key_hint": row["api_key_hint"],
+                "request_method": row["request_method"],
+                "request_path": row["request_path"],
+                "request_ip": row["request_ip"],
+                "event_id": row["event_id"],
+                "event_type": row["event_type"],
+                "correlation_id": row["correlation_id"],
+                "checkin_id": row["checkin_id"],
+                "facility_name": row["facility_name"],
+                "insurance_no": row["insurance_no"],
+                "policy_no": row["policy_no"],
+                "plan_name": row["plan_name"],
+                "auth_status": row["auth_status"],
+                "payload_received": row["payload_received"],
+                "payload_valid": row["payload_valid"],
+                "payload_status": row["payload_status"],
+                "payload_size_bytes": row["payload_size_bytes"],
+                "payload_summary": parse_json_field(row["payload_summary"]),
+                "db_insert_status": row["db_insert_status"],
+                "preauth_request_id": row["preauth_request_id"],
+                "preauth_log_id": row["preauth_log_id"],
+                "http_status_returned": row["http_status_returned"],
+                "final_status": row["final_status"],
+                "error_message": row["error_message"],
+                "processing_time_ms": row["processing_time_ms"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+            for row in rows
+        ],
+    }
+
+
+@router.get("/webhook-audit-trail")
+async def webhook_audit_trail(
+    event_id: str | None = None,
+    checkin_id: str | None = None,
+    request_id: str | None = None,
+    include_payload: bool = False,
+    limit: int = 50,
+    claims: dict = Depends(verify_session_token)
+):
+    if claims["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can view webhook audit trails")
+
+    org_id = _dashboard_org_id(claims)
+    can_view_all = str(claims.get("email", "")).lower() == "kalycodes@gmail.com"
+    safe_limit = min(max(limit, 1), 100)
+
+    rows = await pg_query_all(
+        """
+        SELECT
+            w.delivery_id,
+            w.provider,
+            w.org_id,
+            w.event_id,
+            w.event_type,
+            w.correlation_id,
+            w.checkin_id,
+            w.facility_name,
+            w.insurance_no,
+            w.policy_no,
+            w.plan_name,
+            w.auth_status,
+            w.payload_status,
+            w.db_insert_status,
+            w.final_status,
+            w.http_status_returned,
+            w.error_message,
+            w.processing_time_ms,
+            w.created_at AS delivery_received_at,
+            w.preauth_request_id,
+            w.preauth_log_id,
+            p.id AS resolved_preauth_log_id,
+            p.request_id AS resolved_request_id,
+            p.patient_id,
+            p.status AS preauth_status,
+            p.decision,
+            p.agent_step,
+            p.received_at AS preauth_received_at,
+            p.processed_at,
+            p.raw_payload,
+            p.extracted_fields,
+            p.agent_result,
+            COALESCE(
+                jsonb_agg(
+                    jsonb_build_object(
+                        'agent_num', al.agent_num,
+                        'agent_name', al.agent_name,
+                        'status', al.status,
+                        'result', al.result,
+                        'logged_at', al.logged_at
+                    )
+                    ORDER BY al.agent_num, al.logged_at
+                ) FILTER (WHERE al.id IS NOT NULL),
+                '[]'::jsonb
+            ) AS agent_logs
+        FROM webhook_delivery_logs w
+        LEFT JOIN preauth_logs p
+            ON p.id = w.preauth_log_id
+            OR (w.preauth_log_id IS NULL AND p.request_id = w.preauth_request_id)
+        LEFT JOIN agent_logs al ON al.request_id = p.request_id
+        WHERE ($1::boolean = TRUE OR w.org_id = $2)
+          AND ($3::text IS NULL OR w.event_id = $3::text)
+          AND ($4::text IS NULL OR w.checkin_id = $4::text)
+          AND (
+              $5::text IS NULL
+              OR w.preauth_request_id = $5::text
+              OR p.request_id = $5::text
+          )
+        GROUP BY
+            w.id,
+            p.id,
+            p.request_id,
+            p.patient_id,
+            p.status,
+            p.decision,
+            p.agent_step,
+            p.received_at,
+            p.processed_at,
+            p.raw_payload,
+            p.extracted_fields,
+            p.agent_result
+        ORDER BY w.created_at DESC
+        LIMIT $6
+        """,
+        can_view_all,
+        org_id,
+        event_id,
+        checkin_id,
+        request_id,
+        safe_limit,
+    )
+
+    return {
+        "filters": {
+            "event_id": event_id,
+            "checkin_id": checkin_id,
+            "request_id": request_id,
+            "include_payload": include_payload,
+            "limit": safe_limit,
+        },
+        "traces": [
+            {
+                "delivery": {
+                    "delivery_id": str(row["delivery_id"]),
+                    "provider": row["provider"],
+                    "org_id": row["org_id"],
+                    "event_id": row["event_id"],
+                    "event_type": row["event_type"],
+                    "correlation_id": row["correlation_id"],
+                    "checkin_id": row["checkin_id"],
+                    "facility_name": row["facility_name"],
+                    "insurance_no": row["insurance_no"],
+                    "policy_no": row["policy_no"],
+                    "plan_name": row["plan_name"],
+                    "auth_status": row["auth_status"],
+                    "payload_status": row["payload_status"],
+                    "db_insert_status": row["db_insert_status"],
+                    "final_status": row["final_status"],
+                    "http_status_returned": row["http_status_returned"],
+                    "error_message": row["error_message"],
+                    "processing_time_ms": row["processing_time_ms"],
+                    "received_at": row["delivery_received_at"],
+                },
+                "preauth": {
+                    "raw_payload_reference": {
+                        "preauth_log_id": row["resolved_preauth_log_id"] or row["preauth_log_id"],
+                        "request_id": row["resolved_request_id"] or row["preauth_request_id"],
+                    },
+                    "preauth_log_id": row["resolved_preauth_log_id"],
+                    "request_id": row["resolved_request_id"],
+                    "patient_id": row["patient_id"],
+                    "status": row["preauth_status"],
+                    "decision": row["decision"],
+                    "agent_step": row["agent_step"],
+                    "received_at": row["preauth_received_at"],
+                    "processed_at": row["processed_at"],
+                    "raw_payload": parse_json_field(row["raw_payload"]) if include_payload else None,
+                    "extracted_fields": parse_json_field(row["extracted_fields"]) if include_payload else None,
+                },
+                "agent": {
+                    "agent_result": parse_json_field(row["agent_result"]) if row["agent_result"] else None,
+                    "agent_logs": parse_json_field(row["agent_logs"]) if row["agent_logs"] else [],
+                },
+            }
+            for row in rows
+        ],
+    }
+
+
 # ─────────────────────────────────────────────
 # Invite team member (admin only)
 # ─────────────────────────────────────────────

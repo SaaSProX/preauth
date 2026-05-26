@@ -66,16 +66,48 @@ ALTER TABLE preauth_logs ADD COLUMN IF NOT EXISTS agent_result JSONB;
 ALTER TABLE preauth_logs ADD COLUMN IF NOT EXISTS error_message TEXT;
 ALTER TABLE preauth_logs ADD COLUMN IF NOT EXISTS processed_at TIMESTAMPTZ;
 
--- Every agent tool call (for dashboard timeline)
-CREATE TABLE IF NOT EXISTS agent_steps (
-    id              SERIAL PRIMARY KEY,
-    request_id      VARCHAR(100) NOT NULL REFERENCES preauth_logs(request_id),
-    step_number     INT NOT NULL,
-    tool_name       VARCHAR(100) NOT NULL,
-    tool_input      JSONB,
-    tool_result     JSONB,
-    executed_at     TIMESTAMP DEFAULT NOW()
+-- Every inbound webhook delivery attempt, including failures before PA persistence
+CREATE TABLE IF NOT EXISTS webhook_delivery_logs (
+    id                    SERIAL PRIMARY KEY,
+    delivery_id           UUID NOT NULL UNIQUE,
+    provider              VARCHAR(50) NOT NULL DEFAULT 'aman',
+    org_id                INT REFERENCES organizations(id),
+    api_client_id          INT REFERENCES api_clients(id),
+    api_key_hint           VARCHAR(32),
+    request_method        VARCHAR(10),
+    request_path          TEXT,
+    request_ip            VARCHAR(100),
+    user_agent            TEXT,
+    event_id              VARCHAR(100),
+    event_type            VARCHAR(100),
+    correlation_id        VARCHAR(100),
+    checkin_id            VARCHAR(100),
+    facility_name         TEXT,
+    insurance_no          VARCHAR(100),
+    policy_no             VARCHAR(100),
+    plan_name             VARCHAR(100),
+    auth_status           VARCHAR(40) NOT NULL DEFAULT 'not_checked',
+    payload_received      BOOLEAN NOT NULL DEFAULT FALSE,
+    payload_valid         BOOLEAN NOT NULL DEFAULT FALSE,
+    payload_status        VARCHAR(40) NOT NULL DEFAULT 'not_read',
+    payload_size_bytes    INT,
+    payload_summary       JSONB,
+    db_insert_status      VARCHAR(40) NOT NULL DEFAULT 'not_attempted',
+    preauth_request_id    VARCHAR(100),
+    preauth_log_id        INT REFERENCES preauth_logs(id),
+    http_status_returned  INT,
+    final_status          VARCHAR(40) NOT NULL DEFAULT 'received',
+    error_message         TEXT,
+    processing_time_ms    INT,
+    created_at            TIMESTAMPTZ DEFAULT NOW(),
+    updated_at            TIMESTAMPTZ DEFAULT NOW()
 );
+
+ALTER TABLE webhook_delivery_logs ADD COLUMN IF NOT EXISTS facility_name TEXT;
+ALTER TABLE webhook_delivery_logs ADD COLUMN IF NOT EXISTS insurance_no VARCHAR(100);
+ALTER TABLE webhook_delivery_logs ADD COLUMN IF NOT EXISTS policy_no VARCHAR(100);
+ALTER TABLE webhook_delivery_logs ADD COLUMN IF NOT EXISTS plan_name VARCHAR(100);
+ALTER TABLE webhook_delivery_logs ADD COLUMN IF NOT EXISTS preauth_log_id INT REFERENCES preauth_logs(id);
 
 -- Every agent pipeline result (for dashboard timeline)
 CREATE TABLE IF NOT EXISTS agent_logs (
@@ -88,34 +120,19 @@ CREATE TABLE IF NOT EXISTS agent_logs (
     logged_at       TIMESTAMPTZ DEFAULT NOW()
 );
 
--- Final decision per request
-CREATE TABLE IF NOT EXISTS decisions (
-    id              SERIAL PRIMARY KEY,
-    request_id      VARCHAR(100) NOT NULL UNIQUE REFERENCES preauth_logs(request_id),
-    patient_id      VARCHAR(100) NOT NULL,
-    decision        VARCHAR(20) NOT NULL,   -- approved | denied | escalated
-    reason          TEXT NOT NULL,
-    decided_at      TIMESTAMP DEFAULT NOW()
-);
-
--- Emails sent
-CREATE TABLE IF NOT EXISTS notifications (
-    id              SERIAL PRIMARY KEY,
-    request_id      VARCHAR(100) NOT NULL REFERENCES preauth_logs(request_id),
-    sent_to         VARCHAR(255) NOT NULL,
-    subject         VARCHAR(255),
-    body            TEXT,
-    sent_at         TIMESTAMP DEFAULT NOW()
-);
-
 -- Indexes
-CREATE INDEX IF NOT EXISTS idx_agent_steps_request_id ON agent_steps(request_id);
 CREATE INDEX IF NOT EXISTS idx_agent_logs_request_id ON agent_logs(request_id);
 CREATE INDEX IF NOT EXISTS idx_agent_logs_logged_at ON agent_logs(logged_at DESC);
-CREATE INDEX IF NOT EXISTS idx_decisions_decided_at ON decisions(decided_at DESC);
 CREATE INDEX IF NOT EXISTS idx_preauth_logs_status ON preauth_logs(status);
 CREATE INDEX IF NOT EXISTS idx_preauth_logs_org_id ON preauth_logs(org_id);
 CREATE INDEX IF NOT EXISTS idx_preauth_logs_received_at ON preauth_logs(received_at DESC);
 CREATE INDEX IF NOT EXISTS idx_preauth_logs_processed_at ON preauth_logs(processed_at DESC);
 CREATE INDEX IF NOT EXISTS idx_clients_org_id ON clients(org_id);
 CREATE INDEX IF NOT EXISTS idx_api_clients_user_id ON api_clients(user_id);
+CREATE INDEX IF NOT EXISTS idx_webhook_delivery_logs_created_at ON webhook_delivery_logs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_webhook_delivery_logs_org_id ON webhook_delivery_logs(org_id);
+CREATE INDEX IF NOT EXISTS idx_webhook_delivery_logs_event_id ON webhook_delivery_logs(event_id);
+CREATE INDEX IF NOT EXISTS idx_webhook_delivery_logs_checkin_id ON webhook_delivery_logs(checkin_id);
+CREATE INDEX IF NOT EXISTS idx_webhook_delivery_logs_final_status ON webhook_delivery_logs(final_status);
+CREATE INDEX IF NOT EXISTS idx_webhook_delivery_logs_preauth_log_id ON webhook_delivery_logs(preauth_log_id);
+CREATE INDEX IF NOT EXISTS idx_webhook_delivery_logs_insurance_no ON webhook_delivery_logs(insurance_no);

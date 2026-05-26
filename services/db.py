@@ -55,12 +55,21 @@ async def get_pg_conn():
 
 async def pg_query_one(sql: str, *args):
     conn = await get_pg_conn()
-    return await conn.fetchrow(sql, *args)
+    try:
+        return await conn.fetchrow(sql, *args)
+    finally:
+        await conn.close()
 
 async def pg_query_all(sql: str, *args):
     conn = await get_pg_conn()
-    return await conn.fetch(sql, *args)
+    try:
+        return await conn.fetch(sql, *args)
+    finally:
+        await conn.close()
 
 async def pg_execute(sql: str, *args):
     conn = await get_pg_conn()
-    await conn.execute(sql, *args)
+    try:
+        return await conn.execute(sql, *args)
+    finally:
+        await conn.close()

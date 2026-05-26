@@ -1,13 +1,20 @@
 import json
+import logging
+import time
 import uuid
 from datetime import date, datetime
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
-from middleware.auth import verify_api_key
-from services.db import pg_execute
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from services.db import pg_query_one
+from services.webhook_delivery import (
+    create_webhook_delivery_log,
+    mask_api_key,
+    update_webhook_delivery_log,
+)
 from agent import agent
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 def get_nested(payload: dict, path: str):
@@ -25,6 +32,59 @@ def first_value(payload: dict, paths: list[str]):
         if value not in (None, ""):
             return value
     return None
+
+
+def elapsed_ms(started_at: float) -> int:
+    return int((time.perf_counter() - started_at) * 1000)
+
+
+def get_request_ip(request: Request):
+    forwarded_for = request.headers.get("X-Forwarded-For")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    return request.client.host if request.client else None
+
+
+def get_webhook_api_key(request: Request):
+    api_key = request.headers.get("X-API-Key")
+    if api_key:
+        return api_key
+
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        return auth_header.split(" ", 1)[1].strip()
+
+    return None
+
+
+async def authenticate_webhook_request(request: Request):
+    api_key = get_webhook_api_key(request)
+    if not api_key:
+        return None, "missing_api_key", "Missing API key"
+
+    client = await pg_query_one(
+        "SELECT * FROM api_clients WHERE api_key = $1 AND is_active = TRUE",
+        api_key,
+    )
+    if not client:
+        return None, "invalid_api_key", "Invalid API key"
+
+    return client, "auth_success", None
+
+
+def summarize_payload(payload: dict):
+    pa_items = payload.get("pa_items")
+    return {
+        "event_id": payload.get("event_id"),
+        "event_type": payload.get("event_type"),
+        "correlation_id": payload.get("correlation_id"),
+        "checkin_id": get_nested(payload, "encounter.checkin_id"),
+        "facility_name": get_nested(payload, "encounter.facility_name"),
+        "insurance_no": get_nested(payload, "enrollee.insurance_no"),
+        "policy_no": get_nested(payload, "policy.policy_no"),
+        "plan_name": get_nested(payload, "policy.plan_name"),
+        "item_count": len(pa_items) if isinstance(pa_items, list) else None,
+    }
 
 
 def parse_date(value):
@@ -273,47 +333,168 @@ def extract_preauth_fields(payload: dict):
 async def receive_preauth(
     request: Request,
     background: BackgroundTasks,
-    client=Depends(verify_api_key)
 ):
-    try:
-        payload = await request.json()
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Webhook body must be valid JSON")
-
-    if not isinstance(payload, dict):
-        raise HTTPException(status_code=400, detail="Webhook body must be a JSON object")
-
-    extracted_fields = extract_preauth_fields(payload)
-    request_id = extracted_fields["request_id"] or f"intake-{uuid.uuid4().hex}"
-    patient_id = extracted_fields["patient_id"] or "unknown"
-    missing_recommended_fields = [
-        field for field in ["patient_id", "plan", "eligibility", "utilization", "items"]
-        if not extracted_fields.get(field)
-    ]
-
-    # Save incoming webhook immediately
-    await pg_execute(
-        """
-        INSERT INTO preauth_logs (org_id, request_id, patient_id, raw_payload, extracted_fields, status)
-        VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, 'pending')
-        ON CONFLICT (request_id) DO UPDATE SET
-            raw_payload = EXCLUDED.raw_payload,
-            extracted_fields = EXCLUDED.extracted_fields,
-            received_at = NOW(),
-            status = 'pending'
-        """,
-        client["org_id"],
-        str(request_id),
-        str(patient_id),
-        json.dumps(payload),
-        json.dumps(extracted_fields)
+    started_at = time.perf_counter()
+    api_key = get_webhook_api_key(request)
+    delivery_id = await create_webhook_delivery_log(
+        provider="aman",
+        request_method=request.method,
+        request_path=str(request.url.path),
+        request_ip=get_request_ip(request),
+        user_agent=request.headers.get("User-Agent"),
+        api_key_hint=mask_api_key(api_key),
     )
 
-    # Kick off agent in background
-    background.add_task(agent.run, patient_id, request_id)
-    return {
-        "status": "received",
-        "request_id": str(request_id),
-        "captured_fields": extracted_fields,
-        "missing_recommended_fields": missing_recommended_fields,
-    }
+    try:
+        try:
+            client, auth_status, auth_error = await authenticate_webhook_request(request)
+        except Exception as exc:
+            await update_webhook_delivery_log(
+                delivery_id,
+                auth_status="auth_error",
+                final_status="auth_error",
+                http_status_returned=500,
+                error_message=str(exc),
+                processing_time_ms=elapsed_ms(started_at),
+            )
+            logger.exception("Webhook auth check failed")
+            raise HTTPException(status_code=500, detail="Webhook authentication failed")
+
+        if not client:
+            await update_webhook_delivery_log(
+                delivery_id,
+                auth_status=auth_status,
+                final_status=auth_status,
+                http_status_returned=401,
+                error_message=auth_error,
+                processing_time_ms=elapsed_ms(started_at),
+            )
+            raise HTTPException(status_code=401, detail=auth_error)
+
+        await update_webhook_delivery_log(
+            delivery_id,
+            org_id=client["org_id"],
+            api_client_id=client["id"],
+            auth_status=auth_status,
+        )
+
+        body = await request.body()
+        payload_size_bytes = len(body)
+        try:
+            payload = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            await update_webhook_delivery_log(
+                delivery_id,
+                payload_received=payload_size_bytes > 0,
+                payload_valid=False,
+                payload_status="invalid_json",
+                payload_size_bytes=payload_size_bytes,
+                final_status="invalid_payload",
+                http_status_returned=400,
+                error_message="Webhook body must be valid JSON",
+                processing_time_ms=elapsed_ms(started_at),
+            )
+            raise HTTPException(status_code=400, detail="Webhook body must be valid JSON")
+
+        if not isinstance(payload, dict):
+            await update_webhook_delivery_log(
+                delivery_id,
+                payload_received=True,
+                payload_valid=False,
+                payload_status="not_json_object",
+                payload_size_bytes=payload_size_bytes,
+                final_status="invalid_payload",
+                http_status_returned=400,
+                error_message="Webhook body must be a JSON object",
+                processing_time_ms=elapsed_ms(started_at),
+            )
+            raise HTTPException(status_code=400, detail="Webhook body must be a JSON object")
+
+        payload_summary = summarize_payload(payload)
+        await update_webhook_delivery_log(
+            delivery_id,
+            event_id=payload.get("event_id"),
+            event_type=payload.get("event_type"),
+            correlation_id=payload.get("correlation_id"),
+            checkin_id=get_nested(payload, "encounter.checkin_id"),
+            facility_name=payload_summary.get("facility_name"),
+            insurance_no=payload_summary.get("insurance_no"),
+            policy_no=payload_summary.get("policy_no"),
+            plan_name=payload_summary.get("plan_name"),
+            payload_received=True,
+            payload_valid=True,
+            payload_status="payload_valid",
+            payload_size_bytes=payload_size_bytes,
+            payload_summary=payload_summary,
+        )
+
+        extracted_fields = extract_preauth_fields(payload)
+        request_id = extracted_fields["request_id"] or f"intake-{uuid.uuid4().hex}"
+        patient_id = extracted_fields["patient_id"] or "unknown"
+        missing_recommended_fields = [
+            field for field in ["patient_id", "plan", "eligibility", "utilization", "items"]
+            if not extracted_fields.get(field)
+        ]
+
+        # Save incoming webhook immediately
+        try:
+            preauth_row = await pg_query_one(
+                """
+                INSERT INTO preauth_logs (org_id, request_id, patient_id, raw_payload, extracted_fields, status)
+                VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, 'pending')
+                ON CONFLICT (request_id) DO UPDATE SET
+                    raw_payload = EXCLUDED.raw_payload,
+                    extracted_fields = EXCLUDED.extracted_fields,
+                    received_at = NOW(),
+                    status = 'pending'
+                RETURNING id
+                """,
+                client["org_id"],
+                str(request_id),
+                str(patient_id),
+                json.dumps(payload),
+                json.dumps(extracted_fields)
+            )
+        except Exception as exc:
+            await update_webhook_delivery_log(
+                delivery_id,
+                db_insert_status="db_insert_failed",
+                preauth_request_id=str(request_id),
+                final_status="db_insert_failed",
+                http_status_returned=500,
+                error_message=str(exc),
+                processing_time_ms=elapsed_ms(started_at),
+            )
+            logger.exception("Failed to persist preauth webhook payload")
+            raise HTTPException(status_code=500, detail="Failed to persist webhook payload")
+
+        await update_webhook_delivery_log(
+            delivery_id,
+            db_insert_status="db_upsert_success",
+            preauth_request_id=str(request_id),
+            preauth_log_id=preauth_row["id"] if preauth_row else None,
+            final_status="accepted",
+            http_status_returned=200,
+            processing_time_ms=elapsed_ms(started_at),
+        )
+
+        # Kick off agent in background
+        # background.add_task(agent.run, str(patient_id), str(request_id))
+        return {
+            "status": "received",
+            "request_id": str(request_id),
+            "captured_fields": extracted_fields,
+            "missing_recommended_fields": missing_recommended_fields,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        await update_webhook_delivery_log(
+            delivery_id,
+            final_status="failed",
+            http_status_returned=500,
+            error_message=str(exc),
+            processing_time_ms=elapsed_ms(started_at),
+        )
+        logger.exception("Unhandled webhook processing error")
+        raise
