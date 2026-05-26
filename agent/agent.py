@@ -304,6 +304,12 @@ Check in this order:
 3. PLAN COVERAGE CHECK: Is the item covered on this specific plan tier?
 4. BENEFIT CATEGORY: Classify into the correct bucket
 
+Production payload guidance:
+- If items have pricing_source="tariff", treat them as recognized Aman tariff items.
+- If proposed_impact.status is "allowed" and proposed_impact.violations is empty, do not deny solely because the exact tariff item name is not listed in the knowledge base.
+- For basic outpatient consultation, routine laboratory tests, and routine medication on tariff, pass coverage unless there is a clear exclusion, waiting-period issue, or explicit violation.
+- If coverage is uncertain, prefer pass with a note or escalate in the final decision rather than deterministic denial.
+
 Return ONLY this JSON:
 {{
   "pass": true or false,
@@ -342,7 +348,8 @@ PA REQUEST:
 Rules:
 1. Identify the correct limit bucket based on benefit_category and plan tier
 2. Use utilization data if present; if missing, use knowledge base limits and assume 0 used
-3. For amount-based benefits, check: bucket_used + estimated_cost <= bucket_limit
+3. For amount-based benefits, check: bucket_used + estimated_cost <= bucket_limit.
+   For multi-item requests, estimated_cost means total_requested_cost if present, otherwise sum every item estimated_cost/requested_cost.
 4. For frequency-based benefits such as CT/MRI scan counts, check: count_used + 1 <= count_limit.
    Do not compare estimated_cost against a frequency count.
 4. Check: maximum_annual_benefit_used + estimated_cost <= maximum_annual_benefit_limit
@@ -555,11 +562,25 @@ def _get_estimated_cost(pa: dict) -> float | None:
     if not isinstance(pa, dict):
         return None
 
+    total_requested_cost = pa.get("total_requested_cost")
+    if isinstance(total_requested_cost, (int, float)):
+        return total_requested_cost
+
     items = _parse_json_field(pa.get("items") or [])
     if isinstance(items, list) and items:
-        first_item = items[0]
-        if isinstance(first_item, dict):
-            return first_item.get("estimated_cost")
+        total = 0
+        has_cost = False
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            cost = item.get("estimated_cost") or item.get("requested_cost") or item.get("amount")
+            try:
+                total += float(cost)
+                has_cost = True
+            except (TypeError, ValueError):
+                continue
+        if has_cost:
+            return total
     return None
 
 
