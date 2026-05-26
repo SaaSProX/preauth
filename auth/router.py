@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from services.db import pg_execute, pg_query_all, pg_query_one
 from services.invites import build_invite_link
 from services.notifier import EmailDeliveryError, send_invite_email
+from config.settings import settings
 from auth.utils import (
     hash_password, verify_password,
     generate_api_key, generate_session_token,
@@ -105,10 +106,17 @@ def _dashboard_request(row):
         "error_message": row["error_message"],
         "plan": source.get("plan") if isinstance(source, dict) else None,
         "item_type": item.get("type"),
-        "item_description": item.get("description") or item.get("name"),
-        "estimated_cost": item.get("estimated_cost") or item.get("amount"),
-        "facility": item.get("facility"),
-        "requesting_provider": item.get("requesting_provider") or item.get("provider"),
+        "item_description": item.get("description") or item.get("name") or item.get("item_name"),
+        "estimated_cost": (
+            source.get("total_requested_cost")
+            if isinstance(source, dict) else None
+        ) or item.get("estimated_cost") or item.get("requested_cost") or item.get("amount"),
+        "facility": item.get("facility") or (source.get("facility") if isinstance(source, dict) else None),
+        "requesting_provider": (
+            item.get("requesting_provider")
+            or item.get("provider")
+            or (source.get("submitted_by") if isinstance(source, dict) else None)
+        ),
         "reason": reason or row["error_message"],
         "confidence": confidence,
         "amount_approved": amount_approved,
@@ -315,6 +323,8 @@ async def preauth_dashboard(
     if claims["role"] != "admin":
         raise HTTPException(status_code=403, detail="Only admins can view pre-auth dashboard")
 
+    org_id = settings.dashboard_org_id_override or claims["org_id"]
+
     if date_from and date_to and date_from > date_to:
         raise HTTPException(status_code=400, detail="Start date cannot be after end date")
 
@@ -350,7 +360,7 @@ async def preauth_dashboard(
           AND ($2::timestamp IS NULL OR received_at >= $2::timestamp)
           AND ($3::timestamp IS NULL OR received_at < $3::timestamp)
         """,
-        claims["org_id"], date_from_start, date_to_end
+        org_id, date_from_start, date_to_end
     )
 
     rows = await pg_query_all(
@@ -401,7 +411,7 @@ async def preauth_dashboard(
         ORDER BY p.received_at DESC
         LIMIT 100
         """,
-        claims["org_id"], date_from_start, date_to_end
+        org_id, date_from_start, date_to_end
     )
 
     return {

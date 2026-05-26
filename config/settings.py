@@ -21,6 +21,7 @@ class Settings(BaseSettings):
 
     # Dashboard
     dashboard_base_url: str = "http://localhost:3000"
+    dashboard_org_id_override: int | None = None
 
     # Email (Resend)
     resend_api_key: str = ""
