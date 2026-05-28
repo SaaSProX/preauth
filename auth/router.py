@@ -509,6 +509,37 @@ async def preauth_dashboard(
         org_id, date_from_start, date_to_end
     )
 
+    series_rows = await pg_query_all(
+        """
+        SELECT
+            to_char(date(received_at), 'YYYY-MM-DD') AS day,
+            COUNT(*)::int AS received,
+            COALESCE(
+                AVG(EXTRACT(EPOCH FROM (processed_at::timestamp - received_at)))
+                    FILTER (WHERE processed_at IS NOT NULL),
+                0
+            )::float AS avg_latency,
+            COALESCE(
+                SUM(
+                    CASE
+                        WHEN LOWER(COALESCE(decision, status, '')) IN ('approve', 'approved')
+                            AND (agent_result->>'amount_approved') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                        THEN (agent_result->>'amount_approved')::numeric
+                        ELSE 0
+                    END
+                ),
+                0
+            )::float AS approved_value
+        FROM preauth_logs
+        WHERE org_id = $1
+          AND ($2::timestamp IS NULL OR received_at >= $2::timestamp)
+          AND ($3::timestamp IS NULL OR received_at < $3::timestamp)
+        GROUP BY date(received_at)
+        ORDER BY day
+        """,
+        org_id, date_from_start, date_to_end
+    )
+
     return {
         "filters": {
             "date_from": date_from.isoformat() if date_from else None,
@@ -527,6 +558,15 @@ async def preauth_dashboard(
             "avg_processing_seconds": summary["avg_processing_seconds"] if summary else None,
         },
         "requests": [_dashboard_request(row) for row in rows],
+        "series": [
+            {
+                "day": r["day"],
+                "received": r["received"],
+                "avg_latency": r["avg_latency"],
+                "approved_value": r["approved_value"],
+            }
+            for r in series_rows
+        ],
     }
 
 
