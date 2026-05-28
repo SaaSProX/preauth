@@ -413,9 +413,6 @@ async def preauth_dashboard(
     date_to: date | None = None,
     claims: dict = Depends(verify_session_token)
 ):
-    if claims["role"] != "admin":
-        raise HTTPException(status_code=403, detail="Only admins can view pre-auth dashboard")
-
     org_id = _dashboard_org_id(claims)
 
     if date_from and date_to and date_from > date_to:
@@ -576,9 +573,6 @@ async def webhook_delivery_logs(
     limit: int = 100,
     claims: dict = Depends(verify_session_token)
 ):
-    if claims["role"] != "admin":
-        raise HTTPException(status_code=403, detail="Only admins can view webhook delivery logs")
-
     if date_from and date_to and date_from > date_to:
         raise HTTPException(status_code=400, detail="Start date cannot be after end date")
 
@@ -738,9 +732,6 @@ async def webhook_audit_trail(
     limit: int = 50,
     claims: dict = Depends(verify_session_token)
 ):
-    if claims["role"] != "admin":
-        raise HTTPException(status_code=403, detail="Only admins can view webhook audit trails")
-
     org_id = _dashboard_org_id(claims)
     can_view_all = False
     safe_limit = min(max(limit, 1), 100)
@@ -893,9 +884,6 @@ async def webhook_audit_trail(
 
 @router.get("/team")
 async def list_team_members(claims: dict = Depends(verify_session_token)):
-    if claims["role"] != "admin":
-        raise HTTPException(status_code=403, detail="Only admins can view team members")
-
     rows = await pg_query_all(
         """
         SELECT name, email, role, created_at, 'active' AS status
