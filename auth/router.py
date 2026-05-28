@@ -136,8 +136,6 @@ def _provider_label(value):
 
 
 def _dashboard_org_id(claims):
-    if str(claims.get("email", "")).lower() == "kalycodes@gmail.com":
-        return 3
     return claims["org_id"]
 
 
@@ -585,7 +583,7 @@ async def webhook_delivery_logs(
         raise HTTPException(status_code=400, detail="Start date cannot be after end date")
 
     org_id = _dashboard_org_id(claims)
-    can_view_all = str(claims.get("email", "")).lower() == "kalycodes@gmail.com"
+    can_view_all = False
     safe_limit = min(max(limit, 1), 250)
     date_from_start = datetime.combine(date_from, time.min) if date_from else None
     date_to_end = datetime.combine(date_to + timedelta(days=1), time.min) if date_to else None
@@ -744,7 +742,7 @@ async def webhook_audit_trail(
         raise HTTPException(status_code=403, detail="Only admins can view webhook audit trails")
 
     org_id = _dashboard_org_id(claims)
-    can_view_all = str(claims.get("email", "")).lower() == "kalycodes@gmail.com"
+    can_view_all = False
     safe_limit = min(max(limit, 1), 100)
 
     rows = await pg_query_all(
