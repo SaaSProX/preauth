@@ -143,24 +143,30 @@ def _dashboard_org_id(claims):
 
 
 async def _preauth_dashboard_org_id(claims):
-    org_id = claims["org_id"]
-    has_org_data = await pg_query_one(
-        "SELECT 1 FROM preauth_logs WHERE org_id = $1 LIMIT 1",
-        org_id,
+    fallback = await pg_query_one(
+        """
+        SELECT org_id
+        FROM preauth_events
+        WHERE org_id IS NOT NULL
+        GROUP BY org_id
+        ORDER BY COUNT(*) DESC, MAX(created_at) DESC NULLS LAST
+        LIMIT 1
+        """
     )
-    if has_org_data:
-        return org_id
+    if fallback:
+        return fallback["org_id"]
 
     fallback = await pg_query_one(
         """
         SELECT org_id
         FROM preauth_logs
         WHERE org_id IS NOT NULL
-        ORDER BY received_at DESC NULLS LAST, id DESC
+        GROUP BY org_id
+        ORDER BY COUNT(*) DESC, MAX(received_at) DESC NULLS LAST
         LIMIT 1
         """
     )
-    return fallback["org_id"] if fallback else org_id
+    return fallback["org_id"] if fallback else claims["org_id"]
 
 
 def _dashboard_request(row):
