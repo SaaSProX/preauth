@@ -2,6 +2,7 @@ import json
 import secrets
 import asyncio
 from datetime import date, datetime, time, timedelta
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel
@@ -205,6 +206,13 @@ def _dashboard_request(row):
         "item_description": item_description,
         "estimated_cost": _total_requested_cost(source),
         "line_item_count": item_count,
+        "event_count": row["event_count"],
+        "latest_event_sequence": row["latest_event_sequence"],
+        "latest_event_id": row["latest_event_id"],
+        "latest_items_added_count": row["latest_items_added_count"],
+        "latest_items_added_total": row["latest_items_added_total"],
+        "duplicate_event_attempts": row["duplicate_event_attempts"],
+        "total_intake_value": row["total_intake_value"],
         "facility": item.get("facility") or source.get("facility") or _nested_value(raw_source, "encounter", "facility_name"),
         "requesting_provider": _provider_label(
             item.get("requesting_provider")
@@ -425,6 +433,11 @@ async def preauth_dashboard(
 
     date_from_start = datetime.combine(date_from, time.min) if date_from else None
     date_to_end = datetime.combine(date_to + timedelta(days=1), time.min) if date_to else None
+    lagos_tz = ZoneInfo("Africa/Lagos")
+    event_date_from_start = datetime.combine(date_from, time.min, tzinfo=lagos_tz) if date_from else None
+    event_date_to_end = datetime.combine(date_to + timedelta(days=1), time.min, tzinfo=lagos_tz) if date_to else None
+    today_start = datetime.now(lagos_tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    today_end = today_start + timedelta(days=1)
 
     summary = await pg_query_one(
         """
@@ -437,6 +450,26 @@ async def preauth_dashboard(
             COUNT(*) FILTER (WHERE LOWER(status) IN ('escalate', 'escalated'))::int AS escalated,
             COUNT(*) FILTER (WHERE LOWER(status) = 'error')::int AS errors,
             COUNT(*) FILTER (WHERE received_at >= NOW() - INTERVAL '24 hours')::int AS received_24h,
+            COALESCE(
+                SUM(
+                    CASE
+                        WHEN (extracted_fields->>'total_requested_cost') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                        THEN (extracted_fields->>'total_requested_cost')::numeric
+                        ELSE 0
+                    END
+                ),
+                0
+            )::float AS current_snapshot_value,
+            COALESCE(
+                SUM(
+                    CASE
+                        WHEN jsonb_typeof(extracted_fields->'items') = 'array'
+                        THEN jsonb_array_length(extracted_fields->'items')
+                        ELSE 0
+                    END
+                ),
+                0
+            )::int AS current_snapshot_line_items,
             COALESCE(
                 SUM(
                     CASE
@@ -458,6 +491,83 @@ async def preauth_dashboard(
         org_id, date_from_start, date_to_end
     )
 
+    event_summary = await pg_query_one(
+        """
+        SELECT
+            COUNT(*)::int AS event_count,
+            COUNT(DISTINCT checkin_id)::int AS unique_pa_count,
+            COALESCE(SUM(COALESCE(items_added_total, total_requested_cost, 0)), 0)::float AS intake_value,
+            COALESCE(SUM(COALESCE(items_added_count, item_count, 0)), 0)::int AS added_line_items
+        FROM preauth_events
+        WHERE org_id = $1
+          AND ($2::timestamptz IS NULL OR created_at >= $2::timestamptz)
+          AND ($3::timestamptz IS NULL OR created_at < $3::timestamptz)
+        """,
+        org_id, event_date_from_start, event_date_to_end
+    )
+
+    all_time_event_summary = await pg_query_one(
+        """
+        SELECT
+            COUNT(*)::int AS event_count,
+            COUNT(DISTINCT checkin_id)::int AS unique_pa_count,
+            COALESCE(SUM(COALESCE(items_added_total, total_requested_cost, 0)), 0)::float AS intake_value,
+            COALESCE(SUM(COALESCE(items_added_count, item_count, 0)), 0)::int AS added_line_items
+        FROM preauth_events
+        WHERE org_id = $1
+        """,
+        org_id
+    )
+
+    today_event_summary = await pg_query_one(
+        """
+        SELECT
+            COUNT(*)::int AS event_count,
+            COUNT(DISTINCT checkin_id)::int AS unique_pa_count,
+            COALESCE(SUM(COALESCE(items_added_total, total_requested_cost, 0)), 0)::float AS intake_value,
+            COALESCE(SUM(COALESCE(items_added_count, item_count, 0)), 0)::int AS added_line_items
+        FROM preauth_events
+        WHERE org_id = $1
+          AND created_at >= $2::timestamptz
+          AND created_at < $3::timestamptz
+        """,
+        org_id, today_start, today_end
+    )
+
+    duplicate_summary = await pg_query_one(
+        """
+        SELECT COUNT(*)::int AS duplicate_event_attempts
+        FROM webhook_delivery_logs
+        WHERE org_id = $1
+          AND db_insert_status = 'duplicate_event_seen'
+          AND ($2::timestamptz IS NULL OR created_at >= $2::timestamptz)
+          AND ($3::timestamptz IS NULL OR created_at < $3::timestamptz)
+        """,
+        org_id, event_date_from_start, event_date_to_end
+    )
+
+    all_time_duplicate_summary = await pg_query_one(
+        """
+        SELECT COUNT(*)::int AS duplicate_event_attempts
+        FROM webhook_delivery_logs
+        WHERE org_id = $1
+          AND db_insert_status = 'duplicate_event_seen'
+        """,
+        org_id
+    )
+
+    today_duplicate_summary = await pg_query_one(
+        """
+        SELECT COUNT(*)::int AS duplicate_event_attempts
+        FROM webhook_delivery_logs
+        WHERE org_id = $1
+          AND db_insert_status = 'duplicate_event_seen'
+          AND created_at >= $2::timestamptz
+          AND created_at < $3::timestamptz
+        """,
+        org_id, today_start, today_end
+    )
+
     rows = await pg_query_all(
         """
         SELECT
@@ -472,6 +582,13 @@ async def preauth_dashboard(
             p.agent_result,
             p.error_message,
             p.processed_at,
+            COALESCE(ev.event_count, 0)::int AS event_count,
+            ev.latest_event_sequence,
+            ev.latest_event_id,
+            COALESCE(ev.latest_items_added_count, 0)::int AS latest_items_added_count,
+            COALESCE(ev.latest_items_added_total, 0)::float AS latest_items_added_total,
+            COALESCE(ev.duplicate_event_attempts, 0)::int AS duplicate_event_attempts,
+            COALESCE(ev.total_intake_value, 0)::float AS total_intake_value,
             COALESCE(
                 jsonb_agg(
                     jsonb_build_object(
@@ -486,6 +603,19 @@ async def preauth_dashboard(
                 '[]'::jsonb
             ) AS agent_logs
         FROM preauth_logs p
+        LEFT JOIN LATERAL (
+            SELECT
+                COUNT(*)::int AS event_count,
+                MAX(e.event_sequence)::int AS latest_event_sequence,
+                (ARRAY_AGG(e.event_id ORDER BY e.event_sequence DESC, e.created_at DESC))[1] AS latest_event_id,
+                (ARRAY_AGG(e.items_added_count ORDER BY e.event_sequence DESC, e.created_at DESC))[1] AS latest_items_added_count,
+                (ARRAY_AGG(e.items_added_total ORDER BY e.event_sequence DESC, e.created_at DESC))[1] AS latest_items_added_total,
+                COALESCE(SUM(e.duplicate_count), 0)::int AS duplicate_event_attempts,
+                COALESCE(SUM(COALESCE(e.items_added_total, e.total_requested_cost, 0)), 0)::float AS total_intake_value
+            FROM preauth_events e
+            WHERE e.org_id = p.org_id
+              AND e.checkin_id = p.request_id
+        ) ev ON TRUE
         LEFT JOIN agent_logs al ON al.request_id = p.request_id
         WHERE p.org_id = $1
           AND ($2::timestamp IS NULL OR p.received_at >= $2::timestamp)
@@ -502,7 +632,14 @@ async def preauth_dashboard(
             p.decision,
             p.agent_result,
             p.error_message,
-            p.processed_at
+            p.processed_at,
+            ev.event_count,
+            ev.latest_event_sequence,
+            ev.latest_event_id,
+            ev.latest_items_added_count,
+            ev.latest_items_added_total,
+            ev.duplicate_event_attempts,
+            ev.total_intake_value
         ORDER BY p.received_at DESC
         LIMIT 100
         """,
@@ -523,8 +660,25 @@ async def preauth_dashboard(
             "escalated": summary["escalated"] if summary else 0,
             "errors": summary["errors"] if summary else 0,
             "received_24h": summary["received_24h"] if summary else 0,
+            "current_snapshot_value": summary["current_snapshot_value"] if summary else 0,
+            "current_snapshot_line_items": summary["current_snapshot_line_items"] if summary else 0,
             "total_amount_approved": summary["total_amount_approved"] if summary else 0,
             "avg_processing_seconds": summary["avg_processing_seconds"] if summary else None,
+            "event_count": event_summary["event_count"] if event_summary else 0,
+            "unique_pa_count": event_summary["unique_pa_count"] if event_summary else 0,
+            "intake_value": event_summary["intake_value"] if event_summary else 0,
+            "added_line_items": event_summary["added_line_items"] if event_summary else 0,
+            "duplicate_event_attempts": duplicate_summary["duplicate_event_attempts"] if duplicate_summary else 0,
+            "all_time_event_count": all_time_event_summary["event_count"] if all_time_event_summary else 0,
+            "all_time_unique_pa_count": all_time_event_summary["unique_pa_count"] if all_time_event_summary else 0,
+            "all_time_intake_value": all_time_event_summary["intake_value"] if all_time_event_summary else 0,
+            "all_time_added_line_items": all_time_event_summary["added_line_items"] if all_time_event_summary else 0,
+            "all_time_duplicate_event_attempts": all_time_duplicate_summary["duplicate_event_attempts"] if all_time_duplicate_summary else 0,
+            "today_event_count": today_event_summary["event_count"] if today_event_summary else 0,
+            "today_unique_pa_count": today_event_summary["unique_pa_count"] if today_event_summary else 0,
+            "today_intake_value": today_event_summary["intake_value"] if today_event_summary else 0,
+            "today_added_line_items": today_event_summary["added_line_items"] if today_event_summary else 0,
+            "today_duplicate_event_attempts": today_duplicate_summary["duplicate_event_attempts"] if today_duplicate_summary else 0,
         },
         "requests": [_dashboard_request(row) for row in rows],
     }
@@ -564,7 +718,13 @@ async def webhook_delivery_logs(
             COUNT(*) FILTER (
                 WHERE payload_status IN ('invalid_json', 'not_json_object')
             )::int AS payload_invalid,
-            COUNT(*) FILTER (WHERE db_insert_status = 'db_upsert_success')::int AS db_saved,
+            COUNT(*) FILTER (
+                WHERE db_insert_status IN (
+                    'db_upsert_success',
+                    'event_saved_latest_state_updated',
+                    'duplicate_event_seen'
+                )
+            )::int AS db_saved,
             COUNT(*) FILTER (WHERE db_insert_status = 'db_insert_failed')::int AS db_failed,
             COUNT(*) FILTER (WHERE http_status_returned BETWEEN 200 AND 299)::int AS http_success,
             COUNT(*) FILTER (WHERE http_status_returned >= 400)::int AS http_failed,
@@ -606,6 +766,7 @@ async def webhook_delivery_logs(
             db_insert_status,
             preauth_request_id,
             preauth_log_id,
+            preauth_event_id,
             http_status_returned,
             final_status,
             error_message,
@@ -618,7 +779,7 @@ async def webhook_delivery_logs(
           AND ($4::timestamp IS NULL OR created_at < $4::timestamp)
           AND (
               $5::boolean = FALSE
-              OR final_status <> 'accepted'
+              OR final_status NOT IN ('accepted', 'accepted_duplicate_event')
               OR http_status_returned >= 400
               OR auth_status <> 'auth_success'
               OR payload_valid = FALSE
@@ -679,6 +840,7 @@ async def webhook_delivery_logs(
                 "db_insert_status": row["db_insert_status"],
                 "preauth_request_id": row["preauth_request_id"],
                 "preauth_log_id": row["preauth_log_id"],
+                "preauth_event_id": row["preauth_event_id"],
                 "http_status_returned": row["http_status_returned"],
                 "final_status": row["final_status"],
                 "error_message": row["error_message"],
@@ -731,6 +893,7 @@ async def webhook_audit_trail(
             w.created_at AS delivery_received_at,
             w.preauth_request_id,
             w.preauth_log_id,
+            w.preauth_event_id,
             p.id AS resolved_preauth_log_id,
             p.request_id AS resolved_request_id,
             p.patient_id,
@@ -822,6 +985,7 @@ async def webhook_audit_trail(
                     "error_message": row["error_message"],
                     "processing_time_ms": row["processing_time_ms"],
                     "received_at": row["delivery_received_at"],
+                    "preauth_event_id": row["preauth_event_id"],
                 },
                 "preauth": {
                     "raw_payload_reference": {
@@ -843,6 +1007,150 @@ async def webhook_audit_trail(
                     "agent_result": parse_json_field(row["agent_result"]) if row["agent_result"] else None,
                     "agent_logs": parse_json_field(row["agent_logs"]) if row["agent_logs"] else [],
                 },
+            }
+            for row in rows
+        ],
+    }
+
+
+@router.get("/preauth-events")
+async def preauth_events(
+    event_id: str | None = None,
+    checkin_id: str | None = None,
+    request_id: str | None = None,
+    include_payload: bool = False,
+    limit: int = 50,
+    claims: dict = Depends(verify_session_token)
+):
+    if claims["role"] != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can view PA event history")
+
+    org_id = _dashboard_org_id(claims)
+    can_view_all = str(claims.get("email", "")).lower() == "kalycodes@gmail.com"
+    safe_limit = min(max(limit, 1), 100)
+
+    rows = await pg_query_all(
+        """
+        SELECT
+            e.id,
+            e.org_id,
+            e.preauth_log_id,
+            e.event_id,
+            e.event_type,
+            e.correlation_id,
+            e.checkin_id,
+            e.request_id,
+            e.patient_id,
+            e.facility_name,
+            e.insurance_no,
+            e.policy_no,
+            e.plan_name,
+            e.event_sequence,
+            e.occurred_at,
+            e.submitted_at,
+            e.item_count,
+            e.total_requested_cost,
+            e.items_added_count,
+            e.items_added_total,
+            e.duplicate_count,
+            e.first_seen_at,
+            e.last_seen_at,
+            e.created_at,
+            e.updated_at,
+            e.raw_payload,
+            e.extracted_fields,
+            e.payload_summary,
+            p.status AS preauth_status,
+            p.decision AS preauth_decision,
+            w.delivery_id,
+            w.final_status AS delivery_status,
+            w.http_status_returned,
+            w.processing_time_ms,
+            COALESCE(wa.delivery_attempts, 0)::int AS delivery_attempts
+        FROM preauth_events e
+        LEFT JOIN preauth_logs p ON p.id = e.preauth_log_id
+        LEFT JOIN LATERAL (
+            SELECT
+                delivery_id,
+                final_status,
+                http_status_returned,
+                processing_time_ms
+            FROM webhook_delivery_logs
+            WHERE preauth_event_id = e.id
+            ORDER BY created_at DESC
+            LIMIT 1
+        ) w ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT COUNT(*) AS delivery_attempts
+            FROM webhook_delivery_logs
+            WHERE preauth_event_id = e.id
+        ) wa ON TRUE
+        WHERE ($1::boolean = TRUE OR e.org_id = $2)
+          AND ($3::text IS NULL OR e.event_id = $3::text)
+          AND ($4::text IS NULL OR e.checkin_id = $4::text)
+          AND (
+              $5::text IS NULL
+              OR e.request_id = $5::text
+              OR p.request_id = $5::text
+          )
+        ORDER BY e.checkin_id DESC, e.event_sequence DESC, e.created_at DESC
+        LIMIT $6
+        """,
+        can_view_all,
+        org_id,
+        event_id,
+        checkin_id,
+        request_id,
+        safe_limit,
+    )
+
+    return {
+        "filters": {
+            "event_id": event_id,
+            "checkin_id": checkin_id,
+            "request_id": request_id,
+            "include_payload": include_payload,
+            "limit": safe_limit,
+        },
+        "events": [
+            {
+                "id": row["id"],
+                "org_id": row["org_id"],
+                "preauth_log_id": row["preauth_log_id"],
+                "event_id": row["event_id"],
+                "event_type": row["event_type"],
+                "correlation_id": row["correlation_id"],
+                "checkin_id": row["checkin_id"],
+                "request_id": row["request_id"],
+                "patient_id": row["patient_id"],
+                "facility_name": row["facility_name"],
+                "insurance_no": row["insurance_no"],
+                "policy_no": row["policy_no"],
+                "plan_name": row["plan_name"],
+                "event_sequence": row["event_sequence"],
+                "occurred_at": row["occurred_at"],
+                "submitted_at": row["submitted_at"],
+                "item_count": row["item_count"],
+                "total_requested_cost": float(row["total_requested_cost"]) if row["total_requested_cost"] is not None else None,
+                "items_added_count": row["items_added_count"],
+                "items_added_total": float(row["items_added_total"]) if row["items_added_total"] is not None else None,
+                "duplicate_count": row["duplicate_count"],
+                "first_seen_at": row["first_seen_at"],
+                "last_seen_at": row["last_seen_at"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+                "preauth_status": row["preauth_status"],
+                "preauth_decision": row["preauth_decision"],
+                "delivery": {
+                    "delivery_id": str(row["delivery_id"]) if row["delivery_id"] else None,
+                    "status": row["delivery_status"],
+                    "http_status_returned": row["http_status_returned"],
+                    "processing_time_ms": row["processing_time_ms"],
+                    "attempts": row["delivery_attempts"],
+                },
+                "payload_summary": parse_json_field(row["payload_summary"]),
+                "raw_payload": parse_json_field(row["raw_payload"]) if include_payload else None,
+                "extracted_fields": parse_json_field(row["extracted_fields"]) if include_payload else None,
             }
             for row in rows
         ],

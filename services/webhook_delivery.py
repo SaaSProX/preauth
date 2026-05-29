@@ -28,6 +28,7 @@ WEBHOOK_LOG_UPDATE_FIELDS = {
     "db_insert_status",
     "preauth_request_id",
     "preauth_log_id",
+    "preauth_event_id",
     "http_status_returned",
     "final_status",
     "error_message",
