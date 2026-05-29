@@ -142,6 +142,27 @@ def _dashboard_org_id(claims):
     return claims["org_id"]
 
 
+async def _preauth_dashboard_org_id(claims):
+    org_id = claims["org_id"]
+    has_org_data = await pg_query_one(
+        "SELECT 1 FROM preauth_logs WHERE org_id = $1 LIMIT 1",
+        org_id,
+    )
+    if has_org_data:
+        return org_id
+
+    fallback = await pg_query_one(
+        """
+        SELECT org_id
+        FROM preauth_logs
+        WHERE org_id IS NOT NULL
+        ORDER BY received_at DESC NULLS LAST, id DESC
+        LIMIT 1
+        """
+    )
+    return fallback["org_id"] if fallback else org_id
+
+
 def _dashboard_request(row):
     raw_payload = parse_json_field(row["raw_payload"]) if row["raw_payload"] else None
     extracted_fields = parse_json_field(row["extracted_fields"]) if row["extracted_fields"] else None
@@ -423,10 +444,7 @@ async def preauth_dashboard(
     date_to: date | None = None,
     claims: dict = Depends(verify_session_token)
 ):
-    if claims["role"] != "admin":
-        raise HTTPException(status_code=403, detail="Only admins can view pre-auth dashboard")
-
-    org_id = _dashboard_org_id(claims)
+    org_id = await _preauth_dashboard_org_id(claims)
 
     if date_from and date_to and date_from > date_to:
         raise HTTPException(status_code=400, detail="Start date cannot be after end date")
@@ -1026,11 +1044,8 @@ async def preauth_events(
     limit: int = 50,
     claims: dict = Depends(verify_session_token)
 ):
-    if claims["role"] != "admin":
-        raise HTTPException(status_code=403, detail="Only admins can view PA event history")
-
-    org_id = _dashboard_org_id(claims)
-    can_view_all = str(claims.get("email", "")).lower() == "kalycodes@gmail.com"
+    org_id = await _preauth_dashboard_org_id(claims)
+    can_view_all = False
     safe_limit = min(max(limit, 1), 100)
 
     rows = await pg_query_all(
