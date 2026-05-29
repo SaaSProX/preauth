@@ -614,7 +614,11 @@ async def preauth_dashboard(
                 COALESCE(SUM(COALESCE(e.items_added_total, e.total_requested_cost, 0)), 0)::float AS total_intake_value
             FROM preauth_events e
             WHERE e.org_id = p.org_id
-              AND e.checkin_id = p.request_id
+              AND e.checkin_id = COALESCE(
+                  p.raw_payload->'encounter'->>'checkin_id',
+                  p.extracted_fields->>'checkin_id',
+                  p.request_id
+              )
         ) ev ON TRUE
         LEFT JOIN agent_logs al ON al.request_id = p.request_id
         WHERE p.org_id = $1
