@@ -441,6 +441,7 @@ async def preauth_dashboard(
     page: int = 1,
     page_size: int = 25,
     plan: str | None = None,
+    q: str | None = None,
     claims: dict = Depends(verify_session_token)
 ):
     # Super-admins can pass ?org_id= to view a client org's activity.
@@ -461,6 +462,11 @@ async def preauth_dashboard(
     date_from_start = datetime.combine(date_from, time.min) if date_from else None
     date_to_end = datetime.combine(date_to + timedelta(days=1), time.min) if date_to else None
     plan_filter = plan.strip() if plan and plan.strip() and plan.strip().lower() != 'all' else None
+    # Trim + wildcard the search term once so every clause uses the same value.
+    # Searches against patient_id, request_id, decision, and the raw payload
+    # JSON-cast-to-text (catches patient names, facilities, plans, etc.).
+    search_q = q.strip() if q and q.strip() else None
+    search_pattern = f"%{search_q}%" if search_q else None
 
     summary = await pg_query_one(
         """
@@ -491,8 +497,14 @@ async def preauth_dashboard(
           AND ($2::timestamp IS NULL OR received_at >= $2::timestamp)
           AND ($3::timestamp IS NULL OR received_at < $3::timestamp)
           AND ($4::text IS NULL OR COALESCE(extracted_fields->>'plan', raw_payload->'policy'->>'plan_name', raw_payload->'policy'->>'insurance_package') ILIKE $4)
+          AND ($5::text IS NULL OR (
+                patient_id ILIKE $5
+                OR request_id ILIKE $5
+                OR COALESCE(decision, '') ILIKE $5
+                OR raw_payload::text ILIKE $5
+          ))
         """,
-        org_id, date_from_start, date_to_end, plan_filter
+        org_id, date_from_start, date_to_end, plan_filter, search_pattern
     )
 
     rows = await pg_query_all(
@@ -528,6 +540,12 @@ async def preauth_dashboard(
           AND ($2::timestamp IS NULL OR p.received_at >= $2::timestamp)
           AND ($3::timestamp IS NULL OR p.received_at < $3::timestamp)
           AND ($4::text IS NULL OR COALESCE(p.extracted_fields->>'plan', p.raw_payload->'policy'->>'plan_name', p.raw_payload->'policy'->>'insurance_package') ILIKE $4)
+          AND ($5::text IS NULL OR (
+                p.patient_id ILIKE $5
+                OR p.request_id ILIKE $5
+                OR COALESCE(p.decision, '') ILIKE $5
+                OR p.raw_payload::text ILIKE $5
+          ))
         GROUP BY
             p.id,
             p.request_id,
@@ -542,9 +560,9 @@ async def preauth_dashboard(
             p.error_message,
             p.processed_at
         ORDER BY p.received_at DESC
-        LIMIT $5 OFFSET $6
+        LIMIT $6 OFFSET $7
         """,
-        org_id, date_from_start, date_to_end, plan_filter, page_size, offset
+        org_id, date_from_start, date_to_end, plan_filter, search_pattern, page_size, offset
     )
 
     series_rows = await pg_query_all(
@@ -573,10 +591,16 @@ async def preauth_dashboard(
           AND ($2::timestamp IS NULL OR received_at >= $2::timestamp)
           AND ($3::timestamp IS NULL OR received_at < $3::timestamp)
           AND ($4::text IS NULL OR COALESCE(extracted_fields->>'plan', raw_payload->'policy'->>'plan_name', raw_payload->'policy'->>'insurance_package') ILIKE $4)
+          AND ($5::text IS NULL OR (
+                patient_id ILIKE $5
+                OR request_id ILIKE $5
+                OR COALESCE(decision, '') ILIKE $5
+                OR raw_payload::text ILIKE $5
+          ))
         GROUP BY date(received_at)
         ORDER BY day
         """,
-        org_id, date_from_start, date_to_end, plan_filter
+        org_id, date_from_start, date_to_end, plan_filter, search_pattern
     )
 
     plans_rows = await pg_query_all(
