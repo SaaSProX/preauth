@@ -590,6 +590,17 @@ async def preauth_dashboard(
         """,
         org_id
     )
+    # The full date span the org has ever received PAs over (ignores active filters).
+    # Used by the dashboard header so the visible timeframe is always honest.
+    window_row = await pg_query_one(
+        "SELECT MIN(received_at) AS earliest, MAX(received_at) AS latest FROM preauth_logs WHERE org_id = $1",
+        org_id
+    )
+    data_window = {
+        "earliest": window_row["earliest"].isoformat() if window_row and window_row.get("earliest") else None,
+        "latest": window_row["latest"].isoformat() if window_row and window_row.get("latest") else None,
+    }
+
     # Dedupe case variants ("Gold" vs "GOLD") — prefer the non-all-caps form
     _plan_groups: dict[str, list[str]] = {}
     for r in plans_rows:
@@ -612,6 +623,7 @@ async def preauth_dashboard(
         },
         "meta": {
             "plans": available_plans,
+            "data_window": data_window,
         },
         "pagination": {
             "page": page,
