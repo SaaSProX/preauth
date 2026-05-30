@@ -458,7 +458,7 @@ async def preauth_dashboard(
                 ),
                 0
             )::float AS total_amount_approved,
-            (AVG(EXTRACT(EPOCH FROM (processed_at::timestamp - received_at)))
+            (AVG(EXTRACT(EPOCH FROM (processed_at - received_at)))
                 FILTER (WHERE processed_at IS NOT NULL))::float AS avg_processing_seconds
         FROM preauth_logs
         WHERE org_id = $1
@@ -525,7 +525,7 @@ async def preauth_dashboard(
             to_char(date(received_at), 'YYYY-MM-DD') AS day,
             COUNT(*)::int AS received,
             COALESCE(
-                AVG(EXTRACT(EPOCH FROM (processed_at::timestamp - received_at)))
+                AVG(EXTRACT(EPOCH FROM (processed_at - received_at)))
                     FILTER (WHERE processed_at IS NOT NULL),
                 0
             )::float AS avg_latency,

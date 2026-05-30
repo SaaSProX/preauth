@@ -69,6 +69,11 @@ ALTER TABLE preauth_logs ADD COLUMN IF NOT EXISTS callback_status TEXT;
 ALTER TABLE preauth_logs ADD COLUMN IF NOT EXISTS callback_http_status INT;
 ALTER TABLE preauth_logs ADD COLUMN IF NOT EXISTS callback_sent_at TIMESTAMPTZ;
 ALTER TABLE preauth_logs ADD COLUMN IF NOT EXISTS callback_error TEXT;
+-- Standardize received_at to a timezone-aware type so latency math is honest
+-- (matches processed_at and agent_logs.logged_at, both TIMESTAMPTZ). The
+-- AT TIME ZONE clause interprets existing naive values as UTC; operators
+-- should adjust to their server TZ if rows were written in another zone.
+ALTER TABLE preauth_logs ALTER COLUMN received_at TYPE TIMESTAMPTZ USING received_at AT TIME ZONE 'UTC';
 
 -- Every inbound webhook delivery attempt, including failures before PA persistence
 CREATE TABLE IF NOT EXISTS webhook_delivery_logs (
