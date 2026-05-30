@@ -438,6 +438,8 @@ async def preauth_dashboard(
     date_from: date | None = None,
     date_to: date | None = None,
     org_id: int | None = None,
+    page: int = 1,
+    page_size: int = 25,
     claims: dict = Depends(verify_session_token)
 ):
     # Super-admins can pass ?org_id= to view a client org's activity.
@@ -447,6 +449,10 @@ async def preauth_dashboard(
             raise HTTPException(status_code=403, detail="Only super-admins can view another org's data")
     else:
         org_id = _dashboard_org_id(claims)
+
+    page = max(1, page)
+    page_size = min(max(1, page_size), 200)
+    offset = (page - 1) * page_size
 
     if date_from and date_to and date_from > date_to:
         raise HTTPException(status_code=400, detail="Start date cannot be after end date")
@@ -532,9 +538,9 @@ async def preauth_dashboard(
             p.error_message,
             p.processed_at
         ORDER BY p.received_at DESC
-        LIMIT 100
+        LIMIT $4 OFFSET $5
         """,
-        org_id, date_from_start, date_to_end
+        org_id, date_from_start, date_to_end, page_size, offset
     )
 
     series_rows = await pg_query_all(
@@ -568,10 +574,17 @@ async def preauth_dashboard(
         org_id, date_from_start, date_to_end
     )
 
+    total = summary["total"] if summary else 0
     return {
         "filters": {
             "date_from": date_from.isoformat() if date_from else None,
             "date_to": date_to.isoformat() if date_to else None,
+        },
+        "pagination": {
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "total_pages": ((total + page_size - 1) // page_size) if page_size > 0 else 0,
         },
         "summary": {
             "total": summary["total"] if summary else 0,
