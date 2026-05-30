@@ -426,9 +426,16 @@ async def list_preauth_payloads(claims: dict = Depends(verify_session_token)):
 async def preauth_dashboard(
     date_from: date | None = None,
     date_to: date | None = None,
+    org_id: int | None = None,
     claims: dict = Depends(verify_session_token)
 ):
-    org_id = _dashboard_org_id(claims)
+    # Super-admins can pass ?org_id= to view a client org's activity.
+    # Anyone else is strictly scoped to their own org_id.
+    if org_id is not None:
+        if not await is_super_admin(claims):
+            raise HTTPException(status_code=403, detail="Only super-admins can view another org's data")
+    else:
+        org_id = _dashboard_org_id(claims)
 
     if date_from and date_to and date_from > date_to:
         raise HTTPException(status_code=400, detail="Start date cannot be after end date")
