@@ -34,6 +34,10 @@ class LoginPayload(BaseModel):
 class TeamInvitePayload(BaseModel):
     email: str
 
+class CreateOrgPayload(BaseModel):
+    org_name: str
+    admin_email: str
+
 
 def parse_json_field(value):
     if isinstance(value, str):
@@ -137,6 +141,17 @@ def _provider_label(value):
 
 def _dashboard_org_id(claims):
     return claims["org_id"]
+
+
+async def is_super_admin(claims):
+    """SaaSPro super-admin = admin of the platform org named 'SAASPRO'."""
+    if claims.get("role") != "admin":
+        return False
+    row = await pg_query_one(
+        "SELECT 1 FROM organizations WHERE id = $1 AND LOWER(name) = 'saaspro' AND is_active = TRUE",
+        claims["org_id"],
+    )
+    return bool(row)
 
 
 def _dashboard_request(row):
@@ -1012,6 +1027,101 @@ async def invite_member(request: Request, claims: dict = Depends(verify_session_
         "message": f"Invite email sent to {payload.email}",
         "email_sent": True,
         "email_id": email_result.get("id")
+    }
+
+
+# ─────────────────────────────────────────────
+# Onboarding (SaaSPro super-admin: cross-org)
+# Super-admin = admin of the SAASPRO platform org.
+# ─────────────────────────────────────────────
+
+@router.get("/onboarding/orgs")
+async def onboarding_list_orgs(claims: dict = Depends(verify_session_token)):
+    if not await is_super_admin(claims):
+        raise HTTPException(status_code=403, detail="Only SaaSPro super-admins can list organizations")
+
+    rows = await pg_query_all(
+        """
+        SELECT
+            o.id,
+            o.name,
+            o.is_active,
+            o.created_at,
+            (SELECT COUNT(*) FROM clients WHERE org_id = o.id AND is_active = TRUE)::int AS members,
+            (SELECT COUNT(*) FROM invites WHERE org_id = o.id AND used = FALSE)::int AS pending_invites,
+            (SELECT COUNT(*) FROM api_clients WHERE org_id = o.id AND is_active = TRUE)::int AS api_keys,
+            (SELECT COUNT(*) FROM preauth_logs WHERE org_id = o.id)::int AS requests,
+            (SELECT MAX(received_at) FROM preauth_logs WHERE org_id = o.id) AS last_activity
+        FROM organizations o
+        ORDER BY o.created_at DESC
+        """
+    )
+    return {"orgs": [dict(r) for r in rows]}
+
+
+@router.post("/onboarding/create-org")
+async def onboarding_create_org(payload: CreateOrgPayload, claims: dict = Depends(verify_session_token)):
+    if not await is_super_admin(claims):
+        raise HTTPException(status_code=403, detail="Only SaaSPro super-admins can create organizations")
+
+    org_name = payload.org_name.strip()
+    admin_email = payload.admin_email.strip().lower()
+    if not org_name or not admin_email or "@" not in admin_email:
+        raise HTTPException(status_code=400, detail="org_name and a valid admin_email are required")
+
+    existing_client = await pg_query_one(
+        "SELECT id FROM clients WHERE LOWER(email) = $1",
+        admin_email,
+    )
+    if existing_client:
+        raise HTTPException(status_code=400, detail="That email is already registered to an organization")
+
+    existing_org = await pg_query_one(
+        "SELECT id, name FROM organizations WHERE LOWER(name) = LOWER($1) AND is_active = TRUE",
+        org_name,
+    )
+    if existing_org:
+        raise HTTPException(status_code=400, detail=f"Organization '{existing_org['name']}' already exists")
+
+    org = await pg_query_one(
+        "INSERT INTO organizations (name) VALUES ($1) RETURNING id, name, created_at",
+        org_name,
+    )
+
+    token = secrets.token_hex(16)
+    await pg_execute(
+        """
+        INSERT INTO invites (org_id, email, token, role, invited_by)
+        VALUES ($1, $2, $3, 'admin', $4)
+        """,
+        org["id"], admin_email, token, int(claims["sub"]),
+    )
+
+    invite_link = build_invite_link(token, admin_email)
+
+    email_sent = False
+    email_error = None
+    try:
+        await asyncio.to_thread(
+            send_invite_email,
+            admin_email,
+            invite_link,
+            org_name,
+            None,
+        )
+    except EmailDeliveryError as exc:
+        email_error = str(exc)
+    else:
+        email_sent = True
+
+    return {
+        "org": {"id": org["id"], "name": org["name"], "created_at": org["created_at"]},
+        "invite": {
+            "email": admin_email,
+            "invite_link": invite_link,
+            "email_sent": email_sent,
+            "email_error": email_error,
+        },
     }
 
 
