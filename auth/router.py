@@ -232,6 +232,7 @@ def _dashboard_request(row):
         "extracted_fields": extracted_fields,
         "agent_result": agent_result,
         "agent_logs": agent_logs or [],
+        "patient_pa_count": (row["patient_pa_count"] if "patient_pa_count" in row.keys() else None),
     }
 
 
@@ -533,7 +534,12 @@ async def preauth_dashboard(
                     ORDER BY al.agent_num, al.logged_at
                 ) FILTER (WHERE al.id IS NOT NULL),
                 '[]'::jsonb
-            ) AS agent_logs
+            ) AS agent_logs,
+            CASE
+                WHEN p.patient_id IS NULL OR p.patient_id = 'unknown' THEN 0
+                ELSE (SELECT COUNT(*)::int FROM preauth_logs p2
+                      WHERE p2.org_id = p.org_id AND p2.patient_id = p.patient_id)
+            END AS patient_pa_count
         FROM preauth_logs p
         LEFT JOIN agent_logs al ON al.request_id = p.request_id
         WHERE p.org_id = $1
