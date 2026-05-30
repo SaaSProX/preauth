@@ -557,6 +557,14 @@ async def _save_decision(request_id: str, decision: str, result: dict):
     )
     logger.info(f"[Agent] ── END ── request_id={request_id} decision={decision}")
 
+    # Send the decision back to Aman (advisory callback — integration direction (ii)).
+    # Imported lazily to avoid any startup-time coupling.
+    try:
+        from services.aman_callback import send_decision_to_aman
+        await send_decision_to_aman(str(request_id))
+    except Exception:
+        logger.exception("[Agent] Aman callback failed (logged, not raised)")
+
 
 def _get_estimated_cost(pa: dict) -> float | None:
     if not isinstance(pa, dict):

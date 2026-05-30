@@ -65,6 +65,10 @@ ALTER TABLE preauth_logs ADD COLUMN IF NOT EXISTS decision TEXT;
 ALTER TABLE preauth_logs ADD COLUMN IF NOT EXISTS agent_result JSONB;
 ALTER TABLE preauth_logs ADD COLUMN IF NOT EXISTS error_message TEXT;
 ALTER TABLE preauth_logs ADD COLUMN IF NOT EXISTS processed_at TIMESTAMPTZ;
+ALTER TABLE preauth_logs ADD COLUMN IF NOT EXISTS callback_status TEXT;
+ALTER TABLE preauth_logs ADD COLUMN IF NOT EXISTS callback_http_status INT;
+ALTER TABLE preauth_logs ADD COLUMN IF NOT EXISTS callback_sent_at TIMESTAMPTZ;
+ALTER TABLE preauth_logs ADD COLUMN IF NOT EXISTS callback_error TEXT;
 
 -- Every inbound webhook delivery attempt, including failures before PA persistence
 CREATE TABLE IF NOT EXISTS webhook_delivery_logs (
