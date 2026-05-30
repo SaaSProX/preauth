@@ -656,6 +656,74 @@ async def preauth_dashboard(
     }
 
 
+@router.get("/patient-history")
+async def patient_history(
+    patient_id: str,
+    org_id: int | None = None,
+    claims: dict = Depends(verify_session_token),
+):
+    """Return every PA in the caller's org for a single patient.
+
+    Matches on the stored patient_id, and also (when stored is null/'unknown')
+    on raw_payload.enrollee.insurance_no — that's the same fallback used when
+    surfacing patient_id to the dashboard. Returns an empty list for a bare
+    'unknown' so we never group unrelated parse-failure rows together.
+    """
+    if org_id is not None:
+        if not await is_super_admin(claims):
+            raise HTTPException(status_code=403, detail="Only super-admins can view another org's data")
+    else:
+        org_id = _dashboard_org_id(claims)
+
+    pid = (patient_id or "").strip()
+    if not pid or pid.lower() == "unknown":
+        return {"patient_id": pid, "requests": []}
+
+    rows = await pg_query_all(
+        """
+        SELECT
+            p.id,
+            p.request_id,
+            p.patient_id,
+            p.status,
+            p.received_at,
+            p.raw_payload,
+            p.extracted_fields,
+            p.agent_step,
+            p.decision,
+            p.agent_result,
+            p.error_message,
+            p.processed_at,
+            COALESCE(
+                jsonb_agg(
+                    jsonb_build_object(
+                        'agent_num', al.agent_num,
+                        'agent_name', al.agent_name,
+                        'status', al.status,
+                        'result', al.result,
+                        'logged_at', al.logged_at
+                    )
+                    ORDER BY al.agent_num, al.logged_at
+                ) FILTER (WHERE al.id IS NOT NULL),
+                '[]'::jsonb
+            ) AS agent_logs
+        FROM preauth_logs p
+        LEFT JOIN agent_logs al ON al.request_id = p.request_id
+        WHERE p.org_id = $1
+          AND (
+                p.patient_id = $2
+                OR ((p.patient_id IS NULL OR p.patient_id = 'unknown') AND p.raw_payload->'enrollee'->>'insurance_no' = $2)
+              )
+        GROUP BY p.id, p.request_id, p.patient_id, p.status, p.received_at,
+                 p.raw_payload, p.extracted_fields, p.agent_step, p.decision,
+                 p.agent_result, p.error_message, p.processed_at
+        ORDER BY p.received_at DESC
+        """,
+        org_id, pid,
+    )
+    return {"patient_id": pid, "requests": [_dashboard_request(row) for row in rows]}
+
+
 @router.get("/webhook-delivery-logs")
 async def webhook_delivery_logs(
     date_from: date | None = None,
