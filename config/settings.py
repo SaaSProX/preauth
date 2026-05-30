@@ -26,6 +26,9 @@ class Settings(BaseSettings):
     aman_decisions_url: str = ""
     kpa_key: str = ""
 
+    # CORS — comma-separated list of allowed origins (default is local dev)
+    cors_origins: str = "http://localhost:5173,http://localhost:3000"
+
     # Email (Resend)
     resend_api_key: str = ""
     resend_from_email: str = ""
