@@ -440,6 +440,7 @@ async def preauth_dashboard(
     org_id: int | None = None,
     page: int = 1,
     page_size: int = 25,
+    plan: str | None = None,
     claims: dict = Depends(verify_session_token)
 ):
     # Super-admins can pass ?org_id= to view a client org's activity.
@@ -459,6 +460,7 @@ async def preauth_dashboard(
 
     date_from_start = datetime.combine(date_from, time.min) if date_from else None
     date_to_end = datetime.combine(date_to + timedelta(days=1), time.min) if date_to else None
+    plan_filter = plan.strip() if plan and plan.strip() and plan.strip().lower() != 'all' else None
 
     summary = await pg_query_one(
         """
@@ -488,8 +490,9 @@ async def preauth_dashboard(
         WHERE org_id = $1
           AND ($2::timestamp IS NULL OR received_at >= $2::timestamp)
           AND ($3::timestamp IS NULL OR received_at < $3::timestamp)
+          AND ($4::text IS NULL OR COALESCE(extracted_fields->>'plan', raw_payload->'policy'->>'plan_name', raw_payload->'policy'->>'insurance_package') ILIKE $4)
         """,
-        org_id, date_from_start, date_to_end
+        org_id, date_from_start, date_to_end, plan_filter
     )
 
     rows = await pg_query_all(
@@ -524,6 +527,7 @@ async def preauth_dashboard(
         WHERE p.org_id = $1
           AND ($2::timestamp IS NULL OR p.received_at >= $2::timestamp)
           AND ($3::timestamp IS NULL OR p.received_at < $3::timestamp)
+          AND ($4::text IS NULL OR COALESCE(p.extracted_fields->>'plan', p.raw_payload->'policy'->>'plan_name', p.raw_payload->'policy'->>'insurance_package') ILIKE $4)
         GROUP BY
             p.id,
             p.request_id,
@@ -538,9 +542,9 @@ async def preauth_dashboard(
             p.error_message,
             p.processed_at
         ORDER BY p.received_at DESC
-        LIMIT $4 OFFSET $5
+        LIMIT $5 OFFSET $6
         """,
-        org_id, date_from_start, date_to_end, page_size, offset
+        org_id, date_from_start, date_to_end, plan_filter, page_size, offset
     )
 
     series_rows = await pg_query_all(
@@ -568,17 +572,46 @@ async def preauth_dashboard(
         WHERE org_id = $1
           AND ($2::timestamp IS NULL OR received_at >= $2::timestamp)
           AND ($3::timestamp IS NULL OR received_at < $3::timestamp)
+          AND ($4::text IS NULL OR COALESCE(extracted_fields->>'plan', raw_payload->'policy'->>'plan_name', raw_payload->'policy'->>'insurance_package') ILIKE $4)
         GROUP BY date(received_at)
         ORDER BY day
         """,
-        org_id, date_from_start, date_to_end
+        org_id, date_from_start, date_to_end, plan_filter
     )
+
+    plans_rows = await pg_query_all(
+        """
+        SELECT DISTINCT
+            COALESCE(extracted_fields->>'plan', raw_payload->'policy'->>'plan_name', raw_payload->'policy'->>'insurance_package') AS plan
+        FROM preauth_logs
+        WHERE org_id = $1
+          AND COALESCE(extracted_fields->>'plan', raw_payload->'policy'->>'plan_name', raw_payload->'policy'->>'insurance_package') IS NOT NULL
+        ORDER BY plan
+        """,
+        org_id
+    )
+    # Dedupe case variants ("Gold" vs "GOLD") — prefer the non-all-caps form
+    _plan_groups: dict[str, list[str]] = {}
+    for r in plans_rows:
+        p = r["plan"]
+        if not p:
+            continue
+        _plan_groups.setdefault(p.lower(), []).append(p)
+    available_plans: list[str] = []
+    for variants in _plan_groups.values():
+        non_upper = [v for v in variants if not v.isupper()]
+        available_plans.append(non_upper[0] if non_upper else variants[0].title())
+    available_plans.sort(key=lambda s: s.lower())
 
     total = summary["total"] if summary else 0
     return {
         "filters": {
             "date_from": date_from.isoformat() if date_from else None,
             "date_to": date_to.isoformat() if date_to else None,
+            "plan": plan_filter,
+        },
+        "meta": {
+            "plans": available_plans,
         },
         "pagination": {
             "page": page,
