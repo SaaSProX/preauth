@@ -1132,6 +1132,52 @@ async def onboarding_create_org(payload: CreateOrgPayload, claims: dict = Depend
     }
 
 
+class UpdateOrgPayload(BaseModel):
+    name: str | None = None
+    is_active: bool | None = None
+
+
+@router.patch("/onboarding/orgs/{org_id}")
+async def onboarding_update_org(org_id: int, payload: UpdateOrgPayload, claims: dict = Depends(verify_session_token)):
+    if not await is_super_admin(claims):
+        raise HTTPException(status_code=403, detail="Only SaaSPro super-admins can edit organizations")
+
+    org = await pg_query_one(
+        "SELECT id, name, is_active FROM organizations WHERE id = $1",
+        org_id,
+    )
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    if payload.is_active is False and org["name"].upper() == "SAASPRO":
+        raise HTTPException(status_code=400, detail="Cannot deactivate the SaaSPro platform org")
+
+    new_name = payload.name.strip() if payload.name is not None else None
+    if new_name:
+        existing = await pg_query_one(
+            "SELECT id FROM organizations WHERE LOWER(name) = LOWER($1) AND id <> $2",
+            new_name, org_id,
+        )
+        if existing:
+            raise HTTPException(status_code=400, detail=f"Another organization is already named '{new_name}'")
+
+    updates = []
+    args = [org_id]
+    if new_name:
+        args.append(new_name)
+        updates.append(f"name = ${len(args)}")
+    if payload.is_active is not None:
+        args.append(payload.is_active)
+        updates.append(f"is_active = ${len(args)}")
+
+    if not updates:
+        return {"org": {"id": org["id"], "name": org["name"], "is_active": org["is_active"]}, "message": "No changes"}
+
+    sql = f"UPDATE organizations SET {', '.join(updates)} WHERE id = $1 RETURNING id, name, is_active, created_at"
+    updated = await pg_query_one(sql, *args)
+    return {"org": dict(updated), "message": "Updated"}
+
+
 # ─────────────────────────────────────────────
 # Get current user info
 # ─────────────────────────────────────────────
