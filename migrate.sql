@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS api_clients (
 );
 
 ALTER TABLE api_clients ADD COLUMN IF NOT EXISTS user_id INT REFERENCES clients(id);
+ALTER TABLE api_clients ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMPTZ;
 
 -- Every incoming webhook request
 CREATE TABLE IF NOT EXISTS preauth_logs (

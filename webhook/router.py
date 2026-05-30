@@ -5,7 +5,7 @@ import uuid
 from datetime import date, datetime
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
-from services.db import pg_query_one
+from services.db import pg_execute, pg_query_one
 from services.webhook_delivery import (
     create_webhook_delivery_log,
     mask_api_key,
@@ -68,6 +68,15 @@ async def authenticate_webhook_request(request: Request):
     )
     if not client:
         return None, "invalid_api_key", "Invalid API key"
+
+    # Stamp last_used_at — non-fatal if it fails.
+    try:
+        await pg_execute(
+            "UPDATE api_clients SET last_used_at = NOW() WHERE id = $1",
+            client["id"],
+        )
+    except Exception:
+        logger.exception("failed to update last_used_at for api_client %s", client.get("id"))
 
     return client, "auth_success", None
 

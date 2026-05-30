@@ -311,39 +311,51 @@ async def login(payload: LoginPayload):
 
 
 # ─────────────────────────────────────────────
-# Generate API key (user-owned)
+# API keys (user-owned, multiple per user)
 # ─────────────────────────────────────────────
 
+class GenerateKeyPayload(BaseModel):
+    name: str | None = None
+
+
+def _mask_key(k: str) -> str:
+    if not k or len(k) < 4:
+        return "••••"
+    return "••••" + k[-4:]
+
+
 @router.get("/api-key")
-async def get_user_api_key(claims: dict = Depends(verify_session_token)):
-    api_client = await pg_query_one(
+async def list_user_api_keys(claims: dict = Depends(verify_session_token)):
+    rows = await pg_query_all(
         """
-        SELECT id, created_at
+        SELECT id, client_name, api_key, created_at, last_used_at
         FROM api_clients
         WHERE org_id = $1 AND user_id = $2 AND is_active = TRUE
         ORDER BY created_at DESC
-        LIMIT 1
         """,
         claims["org_id"], int(claims["sub"])
     )
-
-    if not api_client:
-        return {"has_api_key": False}
-
     return {
-        "has_api_key": True,
-        "masked_api_key": "*****",
-        "created_at": api_client["created_at"],
+        "keys": [
+            {
+                "id": r["id"],
+                "name": r["client_name"],
+                "masked_api_key": _mask_key(r["api_key"]),
+                "created_at": r["created_at"],
+                "last_used_at": r["last_used_at"],
+            }
+            for r in rows
+        ]
     }
 
 
 @router.post("/api-key/generate")
-async def generate_user_api_key(claims: dict = Depends(verify_session_token)):
+async def generate_user_api_key(payload: GenerateKeyPayload, claims: dict = Depends(verify_session_token)):
     org_id = claims["org_id"]
     user_id = int(claims["sub"])
     client = await pg_query_one(
         """
-        SELECT clients.name, clients.email, organizations.name AS org_name
+        SELECT clients.name, clients.email
         FROM clients
         JOIN organizations ON organizations.id = clients.org_id
         WHERE clients.id = $1 AND clients.org_id = $2
@@ -354,36 +366,35 @@ async def generate_user_api_key(claims: dict = Depends(verify_session_token)):
     if not client:
         raise HTTPException(status_code=404, detail="User or organization not found")
 
-    await pg_execute(
-        "DELETE FROM api_clients WHERE org_id = $1 AND user_id = $2 AND is_active = TRUE",
-        org_id, user_id
-    )
+    name = ((payload.name or "").strip()) or f"{client['name']} ({client['email']})"
 
     api_key = generate_api_key()
-    api_client = await pg_query_one(
+    row = await pg_query_one(
         """
         INSERT INTO api_clients (org_id, user_id, client_name, api_key)
         VALUES ($1, $2, $3, $4)
-        RETURNING created_at
+        RETURNING id, client_name, created_at
         """,
-        org_id, user_id, f"{client['name']} ({client['email']})", api_key
+        org_id, user_id, name, api_key
     )
 
     return {
         "message": "API key generated",
+        "id": row["id"],
+        "name": row["client_name"],
         "api_key": api_key,
-        "created_at": api_client["created_at"],
-        "note": "Save your API key — it won't be shown again"
+        "masked_api_key": _mask_key(api_key),
+        "created_at": row["created_at"],
+        "note": "Save your API key — it won't be shown again",
     }
 
 
-@router.delete("/api-key")
-async def revoke_user_api_key(claims: dict = Depends(verify_session_token)):
+@router.delete("/api-key/{key_id}")
+async def revoke_user_api_key(key_id: int, claims: dict = Depends(verify_session_token)):
     await pg_execute(
-        "DELETE FROM api_clients WHERE org_id = $1 AND user_id = $2 AND is_active = TRUE",
-        claims["org_id"], int(claims["sub"])
+        "DELETE FROM api_clients WHERE id = $1 AND org_id = $2 AND user_id = $3",
+        key_id, claims["org_id"], int(claims["sub"])
     )
-
     return {"message": "API key revoked"}
 
 
