@@ -1,6 +1,9 @@
-# PreAuth
+# PreAuth (backend)
 
 AI-powered pre-authorization automation for Health Maintenance Organizations (HMOs) in Nigeria.
+
+The companion **operations dashboard** lives in its own repo:
+[`SaaSProX/preauth-intake-dashboard`](https://github.com/SaaSProX/preauth-intake-dashboard).
 
 ## Overview
 
@@ -64,34 +67,29 @@ The agent evaluates each request against the HMO's knowledge base:
 
 ```
 preauth/
-├── main.py                # FastAPI application entry point
+├── main.py                # FastAPI app entry point + CORS config
 ├── Dockerfile             # Container image
 ├── docker-compose.yml     # Local development
-├── requirements.txt       # Python dependencies
-├── migrate.sql            # Dashboard database schema
-├── kb/                    # Knowledge base configs (per HMO)
-│   └── {hmo}_plans.json
+├── requirements.txt       # Python deps (FastAPI, asyncpg, anthropic, httpx, …)
+├── migrate.sql            # Postgres schema — run on prod DB before deploy
 ├── agent/
-│   ├── agent.py           # AI agent loop and tool execution
-│   ├── prompts.py         # System prompt builder
-│   └── tools.py           # Tool definitions
+│   └── agent.py           # 4-agent pipeline: Eligibility → Coverage → Limits → Decision
+├── auth/
+│   ├── router.py          # All /auth/* endpoints (dashboard, login, onboarding, team, api keys, patient-history, preauth-events)
+│   └── utils.py           # JWT, password hashing, session helpers
 ├── config/
 │   └── settings.py        # Environment configuration
-├── models/
-│   └── schemas.py         # Pydantic models
 ├── services/
-│   └── db.py              # Database utilities
+│   ├── db.py              # Postgres helpers (pg_query_one / pg_query_all / pg_execute)
+│   ├── aman_callback.py   # Posts agent decisions back to Aman
+│   ├── preauth_events.py  # Tracks each intake-webhook delivery per check-in
+│   ├── webhook_delivery.py # Logs every inbound webhook attempt (auth, parse, insert)
+│   ├── invites.py         # Invite link tokens
+│   └── notifier.py        # Resend transactional email
 ├── webhook/
-│   └── router.py          # Webhook endpoint handler
-├── infra/
-│   ├── terraform/         # Infrastructure as Code
-│   │   ├── main.tf
-│   │   ├── variables.tf
-│   │   └── outputs.tf
-│   └── setup-droplet.sh   # Server setup script
-└── .github/
-    └── workflows/
-        └── deploy.yml     # CI/CD pipeline
+│   └── router.py          # /webhook/preauth — authenticated intake from HMO
+├── infra/                 # Terraform + droplet bootstrap
+└── .github/workflows/     # CI/CD
 ```
 
 ## Setup
@@ -126,23 +124,28 @@ Create a `.env` file:
 # AI Provider
 ANTHROPIC_API_KEY=sk-ant-...
 
-# HMO Database (MySQL)
-HMO_DB_HOST=
-HMO_DB_PORT=3306
-HMO_DB_USER=
-HMO_DB_PASSWORD=
-HMO_DB_NAME=
+# Our Postgres (Supabase in prod, Homebrew local in dev)
+OUR_DB_URL=postgresql://user:pass@host:5432/dbname
 
-# Webhook Security
-WEBHOOK_SECRET=
+# Auth — sessions are 7-day JWTs (HS256)
+JWT_SECRET=<long random string>
+
+# Dashboard origin allowlist for CORS (comma-separated; defaults to local dev)
+CORS_ORIGINS=https://dashboard.yourdomain.com,https://staging.yourdomain.com
+
+# Outbound: send agent decisions back to Aman
+AMAN_DECISIONS_URL=https://aman.example/api/preauth/decisions
+KPA_KEY=<bearer key Aman gave you>
 
 # Dashboard
-DASHBOARD_BASE_URL=http://localhost:3000
+DASHBOARD_BASE_URL=https://dashboard.yourdomain.com
 
 # Notifications (Resend)
 RESEND_API_KEY=
 RESEND_FROM_EMAIL="Saaspro Lab <no-reply@saasprolabs.io>"
 ```
+
+`CORS_ORIGINS`, `AMAN_DECISIONS_URL`, and `KPA_KEY` are recent additions. The backend will start without them but: missing `CORS_ORIGINS` blocks the dashboard from calling the API, and missing `AMAN_DECISIONS_URL`/`KPA_KEY` makes the agent skip the decision callback (logged as `skipped_no_config`).
 
 ### Running Locally
 
@@ -244,30 +247,54 @@ docker compose restart caddy
 
 Caddy automatically provisions SSL certificates via Let's Encrypt.
 
-## API
+## Multi-tenancy
 
-### Submit Pre-Auth Request
+Every table that holds PA data has an `org_id` column. Every dashboard query ends with `WHERE org_id = $1` where `$1` comes from the caller's JWT (not from any URL param). One backend, many HMO tenants, strict row-level isolation.
+
+**Three logical roles:**
+
+| Role | Org | Sees |
+|---|---|---|
+| SaaSPro super-admin | The platform org named `SAASPRO` | Own org by default; can drill into any client org via `?org_id=` (read-only) |
+| Client admin | e.g. `AMAN` | Their org only — full read + write (team, API keys, settings) |
+| Client member | e.g. `AMAN` | Their org only — read-only |
+
+The dashboard's `?org_id=` drill-in is **server-side checked** (`is_super_admin(claims)` in `auth/router.py`) — passing it as a non-super-admin returns 403.
+
+## API endpoints
+
+All `/auth/*` endpoints require a `Bearer` JWT in the `Authorization` header. `/webhook/*` uses an API key on the request body.
+
+### Webhook (HMO → us)
 
 ```
 POST /webhook/preauth
 ```
+Authenticated by an `api_key` field (issued per org from the dashboard's API Keys page). Receives → acks fast → kicks off the 4-agent pipeline in the background. Every delivery (including bad keys, malformed payloads) is logged to `webhook_delivery_logs`. Every successful intake is also logged to `preauth_events` so the dashboard can show the full intake history per check-in (first capture + later additions).
 
-```json
-{
-  "request_id": "REQ-2024-001234",
-  "patient_id": "PAT-5678",
-  "secret": "webhook-secret"
-}
+### Dashboard endpoints (dashboard → us)
+
+```
+POST /auth/login                          # email + password → JWT
+GET  /auth/preauth-dashboard              # paginated queue + summary + chart series
+GET  /auth/patient-history?patient_id=    # every PA for one patient in caller's org
+GET  /auth/preauth-events?checkin_id=     # full delivery timeline for one PA
+GET  /auth/webhook-delivery-logs          # integration health view (failed/passed webhooks)
+GET  /auth/webhook-audit-trail            # per-request pipeline replay
+GET  /auth/team           POST /auth/team/invite                DELETE /auth/team/{email}
+GET  /auth/api-keys       POST /auth/api-keys/generate          DELETE /auth/api-keys/{id}
+GET  /auth/onboarding/orgs                POST /auth/onboarding/orgs           (super-admin)
+PATCH /auth/onboarding/orgs/{id}                                                 (super-admin)
 ```
 
-Response (immediate):
-```json
-{
-  "status": "received"
-}
-```
+`/auth/preauth-dashboard` supports:
+- `page` (1+), `page_size` (1–200, default 25)
+- `date_from`, `date_to` (YYYY-MM-DD)
+- `plan=Bronze|Silver|Gold|…` — case-insensitive ILIKE match
+- `q=…` — searches `patient_id`, `request_id`, `decision`, and the full `raw_payload::text`
+- `org_id=N` — super-admin drill-in
 
-Processing happens asynchronously. Results are written to the HMO database and notifications sent to providers.
+Response includes per-row `patient_pa_count`, `event_count`, plus `meta.data_window` (earliest/latest received_at) and `meta.plans` (deduped distinct plans for the dropdown).
 
 ### Health Check
 
@@ -277,16 +304,29 @@ GET /health
 
 ## Adding a New HMO
 
-1. Create knowledge base file: `kb/{hmo_name}_plans.json`
-2. Define plans, limits, exclusions, and decision rules
-3. Configure database connection for the HMO
-4. Set up webhook integration with HMO's system
+1. **Create the org** from the dashboard's Onboarding view (super-admin only).
+2. **Invite the HMO's first admin** by email — they get a link to set their password.
+3. **Generate an API key** for them from the dashboard's API Keys page.
+4. They point their webhook at `POST /webhook/preauth` with that key.
+5. Their PAs land tagged with their `org_id` automatically and never leak into another tenant.
 
-See `kb/example_plans.json` for the schema structure.
+**Caveat:** the AI agent's plan benefits + exclusions knowledge base is currently hard-coded for Aman in `agent/agent.py`. Until that's parameterized per org (planned), a new HMO's PAs will be evaluated against Aman's rules. The dashboard isolation works fully; the AI accuracy is what's tenant-coupled.
+
+## Schema migrations
+
+`migrate.sql` is **manual** — there is no auto-migrate on startup. Before deploying a release that introduces new columns or tables, run it against the target Postgres:
+
+```bash
+psql "$OUR_DB_URL" -f migrate.sql
+```
+
+Every statement uses `IF NOT EXISTS`, so the file is safe to re-run.
+
+The one statement to watch is the `received_at TIMESTAMPTZ` conversion — it interprets existing naive timestamps as UTC. If your prod has been inserting in another tz, sanity-check the existing rows first.
 
 ## Current Pilot
 
-**Aman HMO** — First integration partner for pilot testing.
+**Aman HMO** — first integration partner. PAs flow in from Aman's `pa.submitted` / `pa.items_added` webhooks; agent decisions flow back via `AMAN_DECISIONS_URL` (advisory mode while mapping is being verified).
 
 ## License
 
