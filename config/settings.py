@@ -26,8 +26,8 @@ class Settings(BaseSettings):
     aman_decisions_url: str = ""
     kpa_key: str = ""
 
-    # CORS — comma-separated list of allowed origins (default is local dev)
-    cors_origins: str = "http://localhost:5173,http://localhost:3000"
+    # CORS — comma-separated list of allowed origins.
+    cors_origins: str = "https://dashboard.saasprolabs.io,http://localhost:5174,http://127.0.0.1:5174,http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000"
 
     # Email (Resend)
     resend_api_key: str = ""
