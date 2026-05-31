@@ -1369,11 +1369,28 @@ async def webhook_delivery_logs(
     date_to: date | None = None,
     org_id: int | None = None,
     failed_only: bool = False,
+    status: str = "all",
     limit: int = 100,
     claims: dict = Depends(verify_session_token)
 ):
     if date_from and date_to and date_from > date_to:
         raise HTTPException(status_code=400, detail="Start date cannot be after end date")
+
+    delivery_status = (status or "all").strip().lower()
+    if failed_only and delivery_status == "all":
+        delivery_status = "failed"
+    allowed_statuses = {
+        "all",
+        "accepted",
+        "failed",
+        "auth_failed",
+        "invalid_payload",
+        "db_failed",
+        "http_failed",
+        "duplicates",
+    }
+    if delivery_status not in allowed_statuses:
+        raise HTTPException(status_code=400, detail=f"Unsupported delivery status filter: {status}")
 
     if org_id is not None:
         if not await is_platform_admin(claims):
@@ -1381,7 +1398,7 @@ async def webhook_delivery_logs(
     else:
         org_id = _dashboard_org_id(claims)
     can_view_all = False
-    safe_limit = min(max(limit, 1), 250)
+    safe_limit = min(max(limit, 1), 1000)
     date_from_start = datetime.combine(date_from, time.min) if date_from else None
     date_to_end = datetime.combine(date_to + timedelta(days=1), time.min) if date_to else None
 
@@ -1411,12 +1428,38 @@ async def webhook_delivery_logs(
             COUNT(*) FILTER (WHERE http_status_returned >= 400)::int AS http_failed,
             AVG(processing_time_ms)::float AS avg_processing_time_ms,
             MAX(created_at) AS latest_received_at
-        FROM webhook_delivery_logs
-        WHERE ($1::boolean = TRUE OR org_id = $2)
-          AND ($3::timestamp IS NULL OR created_at >= $3::timestamp)
-          AND ($4::timestamp IS NULL OR created_at < $4::timestamp)
+        FROM webhook_delivery_logs w
+        WHERE ($1::boolean = TRUE OR w.org_id = $2)
+          AND ($3::timestamp IS NULL OR w.created_at >= $3::timestamp)
+          AND ($4::timestamp IS NULL OR w.created_at < $4::timestamp)
+          AND (
+              $5::text = 'all'
+              OR (
+                  $5::text = 'accepted'
+                  AND w.final_status IN ('accepted', 'accepted_duplicate_event')
+                  AND (w.http_status_returned IS NULL OR w.http_status_returned < 400)
+                  AND w.auth_status = 'auth_success'
+                  AND w.payload_valid = TRUE
+                  AND w.db_insert_status <> 'db_insert_failed'
+              )
+              OR (
+                  $5::text = 'failed'
+                  AND (
+                      w.final_status NOT IN ('accepted', 'accepted_duplicate_event')
+                      OR w.http_status_returned >= 400
+                      OR w.auth_status <> 'auth_success'
+                      OR w.payload_valid = FALSE
+                      OR w.db_insert_status = 'db_insert_failed'
+                  )
+              )
+              OR ($5::text = 'auth_failed' AND w.auth_status <> 'auth_success')
+              OR ($5::text = 'invalid_payload' AND (w.payload_valid = FALSE OR w.payload_status IN ('invalid_json', 'not_json_object')))
+              OR ($5::text = 'db_failed' AND w.db_insert_status = 'db_insert_failed')
+              OR ($5::text = 'http_failed' AND w.http_status_returned >= 400)
+              OR ($5::text = 'duplicates' AND (w.final_status = 'accepted_duplicate_event' OR w.db_insert_status = 'duplicate_event_seen'))
+          )
         """,
-        can_view_all, org_id, date_from_start, date_to_end
+        can_view_all, org_id, date_from_start, date_to_end, delivery_status
     )
 
     rows = await pg_query_all(
@@ -1461,23 +1504,42 @@ async def webhook_delivery_logs(
           AND ($3::timestamp IS NULL OR w.created_at >= $3::timestamp)
           AND ($4::timestamp IS NULL OR w.created_at < $4::timestamp)
           AND (
-              $5::boolean = FALSE
-              OR w.final_status NOT IN ('accepted', 'accepted_duplicate_event')
-              OR w.http_status_returned >= 400
-              OR w.auth_status <> 'auth_success'
-              OR w.payload_valid = FALSE
-              OR w.db_insert_status = 'db_insert_failed'
+              $5::text = 'all'
+              OR (
+                  $5::text = 'accepted'
+                  AND w.final_status IN ('accepted', 'accepted_duplicate_event')
+                  AND (w.http_status_returned IS NULL OR w.http_status_returned < 400)
+                  AND w.auth_status = 'auth_success'
+                  AND w.payload_valid = TRUE
+                  AND w.db_insert_status <> 'db_insert_failed'
+              )
+              OR (
+                  $5::text = 'failed'
+                  AND (
+                      w.final_status NOT IN ('accepted', 'accepted_duplicate_event')
+                      OR w.http_status_returned >= 400
+                      OR w.auth_status <> 'auth_success'
+                      OR w.payload_valid = FALSE
+                      OR w.db_insert_status = 'db_insert_failed'
+                  )
+              )
+              OR ($5::text = 'auth_failed' AND w.auth_status <> 'auth_success')
+              OR ($5::text = 'invalid_payload' AND (w.payload_valid = FALSE OR w.payload_status IN ('invalid_json', 'not_json_object')))
+              OR ($5::text = 'db_failed' AND w.db_insert_status = 'db_insert_failed')
+              OR ($5::text = 'http_failed' AND w.http_status_returned >= 400)
+              OR ($5::text = 'duplicates' AND (w.final_status = 'accepted_duplicate_event' OR w.db_insert_status = 'duplicate_event_seen'))
           )
         ORDER BY w.created_at DESC
         LIMIT $6
         """,
-        can_view_all, org_id, date_from_start, date_to_end, failed_only, safe_limit
+        can_view_all, org_id, date_from_start, date_to_end, delivery_status, safe_limit
     )
 
     return {
         "filters": {
             "date_from": date_from.isoformat() if date_from else None,
             "date_to": date_to.isoformat() if date_to else None,
+            "status": delivery_status,
             "failed_only": failed_only,
             "limit": safe_limit,
         },
