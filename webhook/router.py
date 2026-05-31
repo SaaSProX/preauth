@@ -5,6 +5,7 @@ import uuid
 from datetime import date, datetime
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from agent import agent
 from services.db import pg_query_one
 from services.preauth_events import persist_preauth_intake_event
 from services.webhook_delivery import (
