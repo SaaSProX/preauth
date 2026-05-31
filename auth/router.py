@@ -377,9 +377,25 @@ def _mask_key(k: str) -> str:
 
 @router.get("/api-key")
 async def list_user_api_keys(claims: dict = Depends(verify_session_token)):
-    rows = await pg_query_all(
+    last_used_column = await pg_query_one(
         """
-        SELECT id, client_name, api_key, created_at, last_used_at
+        SELECT EXISTS (
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'api_clients'
+              AND column_name = 'last_used_at'
+        ) AS exists
+        """
+    )
+    last_used_expr = (
+        "last_used_at"
+        if last_used_column and last_used_column["exists"]
+        else "NULL::timestamptz AS last_used_at"
+    )
+    rows = await pg_query_all(
+        f"""
+        SELECT id, client_name, api_key, created_at, {last_used_expr}
         FROM api_clients
         WHERE org_id = $1 AND user_id = $2 AND is_active = TRUE
         ORDER BY created_at DESC
