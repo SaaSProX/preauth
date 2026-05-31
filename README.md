@@ -251,15 +251,15 @@ Caddy automatically provisions SSL certificates via Let's Encrypt.
 
 Every table that holds PA data has an `org_id` column. Every dashboard query ends with `WHERE org_id = $1` where `$1` comes from the caller's JWT (not from any URL param). One backend, many HMO tenants, strict row-level isolation.
 
-**Three logical roles:**
+**Two roles, one URL, one dashboard.** The DB stores exactly two roles on the `clients` table: `admin` and `member`. There is no separate "super-admin" tier — what we call a "platform admin" is just **an admin whose org happens to be SaaSPro**. Same login form, same dashboard URL; the sidebar adapts based on which org the JWT belongs to.
 
-| Role | Org | Sees |
-|---|---|---|
-| SaaSPro super-admin | The platform org named `SAASPRO` | Own org by default; can drill into any client org via `?org_id=` (read-only) |
-| Client admin | e.g. `AMAN` | Their org only — full read + write (team, API keys, settings) |
-| Client member | e.g. `AMAN` | Their org only — read-only |
+| Account | role | org | What they see |
+|---|---|---|---|
+| SaaSPro platform admin | `admin` | `SAASPRO` | Own org by default + Onboarding nav + can drill into any client org via `?org_id=` (read-only) |
+| HMO admin (e.g. Aman ops lead) | `admin` | `AMAN` | Only `AMAN` — full read + write on team, API keys, queue. No Onboarding. |
+| HMO member (e.g. Aman analyst) | `member` | `AMAN` | Only `AMAN`, read-only. Write actions hidden by CSS. |
 
-The dashboard's `?org_id=` drill-in is **server-side checked** (`is_super_admin(claims)` in `auth/router.py`) — passing it as a non-super-admin returns 403.
+The dashboard's `?org_id=` drill-in is **server-side checked** (`is_platform_admin(claims)` in `auth/router.py`) — passing it as a non-platform-admin returns 403. The check is literally `role == 'admin' AND org_name == 'SAASPRO'`.
 
 ## API endpoints
 
@@ -283,8 +283,8 @@ GET  /auth/webhook-delivery-logs          # integration health view (failed/pass
 GET  /auth/webhook-audit-trail            # per-request pipeline replay
 GET  /auth/team           POST /auth/team/invite                DELETE /auth/team/{email}
 GET  /auth/api-keys       POST /auth/api-keys/generate          DELETE /auth/api-keys/{id}
-GET  /auth/onboarding/orgs                POST /auth/onboarding/orgs           (super-admin)
-PATCH /auth/onboarding/orgs/{id}                                                 (super-admin)
+GET  /auth/onboarding/orgs                POST /auth/onboarding/orgs           (platform admin only)
+PATCH /auth/onboarding/orgs/{id}                                                 (platform admin only)
 ```
 
 `/auth/preauth-dashboard` supports:
@@ -292,7 +292,7 @@ PATCH /auth/onboarding/orgs/{id}                                                
 - `date_from`, `date_to` (YYYY-MM-DD)
 - `plan=Bronze|Silver|Gold|…` — case-insensitive ILIKE match
 - `q=…` — searches `patient_id`, `request_id`, `decision`, and the full `raw_payload::text`
-- `org_id=N` — super-admin drill-in
+- `org_id=N` — platform-admin drill-in
 
 Response includes per-row `patient_pa_count`, `event_count`, plus `meta.data_window` (earliest/latest received_at) and `meta.plans` (deduped distinct plans for the dropdown).
 
@@ -304,7 +304,7 @@ GET /health
 
 ## Adding a New HMO
 
-1. **Create the org** from the dashboard's Onboarding view (super-admin only).
+1. **Create the org** from the dashboard's Onboarding view (platform admin only).
 2. **Invite the HMO's first admin** by email — they get a link to set their password.
 3. **Generate an API key** for them from the dashboard's API Keys page.
 4. They point their webhook at `POST /webhook/preauth` with that key.

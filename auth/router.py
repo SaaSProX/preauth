@@ -144,8 +144,14 @@ def _dashboard_org_id(claims):
     return claims["org_id"]
 
 
-async def is_super_admin(claims):
-    """SaaSPro super-admin = admin of the platform org named 'SAASPRO'."""
+async def is_platform_admin(claims):
+    """SaaSPro platform admin = admin of the platform org named 'SAASPRO'.
+
+    There is no separate role tier for "super-admin"; the only thing this
+    helper checks is "are you an admin of the org we use to run the
+    platform". An admin of a client org (e.g. AMAN) is NOT a platform
+    admin and cannot create/edit other orgs or drill into them.
+    """
     if claims.get("role") != "admin":
         return False
     row = await pg_query_one(
@@ -160,7 +166,7 @@ async def is_super_admin(claims):
 # Kept as a defined helper so existing callers (if any are added later) still
 # resolve, BUT the dashboard endpoint deliberately does NOT use it — it would
 # silently override the JWT's org and break per-tenant isolation. The dashboard
-# uses claims["org_id"] + the explicit super-admin ?org_id= drill-in instead.
+# uses claims["org_id"] + the explicit platform-admin ?org_id= drill-in instead.
 async def _preauth_dashboard_org_id(claims):
     fallback = await pg_query_one(
         """
@@ -489,11 +495,12 @@ async def preauth_dashboard(
     q: str | None = None,
     claims: dict = Depends(verify_session_token)
 ):
-    # Super-admins can pass ?org_id= to view a client org's activity.
-    # Anyone else is strictly scoped to their own org_id from the JWT.
+    # Platform admins (SaaSPro org admins) can pass ?org_id= to view a
+    # client org's activity. Anyone else is strictly scoped to their own
+    # org_id from the JWT.
     if org_id is not None:
-        if not await is_super_admin(claims):
-            raise HTTPException(status_code=403, detail="Only super-admins can view another org's data")
+        if not await is_platform_admin(claims):
+            raise HTTPException(status_code=403, detail="Only platform admins (SaaSPro org) can view another org's data")
     else:
         org_id = _dashboard_org_id(claims)
 
@@ -896,8 +903,8 @@ async def patient_history(
     'unknown' so we never group unrelated parse-failure rows together.
     """
     if org_id is not None:
-        if not await is_super_admin(claims):
-            raise HTTPException(status_code=403, detail="Only super-admins can view another org's data")
+        if not await is_platform_admin(claims):
+            raise HTTPException(status_code=403, detail="Only platform admins (SaaSPro org) can view another org's data")
     else:
         org_id = _dashboard_org_id(claims)
 
@@ -1552,14 +1559,15 @@ async def invite_member(request: Request, claims: dict = Depends(verify_session_
 
 
 # ─────────────────────────────────────────────
-# Onboarding (SaaSPro super-admin: cross-org)
-# Super-admin = admin of the SAASPRO platform org.
+# Onboarding (platform admin: cross-org)
+# Platform admin = admin of the SAASPRO platform org. Only role+org
+# membership determines this — there's no separate flag, table, or URL.
 # ─────────────────────────────────────────────
 
 @router.get("/onboarding/orgs")
 async def onboarding_list_orgs(claims: dict = Depends(verify_session_token)):
-    if not await is_super_admin(claims):
-        raise HTTPException(status_code=403, detail="Only SaaSPro super-admins can list organizations")
+    if not await is_platform_admin(claims):
+        raise HTTPException(status_code=403, detail="Only SaaSPro platform admins can list organizations")
 
     rows = await pg_query_all(
         """
@@ -1582,8 +1590,8 @@ async def onboarding_list_orgs(claims: dict = Depends(verify_session_token)):
 
 @router.post("/onboarding/create-org")
 async def onboarding_create_org(payload: CreateOrgPayload, claims: dict = Depends(verify_session_token)):
-    if not await is_super_admin(claims):
-        raise HTTPException(status_code=403, detail="Only SaaSPro super-admins can create organizations")
+    if not await is_platform_admin(claims):
+        raise HTTPException(status_code=403, detail="Only SaaSPro platform admins can create organizations")
 
     org_name = payload.org_name.strip()
     admin_email = payload.admin_email.strip().lower()
@@ -1653,8 +1661,8 @@ class UpdateOrgPayload(BaseModel):
 
 @router.patch("/onboarding/orgs/{org_id}")
 async def onboarding_update_org(org_id: int, payload: UpdateOrgPayload, claims: dict = Depends(verify_session_token)):
-    if not await is_super_admin(claims):
-        raise HTTPException(status_code=403, detail="Only SaaSPro super-admins can edit organizations")
+    if not await is_platform_admin(claims):
+        raise HTTPException(status_code=403, detail="Only SaaSPro platform admins can edit organizations")
 
     org = await pg_query_one(
         "SELECT id, name, is_active FROM organizations WHERE id = $1",
