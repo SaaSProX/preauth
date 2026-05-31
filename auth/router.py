@@ -1422,51 +1422,53 @@ async def webhook_delivery_logs(
     rows = await pg_query_all(
         """
         SELECT
-            delivery_id,
-            provider,
-            org_id,
-            api_client_id,
-            api_key_hint,
-            request_method,
-            request_path,
-            request_ip,
-            event_id,
-            event_type,
-            correlation_id,
-            checkin_id,
-            facility_name,
-            insurance_no,
-            policy_no,
-            plan_name,
-            auth_status,
-            payload_received,
-            payload_valid,
-            payload_status,
-            payload_size_bytes,
-            payload_summary,
-            db_insert_status,
-            preauth_request_id,
-            preauth_log_id,
-            preauth_event_id,
-            http_status_returned,
-            final_status,
-            error_message,
-            processing_time_ms,
-            created_at,
-            updated_at
-        FROM webhook_delivery_logs
-        WHERE ($1::boolean = TRUE OR org_id = $2)
-          AND ($3::timestamp IS NULL OR created_at >= $3::timestamp)
-          AND ($4::timestamp IS NULL OR created_at < $4::timestamp)
+            w.delivery_id,
+            w.provider,
+            w.org_id,
+            w.api_client_id,
+            ac.client_name AS api_client_name,
+            w.api_key_hint,
+            w.request_method,
+            w.request_path,
+            w.request_ip,
+            w.event_id,
+            w.event_type,
+            w.correlation_id,
+            w.checkin_id,
+            w.facility_name,
+            w.insurance_no,
+            w.policy_no,
+            w.plan_name,
+            w.auth_status,
+            w.payload_received,
+            w.payload_valid,
+            w.payload_status,
+            w.payload_size_bytes,
+            w.payload_summary,
+            w.db_insert_status,
+            w.preauth_request_id,
+            w.preauth_log_id,
+            w.preauth_event_id,
+            w.http_status_returned,
+            w.final_status,
+            w.error_message,
+            w.processing_time_ms,
+            w.created_at,
+            w.updated_at
+        FROM webhook_delivery_logs w
+        LEFT JOIN api_clients ac ON ac.id = w.api_client_id
+        WHERE ($1::boolean = TRUE OR w.org_id = $2)
+          AND ($3::timestamp IS NULL OR w.created_at >= $3::timestamp)
+          AND ($4::timestamp IS NULL OR w.created_at < $4::timestamp)
           AND (
               $5::boolean = FALSE
-              OR final_status NOT IN ('accepted', 'accepted_duplicate_event')
-              OR http_status_returned >= 400
-              OR auth_status <> 'auth_success'
-              OR payload_valid = FALSE
-              OR db_insert_status = 'db_insert_failed'
+              OR w.final_status NOT IN ('accepted', 'accepted_duplicate_event')
+              OR w.http_status_returned >= 400
+              OR w.auth_status <> 'auth_success'
+              OR w.payload_valid = FALSE
+              OR w.db_insert_status = 'db_insert_failed'
           )
-        ORDER BY created_at DESC
+        ORDER BY w.created_at DESC
         LIMIT $6
         """,
         can_view_all, org_id, date_from_start, date_to_end, failed_only, safe_limit
@@ -1500,6 +1502,7 @@ async def webhook_delivery_logs(
                 "provider": row["provider"],
                 "org_id": row["org_id"],
                 "api_client_id": row["api_client_id"],
+                "api_client_name": row["api_client_name"],
                 "api_key_hint": row["api_key_hint"],
                 "request_method": row["request_method"],
                 "request_path": row["request_path"],
