@@ -402,6 +402,8 @@ async def list_user_api_keys(claims: dict = Depends(verify_session_token)):
 
 @router.post("/api-key/generate")
 async def generate_user_api_key(payload: GenerateKeyPayload, claims: dict = Depends(verify_session_token)):
+    if claims.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can generate API keys")
     org_id = claims["org_id"]
     user_id = int(claims["sub"])
     client = await pg_query_one(
@@ -442,9 +444,15 @@ async def generate_user_api_key(payload: GenerateKeyPayload, claims: dict = Depe
 
 @router.delete("/api-key/{key_id}")
 async def revoke_user_api_key(key_id: int, claims: dict = Depends(verify_session_token)):
+    if claims.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can revoke API keys")
+    # Revoke any key in the caller's org (not just keys the caller created
+    # themselves). Org admins manage org-level credentials. The previous
+    # `AND user_id = $3` clause made revocation impossible for keys issued
+    # by a different admin.
     await pg_execute(
-        "DELETE FROM api_clients WHERE id = $1 AND org_id = $2 AND user_id = $3",
-        key_id, claims["org_id"], int(claims["sub"])
+        "DELETE FROM api_clients WHERE id = $1 AND org_id = $2",
+        key_id, claims["org_id"]
     )
     return {"message": "API key revoked"}
 
