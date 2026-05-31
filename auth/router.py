@@ -1057,16 +1057,39 @@ async def patients_list(
                 p.agent_result,
                 p.raw_payload,
                 COALESCE(
-                    NULLIF(p.raw_payload->>'total_requested_cost', '')::numeric,
+                    CASE
+                        WHEN NULLIF(p.raw_payload->>'total_requested_cost', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                        THEN (p.raw_payload->>'total_requested_cost')::numeric
+                    END,
                     (
                         SELECT COALESCE(SUM(
                             COALESCE(
-                                NULLIF(it->>'requested_cost', '')::numeric,
-                                NULLIF(it->>'estimated_cost', '')::numeric,
-                                NULLIF(it->>'cost', '')::numeric,
-                                NULLIF(it->>'amount', '')::numeric,
-                                NULLIF(it->>'unit_cost', '')::numeric
-                                    * COALESCE(NULLIF(it->>'quantity', '')::numeric, 1),
+                                CASE
+                                    WHEN NULLIF(it->>'requested_cost', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                                    THEN (it->>'requested_cost')::numeric
+                                END,
+                                CASE
+                                    WHEN NULLIF(it->>'estimated_cost', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                                    THEN (it->>'estimated_cost')::numeric
+                                END,
+                                CASE
+                                    WHEN NULLIF(it->>'cost', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                                    THEN (it->>'cost')::numeric
+                                END,
+                                CASE
+                                    WHEN NULLIF(it->>'amount', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                                    THEN (it->>'amount')::numeric
+                                END,
+                                CASE
+                                    WHEN NULLIF(it->>'unit_cost', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                                    THEN (it->>'unit_cost')::numeric * COALESCE(
+                                        CASE
+                                            WHEN NULLIF(it->>'quantity', '') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                                            THEN (it->>'quantity')::numeric
+                                        END,
+                                        1
+                                    )
+                                END,
                                 0
                             )
                         ), 0)
