@@ -4,8 +4,9 @@ import asyncio
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, HTTPException, Depends, Request
+from fastapi import APIRouter, HTTPException, Depends, Request, BackgroundTasks
 from pydantic import BaseModel
+from agent import agent
 from services.db import pg_execute, pg_query_all, pg_query_one
 from services.invites import build_invite_link
 from services.notifier import EmailDeliveryError, send_invite_email
@@ -918,6 +919,128 @@ class AuditEventPayload(BaseModel):
     target_kind: str | None = None
     target_id: str | None = None
     metadata: dict | None = None
+
+
+class RetryPreauthPayload(BaseModel):
+    request_id: str
+    org_id: int | None = None
+
+
+class RetryPendingPreauthPayload(BaseModel):
+    org_id: int | None = None
+    date_from: date | None = None
+    date_to: date | None = None
+    q: str | None = None
+    limit: int = 200
+
+
+RETRYABLE_PREAUTH_STATUSES = {"pending", "processing", "received", "error"}
+
+
+async def _resolve_mutation_org_id(claims: dict, requested_org_id: int | None = None) -> int:
+    if claims.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can perform this action")
+    if requested_org_id is None:
+        return claims["org_id"]
+    if requested_org_id != claims["org_id"] and not await is_platform_admin(claims):
+        raise HTTPException(status_code=403, detail="Only platform admins (SaaSPro org) can act on another org")
+    return requested_org_id
+
+
+async def _enqueue_preauth_retry(background: BackgroundTasks, row) -> None:
+    await pg_execute("DELETE FROM agent_logs WHERE request_id = $1", row["request_id"])
+    await pg_execute(
+        """
+        UPDATE preauth_logs
+        SET status = 'pending',
+            agent_step = 'retry_queued',
+            decision = NULL,
+            agent_result = NULL,
+            error_message = NULL,
+            processed_at = NULL
+        WHERE id = $1
+        """,
+        row["id"],
+    )
+    background.add_task(agent.run, str(row["patient_id"]), str(row["request_id"]))
+
+
+@router.post("/preauth/retry")
+async def retry_preauth(payload: RetryPreauthPayload, background: BackgroundTasks, claims: dict = Depends(verify_session_token)):
+    org_id = await _resolve_mutation_org_id(claims, payload.org_id)
+    request_id = payload.request_id.strip()
+    if not request_id:
+        raise HTTPException(status_code=400, detail="request_id is required")
+
+    row = await pg_query_one(
+        """
+        SELECT id, request_id, patient_id, status
+        FROM preauth_logs
+        WHERE org_id = $1 AND request_id = $2
+        """,
+        org_id, request_id,
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Pre-auth request not found")
+
+    current_status = (row["status"] or "").lower()
+    if current_status not in RETRYABLE_PREAUTH_STATUSES:
+        raise HTTPException(status_code=409, detail=f"Only pending, processing, received, or error requests can be retried. Current status: {row['status']}")
+
+    await _enqueue_preauth_retry(background, row)
+    return {
+        "status": "queued",
+        "request_id": row["request_id"],
+        "previous_status": row["status"],
+    }
+
+
+@router.post("/preauth/retry-pending")
+async def retry_pending_preauths(payload: RetryPendingPreauthPayload, background: BackgroundTasks, claims: dict = Depends(verify_session_token)):
+    org_id = await _resolve_mutation_org_id(claims, payload.org_id)
+    if payload.date_from and payload.date_to and payload.date_from > payload.date_to:
+        raise HTTPException(status_code=400, detail="Start date cannot be after end date")
+
+    safe_limit = min(max(payload.limit, 1), 500)
+    date_from_start = datetime.combine(payload.date_from, time.min) if payload.date_from else None
+    date_to_end = datetime.combine(payload.date_to + timedelta(days=1), time.min) if payload.date_to else None
+    search_q = payload.q.strip() if payload.q and payload.q.strip() else None
+    search_pattern = f"%{search_q}%" if search_q else None
+
+    rows = await pg_query_all(
+        """
+        SELECT id, request_id, patient_id, status
+        FROM preauth_logs
+        WHERE org_id = $1
+          AND LOWER(status) = ANY($2::text[])
+          AND ($3::timestamp IS NULL OR received_at >= $3::timestamp)
+          AND ($4::timestamp IS NULL OR received_at < $4::timestamp)
+          AND ($5::text IS NULL OR (
+                patient_id ILIKE $5
+                OR request_id ILIKE $5
+                OR COALESCE(decision, '') ILIKE $5
+                OR raw_payload::text ILIKE $5
+          ))
+        ORDER BY received_at DESC
+        LIMIT $6
+        """,
+        org_id,
+        sorted(RETRYABLE_PREAUTH_STATUSES),
+        date_from_start,
+        date_to_end,
+        search_pattern,
+        safe_limit,
+    )
+
+    for row in rows:
+        await _enqueue_preauth_retry(background, row)
+
+    return {
+        "status": "queued",
+        "queued_count": len(rows),
+        "limit": safe_limit,
+        "request_ids": [row["request_id"] for row in rows],
+    }
 
 
 @router.post("/audit/log-event")
