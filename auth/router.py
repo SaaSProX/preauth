@@ -1351,6 +1351,7 @@ async def patient_history(
 async def webhook_delivery_logs(
     date_from: date | None = None,
     date_to: date | None = None,
+    org_id: int | None = None,
     failed_only: bool = False,
     limit: int = 100,
     claims: dict = Depends(verify_session_token)
@@ -1358,7 +1359,11 @@ async def webhook_delivery_logs(
     if date_from and date_to and date_from > date_to:
         raise HTTPException(status_code=400, detail="Start date cannot be after end date")
 
-    org_id = _dashboard_org_id(claims)
+    if org_id is not None:
+        if not await is_platform_admin(claims):
+            raise HTTPException(status_code=403, detail="Only platform admins (SaaSPro org) can view another org's data")
+    else:
+        org_id = _dashboard_org_id(claims)
     can_view_all = False
     safe_limit = min(max(limit, 1), 250)
     date_from_start = datetime.combine(date_from, time.min) if date_from else None
@@ -1520,9 +1525,14 @@ async def webhook_audit_trail(
     request_id: str | None = None,
     include_payload: bool = False,
     limit: int = 50,
+    org_id: int | None = None,
     claims: dict = Depends(verify_session_token)
 ):
-    org_id = _dashboard_org_id(claims)
+    if org_id is not None:
+        if not await is_platform_admin(claims):
+            raise HTTPException(status_code=403, detail="Only platform admins (SaaSPro org) can view another org's data")
+    else:
+        org_id = _dashboard_org_id(claims)
     can_view_all = False
     safe_limit = min(max(limit, 1), 100)
 
@@ -1677,9 +1687,14 @@ async def preauth_events(
     request_id: str | None = None,
     include_payload: bool = False,
     limit: int = 50,
+    org_id: int | None = None,
     claims: dict = Depends(verify_session_token)
 ):
-    org_id = await _preauth_dashboard_org_id(claims)
+    if org_id is not None:
+        if not await is_platform_admin(claims):
+            raise HTTPException(status_code=403, detail="Only platform admins (SaaSPro org) can view another org's data")
+    else:
+        org_id = _dashboard_org_id(claims)
     can_view_all = False
     safe_limit = min(max(limit, 1), 100)
 
