@@ -275,16 +275,37 @@ Authenticated by an `api_key` field (issued per org from the dashboard's API Key
 ### Dashboard endpoints (dashboard → us)
 
 ```
-POST /auth/login                          # email + password → JWT
-GET  /auth/preauth-dashboard              # paginated queue + summary + chart series
-GET  /auth/patient-history?patient_id=    # every PA for one patient in caller's org
-GET  /auth/preauth-events?checkin_id=     # full delivery timeline for one PA
-GET  /auth/webhook-delivery-logs          # integration health view (failed/passed webhooks)
-GET  /auth/webhook-audit-trail            # per-request pipeline replay
-GET  /auth/team           POST /auth/team/invite                DELETE /auth/team/{email}
-GET  /auth/api-keys       POST /auth/api-keys/generate          DELETE /auth/api-keys/{id}
-GET  /auth/onboarding/orgs                POST /auth/onboarding/orgs           (platform admin only)
-PATCH /auth/onboarding/orgs/{id}                                                 (platform admin only)
+POST   /auth/login                            # email + password → JWT
+POST   /auth/register                         # complete invite (email + password from invite token)
+GET    /auth/me                               # current user + org (used after token refresh)
+
+# Dashboard / queue
+GET    /auth/preauth-dashboard                # paginated queue + summary + chart series
+GET    /auth/patient-history?patient_id=      # every PA for one patient in the caller's org
+GET    /auth/patients                         # one row per distinct patient, with aggregates
+GET    /auth/preauth-events?checkin_id=       # full delivery timeline for one PA
+GET    /auth/webhook-delivery-logs            # integration-health view (failed + passed webhooks)
+GET    /auth/webhook-audit-trail              # per-request pipeline replay
+GET    /auth/preauth-payloads                 # recent raw payloads (admin only)
+
+# Audit trail
+POST   /auth/audit/log-event                  # append a compliance-sensitive UI event
+GET    /auth/audit/events                     # browse the org's audit log (admin only)
+
+# Team
+GET    /auth/team
+POST   /auth/invite-member                    # admin only
+DELETE /auth/team-member/{email}              # admin only
+
+# API keys (org-scoped — used to authenticate inbound HMO webhooks)
+GET    /auth/api-key                          # list the org's keys (masked)
+POST   /auth/api-key/generate                 # admin only — returns full key once
+DELETE /auth/api-key/{key_id}                 # admin only
+
+# Onboarding (platform admin only — admins of the SAASPRO org)
+GET    /auth/onboarding/orgs                  # list all client orgs
+POST   /auth/onboarding/create-org            # create a new client org + invite first admin
+PATCH  /auth/onboarding/orgs/{org_id}         # rename or activate/deactivate an org
 ```
 
 `/auth/preauth-dashboard` supports:
@@ -292,9 +313,13 @@ PATCH /auth/onboarding/orgs/{id}                                                
 - `date_from`, `date_to` (YYYY-MM-DD)
 - `plan=Bronze|Silver|Gold|…` — case-insensitive ILIKE match
 - `q=…` — searches `patient_id`, `request_id`, `decision`, and the full `raw_payload::text`
-- `org_id=N` — platform-admin drill-in
+- `org_id=N` — platform-admin drill-in (anyone else gets 403)
 
 Response includes per-row `patient_pa_count`, `event_count`, plus `meta.data_window` (earliest/latest received_at) and `meta.plans` (deduped distinct plans for the dropdown).
+
+`/auth/patients` supports `q=…`, `date_from`, `date_to`, `outcome=denials|escalations|approvals|open|all`, `sort=latest|count|requested|approved|denials`, `page`, `page_size`, and `org_id=` (platform-admin drill-in). Returns one row per distinct `patient_id` with `pa_count`, `total_requested`, `total_approved`, `outcome_counts`, and the patient's name/insurance/plan pulled from their most recent payload. Skips rows with `patient_id` IS NULL or = 'unknown'.
+
+`/auth/audit/log-event` is org-scoped via the JWT — any signed-in user can append an event for their own org. `target_kind` is typically `patient`/`pa`/`org`, `target_id` is the relevant ID, `metadata` is a JSONB blob. Used by the dashboard when an operator exports a patient PDF. `/auth/audit/events` is admin-only — members can't browse the trail.
 
 ### Health Check
 
@@ -323,6 +348,20 @@ psql "$OUR_DB_URL" -f migrate.sql
 Every statement uses `IF NOT EXISTS`, so the file is safe to re-run.
 
 The one statement to watch is the `received_at TIMESTAMPTZ` conversion — it interprets existing naive timestamps as UTC. If your prod has been inserting in another tz, sanity-check the existing rows first.
+
+### Tables we own
+
+| Table | What it holds |
+|---|---|
+| `organizations` | One per tenant (SAASPRO + each client HMO) |
+| `clients` | Users — admins + members, scoped to an org via `org_id` |
+| `invites` | Invite tokens for register / new-admin onboarding |
+| `api_clients` | Per-org API keys used to authenticate inbound HMO webhooks. `last_used_at` is stamped on every successful auth |
+| `preauth_logs` | One row per PA. Carries the raw HMO payload, the agent's reasoning, the final decision, and the callback status |
+| `preauth_events` | One row per intake webhook delivery (first capture + each "items added" follow-up) |
+| `webhook_delivery_logs` | One row per inbound webhook attempt — including the ones that failed before becoming a PA (bad key, malformed JSON, etc.) |
+| `agent_logs` | One row per agent stage per PA — chronological pipeline replay |
+| `audit_events` | Append-only trail of compliance-sensitive UI actions (PDF exports, etc.). Indexed by `org_id`, `created_at`, `event_type`, and `(target_kind, target_id)` |
 
 ## Current Pilot
 
