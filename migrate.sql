@@ -164,7 +164,25 @@ CREATE TABLE IF NOT EXISTS agent_logs (
     logged_at       TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- Append-only audit trail for compliance-sensitive UI actions (PDF exports,
+-- override events, drill-in viewing, etc.). One row per recorded event.
+CREATE TABLE IF NOT EXISTS audit_events (
+    id              SERIAL PRIMARY KEY,
+    org_id          INT REFERENCES organizations(id),
+    user_id         INT REFERENCES clients(id),
+    user_email      VARCHAR(200),
+    event_type      VARCHAR(50) NOT NULL,   -- 'pdf_download', etc.
+    target_kind     VARCHAR(50),            -- 'patient' | 'pa' | 'org'
+    target_id       VARCHAR(200),           -- the patient_id / request_id / org_id
+    metadata        JSONB,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
 -- Indexes
+CREATE INDEX IF NOT EXISTS idx_audit_events_org_id ON audit_events(org_id);
+CREATE INDEX IF NOT EXISTS idx_audit_events_created_at ON audit_events(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_events_event_type ON audit_events(event_type);
+CREATE INDEX IF NOT EXISTS idx_audit_events_target ON audit_events(target_kind, target_id);
 CREATE INDEX IF NOT EXISTS idx_agent_logs_request_id ON agent_logs(request_id);
 CREATE INDEX IF NOT EXISTS idx_agent_logs_logged_at ON agent_logs(logged_at DESC);
 CREATE INDEX IF NOT EXISTS idx_preauth_logs_status ON preauth_logs(status);

@@ -889,6 +889,101 @@ async def preauth_dashboard(
     }
 
 
+class AuditEventPayload(BaseModel):
+    event_type: str
+    target_kind: str | None = None
+    target_id: str | None = None
+    metadata: dict | None = None
+
+
+@router.post("/audit/log-event")
+async def log_audit_event(payload: AuditEventPayload, claims: dict = Depends(verify_session_token)):
+    """Append-only record of compliance-sensitive UI actions.
+
+    The client posts here when an operator does something we want a trail for
+    (PDF export, drill-in view, override, etc.). Org-scoped via the JWT — a
+    client can't write an event into a different org's audit log.
+    """
+    org_id = _dashboard_org_id(claims)
+    try:
+        user_id = int(claims["sub"])
+    except (KeyError, TypeError, ValueError):
+        user_id = None
+    user_email = claims.get("email")
+    await pg_execute(
+        """
+        INSERT INTO audit_events (org_id, user_id, user_email, event_type, target_kind, target_id, metadata)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        """,
+        org_id, user_id, user_email,
+        payload.event_type[:50],
+        (payload.target_kind or None) and payload.target_kind[:50],
+        (payload.target_id or None) and payload.target_id[:200],
+        json.dumps(payload.metadata or {}),
+    )
+    return {"status": "logged"}
+
+
+@router.get("/audit/events")
+async def list_audit_events(
+    event_type: str | None = None,
+    target_kind: str | None = None,
+    target_id: str | None = None,
+    page: int = 1,
+    page_size: int = 50,
+    claims: dict = Depends(verify_session_token),
+):
+    """List audit events for the caller's org. Admin-only — members can't
+    inspect who's been exporting what.
+    """
+    if claims.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can view the audit trail")
+    org_id = _dashboard_org_id(claims)
+    page = max(1, page)
+    page_size = min(max(1, page_size), 200)
+    offset = (page - 1) * page_size
+
+    rows = await pg_query_all(
+        """
+        SELECT id, user_id, user_email, event_type, target_kind, target_id, metadata, created_at
+        FROM audit_events
+        WHERE org_id = $1
+          AND ($2::text IS NULL OR event_type = $2)
+          AND ($3::text IS NULL OR target_kind = $3)
+          AND ($4::text IS NULL OR target_id = $4)
+        ORDER BY created_at DESC
+        LIMIT $5 OFFSET $6
+        """,
+        org_id, event_type, target_kind, target_id, page_size, offset,
+    )
+    total_row = await pg_query_one(
+        """
+        SELECT COUNT(*)::int AS total FROM audit_events
+        WHERE org_id = $1
+          AND ($2::text IS NULL OR event_type = $2)
+          AND ($3::text IS NULL OR target_kind = $3)
+          AND ($4::text IS NULL OR target_id = $4)
+        """,
+        org_id, event_type, target_kind, target_id,
+    )
+    return {
+        "pagination": {"page": page, "page_size": page_size, "total": total_row["total"] if total_row else 0},
+        "events": [
+            {
+                "id": r["id"],
+                "user_id": r["user_id"],
+                "user_email": r["user_email"],
+                "event_type": r["event_type"],
+                "target_kind": r["target_kind"],
+                "target_id": r["target_id"],
+                "metadata": parse_json_field(r["metadata"]) if r["metadata"] else {},
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            }
+            for r in rows
+        ],
+    }
+
+
 @router.get("/patients")
 async def patients_list(
     q: str | None = None,
