@@ -889,6 +889,270 @@ async def preauth_dashboard(
     }
 
 
+@router.get("/patients")
+async def patients_list(
+    q: str | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    outcome: str | None = None,  # 'all' | 'denials' | 'escalations' | 'approvals' | 'open'
+    sort: str | None = None,     # 'latest' | 'count' | 'requested' | 'approved' | 'denials'
+    page: int = 1,
+    page_size: int = 25,
+    org_id: int | None = None,
+    claims: dict = Depends(verify_session_token),
+):
+    """Group preauth_logs by patient_id and return per-patient aggregates.
+
+    Org-scoped via the JWT (or via platform-admin ?org_id= drill-in).
+    Skips rows with patient_id IS NULL or 'unknown' — those aren't reliably
+    the same patient and shouldn't be grouped.
+    """
+    if org_id is not None:
+        if not await is_platform_admin(claims):
+            raise HTTPException(status_code=403, detail="Only platform admins (SaaSPro org) can view another org's data")
+    else:
+        org_id = _dashboard_org_id(claims)
+
+    page = max(1, page)
+    page_size = min(max(1, page_size), 200)
+    offset = (page - 1) * page_size
+
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(status_code=400, detail="Start date cannot be after end date")
+    date_from_start = datetime.combine(date_from, time.min) if date_from else None
+    date_to_end = datetime.combine(date_to + timedelta(days=1), time.min) if date_to else None
+
+    search_q = q.strip() if q and q.strip() else None
+    search_pattern = f"%{search_q}%" if search_q else None
+
+    order_clause = {
+        "latest":    "latest_received_at DESC NULLS LAST",
+        "count":     "pa_count DESC, latest_received_at DESC NULLS LAST",
+        "requested": "total_requested DESC NULLS LAST, latest_received_at DESC NULLS LAST",
+        "approved":  "total_approved DESC NULLS LAST, latest_received_at DESC NULLS LAST",
+        "denials":   "deny_count DESC, escalate_count DESC, latest_received_at DESC NULLS LAST",
+    }.get(sort or "latest", "latest_received_at DESC NULLS LAST")
+
+    outcome_clause = {
+        "denials":     "deny_count > 0",
+        "escalations": "escalate_count > 0",
+        "approvals":   "approve_count > 0",
+        "open":        "(processing_count + pending_count + received_count) > 0",
+    }.get(outcome or "all", "TRUE")
+
+    # Single aggregating query: filter rows, compute per-row requested cost
+    # from raw_payload, group by patient_id, and pull the most recent payload
+    # for each patient to read their display name + insurance no + plan.
+    base_sql = f"""
+        WITH pa_with_cost AS (
+            SELECT
+                p.id,
+                p.patient_id,
+                p.received_at,
+                p.status,
+                p.decision,
+                p.agent_result,
+                p.raw_payload,
+                COALESCE(
+                    NULLIF(p.raw_payload->>'total_requested_cost', '')::numeric,
+                    (
+                        SELECT COALESCE(SUM(
+                            COALESCE(
+                                NULLIF(it->>'requested_cost', '')::numeric,
+                                NULLIF(it->>'estimated_cost', '')::numeric,
+                                NULLIF(it->>'cost', '')::numeric,
+                                NULLIF(it->>'amount', '')::numeric,
+                                NULLIF(it->>'unit_cost', '')::numeric
+                                    * COALESCE(NULLIF(it->>'quantity', '')::numeric, 1),
+                                0
+                            )
+                        ), 0)
+                        FROM jsonb_array_elements(
+                            COALESCE(
+                                CASE jsonb_typeof(p.raw_payload->'pa_items') WHEN 'array' THEN p.raw_payload->'pa_items' END,
+                                CASE jsonb_typeof(p.raw_payload->'items')    WHEN 'array' THEN p.raw_payload->'items'    END,
+                                '[]'::jsonb
+                            )
+                        ) AS it
+                    ),
+                    0
+                ) AS req_cost
+            FROM preauth_logs p
+            WHERE p.org_id = $1
+              AND p.patient_id IS NOT NULL
+              AND p.patient_id <> 'unknown'
+              AND ($2::timestamp IS NULL OR p.received_at >= $2::timestamp)
+              AND ($3::timestamp IS NULL OR p.received_at <  $3::timestamp)
+        ),
+        aggregated AS (
+            SELECT
+                patient_id,
+                COUNT(*)::int AS pa_count,
+                SUM(req_cost)::float AS total_requested,
+                SUM(
+                    CASE
+                        WHEN LOWER(COALESCE(decision, status, '')) IN ('approve', 'approved')
+                          AND (agent_result->>'amount_approved') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                        THEN (agent_result->>'amount_approved')::numeric
+                        ELSE 0
+                    END
+                )::float AS total_approved,
+                COUNT(*) FILTER (WHERE LOWER(COALESCE(decision, status, '')) IN ('approve', 'approved'))::int AS approve_count,
+                COUNT(*) FILTER (WHERE LOWER(COALESCE(decision, status, '')) IN ('deny', 'denied', 'reject', 'rejected'))::int AS deny_count,
+                COUNT(*) FILTER (WHERE LOWER(COALESCE(decision, status, '')) IN ('escalate', 'escalated'))::int AS escalate_count,
+                COUNT(*) FILTER (WHERE LOWER(status) = 'processing')::int AS processing_count,
+                COUNT(*) FILTER (WHERE LOWER(status) = 'pending')::int    AS pending_count,
+                COUNT(*) FILTER (WHERE LOWER(status) = 'received')::int   AS received_count,
+                COUNT(*) FILTER (WHERE LOWER(status) = 'error')::int      AS error_count,
+                MAX(received_at) AS latest_received_at
+            FROM pa_with_cost
+            GROUP BY patient_id
+        ),
+        enriched AS (
+            SELECT
+                a.*,
+                (SELECT raw_payload FROM pa_with_cost p2
+                 WHERE p2.patient_id = a.patient_id
+                 ORDER BY p2.received_at DESC NULLS LAST
+                 LIMIT 1) AS latest_payload
+            FROM aggregated a
+            WHERE {outcome_clause}
+        )
+        SELECT
+            e.patient_id,
+            e.pa_count,
+            e.total_requested,
+            e.total_approved,
+            e.approve_count,
+            e.deny_count,
+            e.escalate_count,
+            e.processing_count,
+            e.pending_count,
+            e.received_count,
+            e.error_count,
+            e.latest_received_at,
+            TRIM(
+                COALESCE(e.latest_payload->'enrollee'->>'first_name', '')
+                || ' '
+                || COALESCE(e.latest_payload->'enrollee'->>'surname', '')
+            ) AS patient_name,
+            COALESCE(
+                e.latest_payload->'enrollee'->>'insurance_no',
+                e.latest_payload->'policy'->>'insurance_no'
+            ) AS insurance_no,
+            COALESCE(
+                e.latest_payload->'policy'->>'plan_name',
+                e.latest_payload->'policy'->>'insurance_package'
+            ) AS plan
+        FROM enriched e
+        WHERE ($4::text IS NULL OR (
+            e.patient_id ILIKE $4
+            OR COALESCE(e.latest_payload->'enrollee'->>'first_name', '') ILIKE $4
+            OR COALESCE(e.latest_payload->'enrollee'->>'surname',    '') ILIKE $4
+            OR COALESCE(e.latest_payload->'enrollee'->>'insurance_no', '') ILIKE $4
+        ))
+        ORDER BY {order_clause}
+        LIMIT $5 OFFSET $6
+    """
+
+    rows = await pg_query_all(base_sql, org_id, date_from_start, date_to_end, search_pattern, page_size, offset)
+
+    # Total count (post-filter) for pagination — reuses the same CTEs minus LIMIT/OFFSET
+    count_sql = f"""
+        WITH pa_with_cost AS (
+            SELECT p.patient_id, p.received_at, p.status, p.decision, p.agent_result, p.raw_payload
+            FROM preauth_logs p
+            WHERE p.org_id = $1
+              AND p.patient_id IS NOT NULL
+              AND p.patient_id <> 'unknown'
+              AND ($2::timestamp IS NULL OR p.received_at >= $2::timestamp)
+              AND ($3::timestamp IS NULL OR p.received_at <  $3::timestamp)
+        ),
+        aggregated AS (
+            SELECT
+                patient_id,
+                COUNT(*) FILTER (WHERE LOWER(COALESCE(decision, status, '')) IN ('approve', 'approved'))::int AS approve_count,
+                COUNT(*) FILTER (WHERE LOWER(COALESCE(decision, status, '')) IN ('deny', 'denied', 'reject', 'rejected'))::int AS deny_count,
+                COUNT(*) FILTER (WHERE LOWER(COALESCE(decision, status, '')) IN ('escalate', 'escalated'))::int AS escalate_count,
+                COUNT(*) FILTER (WHERE LOWER(status) = 'processing')::int AS processing_count,
+                COUNT(*) FILTER (WHERE LOWER(status) = 'pending')::int AS pending_count,
+                COUNT(*) FILTER (WHERE LOWER(status) = 'received')::int AS received_count
+            FROM pa_with_cost
+            GROUP BY patient_id
+        ),
+        outcome_filtered AS (
+            SELECT a.patient_id,
+                (SELECT raw_payload FROM pa_with_cost p2 WHERE p2.patient_id = a.patient_id ORDER BY p2.received_at DESC NULLS LAST LIMIT 1) AS latest_payload
+            FROM aggregated a
+            WHERE {outcome_clause}
+        )
+        SELECT COUNT(*)::int AS total FROM outcome_filtered
+        WHERE ($4::text IS NULL OR (
+            patient_id ILIKE $4
+            OR COALESCE(latest_payload->'enrollee'->>'first_name', '') ILIKE $4
+            OR COALESCE(latest_payload->'enrollee'->>'surname',    '') ILIKE $4
+            OR COALESCE(latest_payload->'enrollee'->>'insurance_no', '') ILIKE $4
+        ))
+    """
+    total_row = await pg_query_one(count_sql, org_id, date_from_start, date_to_end, search_pattern)
+    total = total_row["total"] if total_row else 0
+
+    # Org-wide window (not filtered) — useful for the page subtitle
+    window_row = await pg_query_one(
+        """
+        SELECT MIN(received_at) AS earliest, MAX(received_at) AS latest,
+               COUNT(DISTINCT patient_id) FILTER (WHERE patient_id IS NOT NULL AND patient_id <> 'unknown')::int AS distinct_patients
+        FROM preauth_logs WHERE org_id = $1
+        """,
+        org_id,
+    )
+
+    return {
+        "filters": {
+            "q": search_q,
+            "date_from": date_from.isoformat() if date_from else None,
+            "date_to": date_to.isoformat() if date_to else None,
+            "outcome": outcome or "all",
+            "sort": sort or "latest",
+        },
+        "pagination": {
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "total_pages": ((total + page_size - 1) // page_size) if page_size > 0 else 0,
+        },
+        "meta": {
+            "distinct_patients_org_total": window_row["distinct_patients"] if window_row else 0,
+            "data_window": {
+                "earliest": window_row["earliest"].isoformat() if window_row and window_row.get("earliest") else None,
+                "latest":   window_row["latest"].isoformat()   if window_row and window_row.get("latest")   else None,
+            },
+        },
+        "patients": [
+            {
+                "patient_id":          r["patient_id"],
+                "patient_name":        r["patient_name"] or None,
+                "insurance_no":        r["insurance_no"] or None,
+                "plan":                r["plan"] or None,
+                "pa_count":            r["pa_count"],
+                "total_requested":     float(r["total_requested"] or 0),
+                "total_approved":      float(r["total_approved"] or 0),
+                "latest_received_at":  r["latest_received_at"].isoformat() if r["latest_received_at"] else None,
+                "outcome_counts": {
+                    "approve":    r["approve_count"],
+                    "deny":       r["deny_count"],
+                    "escalate":   r["escalate_count"],
+                    "processing": r["processing_count"],
+                    "pending":    r["pending_count"],
+                    "received":   r["received_count"],
+                    "error":      r["error_count"],
+                },
+            }
+            for r in rows
+        ],
+    }
+
+
 @router.get("/patient-history")
 async def patient_history(
     patient_id: str,
