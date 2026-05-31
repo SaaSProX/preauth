@@ -228,12 +228,14 @@ def _dashboard_request(row):
         amount_approved = agent_result.get("amount_approved")
 
     processing_seconds = None
-    if row["processed_at"] and row["received_at"]:
+    if "agent_runtime_seconds" in row.keys() and row["agent_runtime_seconds"] is not None:
+        processing_seconds = max(0, int(round(row["agent_runtime_seconds"])))
+    elif row["processed_at"] and row["received_at"]:
         processed_at = row["processed_at"]
         received_at = row["received_at"]
         if processed_at.tzinfo and not received_at.tzinfo:
             processed_at = processed_at.replace(tzinfo=None)
-        processing_seconds = int((processed_at - received_at).total_seconds())
+        processing_seconds = max(0, int((processed_at - received_at).total_seconds()))
 
     return {
         "request_id": row["request_id"],
@@ -556,18 +558,18 @@ async def preauth_dashboard(
         """
         SELECT
             COUNT(*)::int AS total,
-            COUNT(*) FILTER (WHERE LOWER(status) = 'pending')::int AS pending,
-            COUNT(*) FILTER (WHERE LOWER(status) = 'processing')::int AS processing,
-            COUNT(*) FILTER (WHERE LOWER(status) IN ('approve', 'approved'))::int AS approved,
-            COUNT(*) FILTER (WHERE LOWER(status) IN ('deny', 'denied', 'reject', 'rejected'))::int AS denied,
-            COUNT(*) FILTER (WHERE LOWER(status) IN ('escalate', 'escalated'))::int AS escalated,
-            COUNT(*) FILTER (WHERE LOWER(status) = 'error')::int AS errors,
-            COUNT(*) FILTER (WHERE received_at >= NOW() - INTERVAL '24 hours')::int AS received_24h,
+            COUNT(*) FILTER (WHERE LOWER(p.status) = 'pending')::int AS pending,
+            COUNT(*) FILTER (WHERE LOWER(p.status) = 'processing')::int AS processing,
+            COUNT(*) FILTER (WHERE LOWER(p.status) IN ('approve', 'approved'))::int AS approved,
+            COUNT(*) FILTER (WHERE LOWER(p.status) IN ('deny', 'denied', 'reject', 'rejected'))::int AS denied,
+            COUNT(*) FILTER (WHERE LOWER(p.status) IN ('escalate', 'escalated'))::int AS escalated,
+            COUNT(*) FILTER (WHERE LOWER(p.status) = 'error')::int AS errors,
+            COUNT(*) FILTER (WHERE p.received_at >= NOW() - INTERVAL '24 hours')::int AS received_24h,
             COALESCE(
                 SUM(
                     CASE
-                        WHEN (extracted_fields->>'total_requested_cost') ~ '^-?[0-9]+(\\.[0-9]+)?$'
-                        THEN (extracted_fields->>'total_requested_cost')::numeric
+                        WHEN (p.extracted_fields->>'total_requested_cost') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                        THEN (p.extracted_fields->>'total_requested_cost')::numeric
                         ELSE 0
                     END
                 ),
@@ -576,8 +578,8 @@ async def preauth_dashboard(
             COALESCE(
                 SUM(
                     CASE
-                        WHEN jsonb_typeof(extracted_fields->'items') = 'array'
-                        THEN jsonb_array_length(extracted_fields->'items')
+                        WHEN jsonb_typeof(p.extracted_fields->'items') = 'array'
+                        THEN jsonb_array_length(p.extracted_fields->'items')
                         ELSE 0
                     END
                 ),
@@ -586,26 +588,49 @@ async def preauth_dashboard(
             COALESCE(
                 SUM(
                     CASE
-                        WHEN LOWER(COALESCE(decision, status, '')) IN ('approve', 'approved')
-                            AND (agent_result->>'amount_approved') ~ '^-?[0-9]+(\\.[0-9]+)?$'
-                        THEN (agent_result->>'amount_approved')::numeric
+                        WHEN LOWER(COALESCE(p.decision, p.status, '')) IN ('approve', 'approved')
+                            AND (p.agent_result->>'amount_approved') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                        THEN (p.agent_result->>'amount_approved')::numeric
                         ELSE 0
                     END
                 ),
                 0
             )::float AS total_amount_approved,
-            (AVG(EXTRACT(EPOCH FROM (processed_at - received_at)))
-                FILTER (WHERE processed_at IS NOT NULL))::float AS avg_processing_seconds
-        FROM preauth_logs
-        WHERE org_id = $1
-          AND ($2::timestamp IS NULL OR received_at >= $2::timestamp)
-          AND ($3::timestamp IS NULL OR received_at < $3::timestamp)
-          AND ($4::text IS NULL OR COALESCE(extracted_fields->>'plan', raw_payload->'policy'->>'plan_name', raw_payload->'policy'->>'insurance_package') ILIKE $4)
+            AVG(
+                CASE
+                    WHEN ar.first_log_at IS NOT NULL
+                    THEN EXTRACT(EPOCH FROM (COALESCE(p.processed_at, ar.last_log_at) - ar.first_log_at))
+                    WHEN p.processed_at IS NOT NULL
+                    THEN EXTRACT(EPOCH FROM (p.processed_at - p.received_at))
+                    ELSE NULL
+                END
+            )::float AS avg_processing_seconds
+        FROM preauth_logs p
+        LEFT JOIN LATERAL (
+            WITH run_start AS (
+                SELECT MAX(logged_at) AS first_log_at
+                FROM agent_logs
+                WHERE request_id = p.request_id
+                  AND agent_num = 1
+                  AND (p.processed_at IS NULL OR logged_at <= p.processed_at + INTERVAL '5 seconds')
+            )
+            SELECT run_start.first_log_at, MAX(al.logged_at) AS last_log_at
+            FROM run_start
+            LEFT JOIN agent_logs al
+              ON al.request_id = p.request_id
+             AND al.logged_at >= run_start.first_log_at
+             AND (p.processed_at IS NULL OR al.logged_at <= p.processed_at + INTERVAL '5 seconds')
+            GROUP BY run_start.first_log_at
+        ) ar ON TRUE
+        WHERE p.org_id = $1
+          AND ($2::timestamp IS NULL OR p.received_at >= $2::timestamp)
+          AND ($3::timestamp IS NULL OR p.received_at < $3::timestamp)
+          AND ($4::text IS NULL OR COALESCE(p.extracted_fields->>'plan', p.raw_payload->'policy'->>'plan_name', p.raw_payload->'policy'->>'insurance_package') ILIKE $4)
           AND ($5::text IS NULL OR (
-                patient_id ILIKE $5
-                OR request_id ILIKE $5
-                OR COALESCE(decision, '') ILIKE $5
-                OR raw_payload::text ILIKE $5
+                p.patient_id ILIKE $5
+                OR p.request_id ILIKE $5
+                OR COALESCE(p.decision, '') ILIKE $5
+                OR p.raw_payload::text ILIKE $5
           ))
         """,
         org_id, date_from_start, date_to_end, plan_filter, search_pattern
@@ -709,6 +734,11 @@ async def preauth_dashboard(
             COALESCE(ev.latest_items_added_total, 0)::float AS latest_items_added_total,
             COALESCE(ev.duplicate_event_attempts, 0)::int AS duplicate_event_attempts,
             COALESCE(ev.total_intake_value, 0)::float AS total_intake_value,
+            CASE
+                WHEN ar.first_log_at IS NOT NULL
+                THEN EXTRACT(EPOCH FROM (COALESCE(p.processed_at, ar.last_log_at) - ar.first_log_at))::float
+                ELSE NULL
+            END AS agent_runtime_seconds,
             COALESCE(
                 jsonb_agg(
                     jsonb_build_object(
@@ -745,6 +775,22 @@ async def preauth_dashboard(
                   p.request_id
               )
         ) ev ON TRUE
+        LEFT JOIN LATERAL (
+            WITH run_start AS (
+                SELECT MAX(logged_at) AS first_log_at
+                FROM agent_logs
+                WHERE request_id = p.request_id
+                  AND agent_num = 1
+                  AND (p.processed_at IS NULL OR logged_at <= p.processed_at + INTERVAL '5 seconds')
+            )
+            SELECT run_start.first_log_at, MAX(al.logged_at) AS last_log_at
+            FROM run_start
+            LEFT JOIN agent_logs al
+              ON al.request_id = p.request_id
+             AND al.logged_at >= run_start.first_log_at
+             AND (p.processed_at IS NULL OR al.logged_at <= p.processed_at + INTERVAL '5 seconds')
+            GROUP BY run_start.first_log_at
+        ) ar ON TRUE
         LEFT JOIN agent_logs al ON al.request_id = p.request_id
         WHERE p.org_id = $1
           AND ($2::timestamp IS NULL OR p.received_at >= $2::timestamp)
@@ -775,7 +821,9 @@ async def preauth_dashboard(
             ev.latest_items_added_count,
             ev.latest_items_added_total,
             ev.duplicate_event_attempts,
-            ev.total_intake_value
+            ev.total_intake_value,
+            ar.first_log_at,
+            ar.last_log_at
         ORDER BY p.received_at DESC
         LIMIT $6 OFFSET $7
         """,
@@ -785,36 +833,59 @@ async def preauth_dashboard(
     series_rows = await pg_query_all(
         """
         SELECT
-            to_char(date(received_at), 'YYYY-MM-DD') AS day,
+            to_char(date(p.received_at), 'YYYY-MM-DD') AS day,
             COUNT(*)::int AS received,
             COALESCE(
-                AVG(EXTRACT(EPOCH FROM (processed_at - received_at)))
-                    FILTER (WHERE processed_at IS NOT NULL),
+                AVG(
+                    CASE
+                        WHEN ar.first_log_at IS NOT NULL
+                        THEN EXTRACT(EPOCH FROM (COALESCE(p.processed_at, ar.last_log_at) - ar.first_log_at))
+                        WHEN p.processed_at IS NOT NULL
+                        THEN EXTRACT(EPOCH FROM (p.processed_at - p.received_at))
+                        ELSE NULL
+                    END
+                ),
                 0
             )::float AS avg_latency,
             COALESCE(
                 SUM(
                     CASE
-                        WHEN LOWER(COALESCE(decision, status, '')) IN ('approve', 'approved')
-                            AND (agent_result->>'amount_approved') ~ '^-?[0-9]+(\\.[0-9]+)?$'
-                        THEN (agent_result->>'amount_approved')::numeric
+                        WHEN LOWER(COALESCE(p.decision, p.status, '')) IN ('approve', 'approved')
+                            AND (p.agent_result->>'amount_approved') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                        THEN (p.agent_result->>'amount_approved')::numeric
                         ELSE 0
                     END
                 ),
                 0
             )::float AS approved_value
-        FROM preauth_logs
-        WHERE org_id = $1
-          AND ($2::timestamp IS NULL OR received_at >= $2::timestamp)
-          AND ($3::timestamp IS NULL OR received_at < $3::timestamp)
-          AND ($4::text IS NULL OR COALESCE(extracted_fields->>'plan', raw_payload->'policy'->>'plan_name', raw_payload->'policy'->>'insurance_package') ILIKE $4)
+        FROM preauth_logs p
+        LEFT JOIN LATERAL (
+            WITH run_start AS (
+                SELECT MAX(logged_at) AS first_log_at
+                FROM agent_logs
+                WHERE request_id = p.request_id
+                  AND agent_num = 1
+                  AND (p.processed_at IS NULL OR logged_at <= p.processed_at + INTERVAL '5 seconds')
+            )
+            SELECT run_start.first_log_at, MAX(al.logged_at) AS last_log_at
+            FROM run_start
+            LEFT JOIN agent_logs al
+              ON al.request_id = p.request_id
+             AND al.logged_at >= run_start.first_log_at
+             AND (p.processed_at IS NULL OR al.logged_at <= p.processed_at + INTERVAL '5 seconds')
+            GROUP BY run_start.first_log_at
+        ) ar ON TRUE
+        WHERE p.org_id = $1
+          AND ($2::timestamp IS NULL OR p.received_at >= $2::timestamp)
+          AND ($3::timestamp IS NULL OR p.received_at < $3::timestamp)
+          AND ($4::text IS NULL OR COALESCE(p.extracted_fields->>'plan', p.raw_payload->'policy'->>'plan_name', p.raw_payload->'policy'->>'insurance_package') ILIKE $4)
           AND ($5::text IS NULL OR (
-                patient_id ILIKE $5
-                OR request_id ILIKE $5
-                OR COALESCE(decision, '') ILIKE $5
-                OR raw_payload::text ILIKE $5
+                p.patient_id ILIKE $5
+                OR p.request_id ILIKE $5
+                OR COALESCE(p.decision, '') ILIKE $5
+                OR p.raw_payload::text ILIKE $5
           ))
-        GROUP BY date(received_at)
+        GROUP BY date(p.received_at)
         ORDER BY day
         """,
         org_id, date_from_start, date_to_end, plan_filter, search_pattern
@@ -1456,6 +1527,11 @@ async def patient_history(
             p.agent_result,
             p.error_message,
             p.processed_at,
+            CASE
+                WHEN ar.first_log_at IS NOT NULL
+                THEN EXTRACT(EPOCH FROM (COALESCE(p.processed_at, ar.last_log_at) - ar.first_log_at))::float
+                ELSE NULL
+            END AS agent_runtime_seconds,
             COALESCE(
                 jsonb_agg(
                     jsonb_build_object(
@@ -1470,6 +1546,22 @@ async def patient_history(
                 '[]'::jsonb
             ) AS agent_logs
         FROM preauth_logs p
+        LEFT JOIN LATERAL (
+            WITH run_start AS (
+                SELECT MAX(logged_at) AS first_log_at
+                FROM agent_logs
+                WHERE request_id = p.request_id
+                  AND agent_num = 1
+                  AND (p.processed_at IS NULL OR logged_at <= p.processed_at + INTERVAL '5 seconds')
+            )
+            SELECT run_start.first_log_at, MAX(al.logged_at) AS last_log_at
+            FROM run_start
+            LEFT JOIN agent_logs al
+              ON al.request_id = p.request_id
+             AND al.logged_at >= run_start.first_log_at
+             AND (p.processed_at IS NULL OR al.logged_at <= p.processed_at + INTERVAL '5 seconds')
+            GROUP BY run_start.first_log_at
+        ) ar ON TRUE
         LEFT JOIN agent_logs al ON al.request_id = p.request_id
         WHERE p.org_id = $1
           AND (
@@ -1478,7 +1570,8 @@ async def patient_history(
               )
         GROUP BY p.id, p.request_id, p.patient_id, p.status, p.received_at,
                  p.raw_payload, p.extracted_fields, p.agent_step, p.decision,
-                 p.agent_result, p.error_message, p.processed_at
+                 p.agent_result, p.error_message, p.processed_at,
+                 ar.first_log_at, ar.last_log_at
         ORDER BY p.received_at DESC
         """,
         org_id, pid,
