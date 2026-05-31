@@ -6,12 +6,12 @@ from datetime import date, datetime
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from services.db import pg_execute, pg_query_one
+from services.preauth_events import persist_preauth_intake_event
 from services.webhook_delivery import (
     create_webhook_delivery_log,
     mask_api_key,
     update_webhook_delivery_log,
 )
-from agent import agent
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -445,24 +445,15 @@ async def receive_preauth(
             if not extracted_fields.get(field)
         ]
 
-        # Save incoming webhook immediately
+        # Save the full AMAN event and update the latest PA state atomically.
         try:
-            preauth_row = await pg_query_one(
-                """
-                INSERT INTO preauth_logs (org_id, request_id, patient_id, raw_payload, extracted_fields, status)
-                VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, 'pending')
-                ON CONFLICT (request_id) DO UPDATE SET
-                    raw_payload = EXCLUDED.raw_payload,
-                    extracted_fields = EXCLUDED.extracted_fields,
-                    received_at = NOW(),
-                    status = 'pending'
-                RETURNING id
-                """,
-                client["org_id"],
-                str(request_id),
-                str(patient_id),
-                json.dumps(payload),
-                json.dumps(extracted_fields)
+            persisted = await persist_preauth_intake_event(
+                org_id=client["org_id"],
+                request_id=str(request_id),
+                patient_id=str(patient_id),
+                payload=payload,
+                extracted_fields=extracted_fields,
+                payload_summary=payload_summary,
             )
         except Exception as exc:
             await update_webhook_delivery_log(
@@ -477,21 +468,35 @@ async def receive_preauth(
             logger.exception("Failed to persist preauth webhook payload")
             raise HTTPException(status_code=500, detail="Failed to persist webhook payload")
 
+        preauth_row = persisted["preauth_row"]
+        event_row = persisted["event_row"]
+        duplicate_event = persisted["duplicate_event"]
+        db_insert_status = (
+            "duplicate_event_seen"
+            if duplicate_event
+            else "event_saved_latest_state_updated"
+        )
+
         await update_webhook_delivery_log(
             delivery_id,
-            db_insert_status="db_upsert_success",
+            db_insert_status=db_insert_status,
             preauth_request_id=str(request_id),
-            preauth_log_id=preauth_row["id"] if preauth_row else None,
-            final_status="accepted",
+            preauth_log_id=preauth_row["id"] if preauth_row else event_row["preauth_log_id"],
+            preauth_event_id=event_row["id"] if event_row else None,
+            final_status="accepted_duplicate_event" if duplicate_event else "accepted",
             http_status_returned=200,
             processing_time_ms=elapsed_ms(started_at),
         )
 
         # Kick off agent in background
-        background.add_task(agent.run, str(patient_id), str(request_id))
+        # background.add_task(agent.run, str(patient_id), str(request_id))
         return {
             "status": "received",
             "request_id": str(request_id),
+            "event_id": str(event_row["event_id"]) if event_row else None,
+            "event_sequence": event_row["event_sequence"] if event_row else None,
+            "duplicate_event": duplicate_event,
+            "latest_state_updated": persisted["latest_state_updated"],
             "captured_fields": extracted_fields,
             "missing_recommended_fields": missing_recommended_fields,
         }
