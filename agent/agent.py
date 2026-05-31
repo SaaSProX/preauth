@@ -505,6 +505,30 @@ async def run(patient_id: str, request_id: str):
             str(request_id)
         )
         benefit_category = result_2.get("benefit_category", "unknown")
+
+        # If consumption / YTD usage is missing from the payload, we cannot
+        # honestly verify limits. Escalate for human review instead of
+        # silently assuming zero usage.
+        util_data = pa.get("utilization") if isinstance(pa.get("utilization"), dict) else {}
+        if util_data.get("utilization_data_missing"):
+            skip_result = {
+                "pass": None,
+                "reason": "Cannot verify limits — consumption data (enrollee_limits/policy_limits) is missing from the payload. Escalated for human review.",
+                "utilization_data_missing": True,
+                "benefit_category": benefit_category,
+            }
+            await _log_agent(request_id, 3, "Utilization & Limits", skip_result)
+            await _save_decision(request_id, "ESCALATE", {
+                "agent1": result_1, "agent2": result_2, "agent3": skip_result, "agent4": None,
+                "decision": "ESCALATE", "confidence": "MEDIUM", "amount_approved": None,
+                "escalation_reason": "Consumption data missing — cannot verify limits",
+                "reasoning": "Cannot verify limits because the inbound payload does not include enrollee or policy consumption snapshots. Escalated for human review.",
+                "flags": ["Consumption data missing"],
+                "no_preauth_required": False,
+                "agent_summary": {"agent1_pass": True, "agent2_pass": True, "agent3_pass": None},
+            })
+            return
+
         result_3 = await agent_utilization(pa, benefit_category)
         await _log_agent(request_id, 3, "Utilization & Limits", result_3)
 
@@ -556,6 +580,14 @@ async def _save_decision(request_id: str, decision: str, result: dict):
         str(request_id), status, decision, json.dumps(result)
     )
     logger.info(f"[Agent] ── END ── request_id={request_id} decision={decision}")
+
+    # Send the decision back to Aman (advisory callback — integration direction (ii)).
+    # Imported lazily to avoid any startup-time coupling.
+    try:
+        from services.aman_callback import send_decision_to_aman
+        await send_decision_to_aman(str(request_id))
+    except Exception:
+        logger.exception("[Agent] Aman callback failed (logged, not raised)")
 
 
 def _get_estimated_cost(pa: dict) -> float | None:

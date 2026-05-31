@@ -22,6 +22,13 @@ class Settings(BaseSettings):
     # Dashboard
     dashboard_base_url: str = "http://localhost:3000"
 
+    # Aman outbound callback (agent decision → Aman)
+    aman_decisions_url: str = ""
+    kpa_key: str = ""
+
+    # CORS — comma-separated list of allowed origins (default is local dev)
+    cors_origins: str = "http://localhost:5173,http://localhost:3000"
+
     # Email (Resend)
     resend_api_key: str = ""
     resend_from_email: str = ""
