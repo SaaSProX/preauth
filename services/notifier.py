@@ -60,16 +60,16 @@ def send_invite_email(to: str, invite_link: str, org_name: str, inviter_name: st
     escaped_inviter = escape(inviter_name) if inviter_name else "An administrator"
     escaped_link = escape(invite_link)
 
-    subject = f"You're invited to {org_name} on Saaspro Lab API Management"
+    subject = f"You're invited to {org_name} on Saaspro Dashboard"
     text = (
         f"{inviter_name or 'An administrator'} invited you to join {org_name} "
-        "on Saaspro Lab API Management.\n\n"
+        "on Saaspro Dashboard.\n\n"
         f"Create your account here:\n{invite_link}\n\n"
         "If you were not expecting this invite, you can ignore this email."
     )
     html = f"""
     <div style="font-family: Arial, sans-serif; color: #172033; line-height: 1.6;">
-      <p>{escaped_inviter} invited you to join <strong>{escaped_org}</strong> on Saaspro Lab API Management.</p>
+      <p>{escaped_inviter} invited you to join <strong>{escaped_org}</strong> on Saaspro Dashboard.</p>
       <p>
         <a href="{escaped_link}" style="display: inline-block; padding: 10px 14px; background: #164e63; color: #ffffff; text-decoration: none; border-radius: 6px;">
           Create account

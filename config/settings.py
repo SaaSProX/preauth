@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     jwt_secret: str = ""
 
     # Dashboard
-    dashboard_base_url: str = "http://localhost:3000"
+    dashboard_base_url: str = "https://dashboard.saasprolabs.io"
 
     # Aman outbound callback (agent decision → Aman)
     aman_decisions_url: str = ""
