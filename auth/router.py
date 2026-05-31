@@ -1002,7 +1002,7 @@ class RetryPendingPreauthPayload(BaseModel):
     date_from: date | None = None
     date_to: date | None = None
     q: str | None = None
-    limit: int = 200
+    limit: int = 20
 
 
 RETRYABLE_PREAUTH_STATUSES = {"pending", "processing", "received", "error"}
@@ -1072,7 +1072,7 @@ async def retry_pending_preauths(payload: RetryPendingPreauthPayload, background
     if payload.date_from and payload.date_to and payload.date_from > payload.date_to:
         raise HTTPException(status_code=400, detail="Start date cannot be after end date")
 
-    safe_limit = min(max(payload.limit, 1), 500)
+    safe_limit = min(max(payload.limit, 1), 20)
     date_from_start = datetime.combine(payload.date_from, time.min) if payload.date_from else None
     date_to_end = datetime.combine(payload.date_to + timedelta(days=1), time.min) if payload.date_to else None
     search_q = payload.q.strip() if payload.q and payload.q.strip() else None
