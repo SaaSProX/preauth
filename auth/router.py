@@ -35,6 +35,10 @@ class LoginPayload(BaseModel):
 class TeamInvitePayload(BaseModel):
     email: str
 
+class CreateOrgPayload(BaseModel):
+    org_name: str
+    admin_email: str
+
 
 def parse_json_field(value):
     if isinstance(value, str):
@@ -137,11 +141,32 @@ def _provider_label(value):
 
 
 def _dashboard_org_id(claims):
-    if str(claims.get("email", "")).lower() == "kalycodes@gmail.com":
-        return 3
     return claims["org_id"]
 
 
+async def is_platform_admin(claims):
+    """SaaSPro platform admin = admin of the platform org named 'SAASPRO'.
+
+    There is no separate role tier for "super-admin"; the only thing this
+    helper checks is "are you an admin of the org we use to run the
+    platform". An admin of a client org (e.g. AMAN) is NOT a platform
+    admin and cannot create/edit other orgs or drill into them.
+    """
+    if claims.get("role") != "admin":
+        return False
+    row = await pg_query_one(
+        "SELECT 1 FROM organizations WHERE id = $1 AND LOWER(name) = 'saaspro' AND is_active = TRUE",
+        claims["org_id"],
+    )
+    return bool(row)
+
+
+# NOTE (merge): kalycoding added _preauth_dashboard_org_id() on origin/main to
+# pick the "busiest" org as a fallback when the JWT's org_id has no data.
+# Kept as a defined helper so existing callers (if any are added later) still
+# resolve, BUT the dashboard endpoint deliberately does NOT use it — it would
+# silently override the JWT's org and break per-tenant isolation. The dashboard
+# uses claims["org_id"] + the explicit platform-admin ?org_id= drill-in instead.
 async def _preauth_dashboard_org_id(claims):
     fallback = await pg_query_one(
         """
@@ -233,13 +258,16 @@ def _dashboard_request(row):
         "item_description": item_description,
         "estimated_cost": _total_requested_cost(source),
         "line_item_count": item_count,
-        "event_count": row["event_count"],
-        "latest_event_sequence": row["latest_event_sequence"],
-        "latest_event_id": row["latest_event_id"],
-        "latest_items_added_count": row["latest_items_added_count"],
-        "latest_items_added_total": row["latest_items_added_total"],
-        "duplicate_event_attempts": row["duplicate_event_attempts"],
-        "total_intake_value": row["total_intake_value"],
+        # Event-history fields come from the LATERAL join in /preauth-dashboard.
+        # Other callers (e.g. /patient-history) don't include them — fall back
+        # to defaults instead of raising KeyError.
+        "event_count": (row["event_count"] if "event_count" in row.keys() else 0),
+        "latest_event_sequence": (row["latest_event_sequence"] if "latest_event_sequence" in row.keys() else None),
+        "latest_event_id": (row["latest_event_id"] if "latest_event_id" in row.keys() else None),
+        "latest_items_added_count": (row["latest_items_added_count"] if "latest_items_added_count" in row.keys() else 0),
+        "latest_items_added_total": (row["latest_items_added_total"] if "latest_items_added_total" in row.keys() else 0),
+        "duplicate_event_attempts": (row["duplicate_event_attempts"] if "duplicate_event_attempts" in row.keys() else 0),
+        "total_intake_value": (row["total_intake_value"] if "total_intake_value" in row.keys() else 0),
         "facility": item.get("facility") or source.get("facility") or _nested_value(raw_source, "encounter", "facility_name"),
         "requesting_provider": _provider_label(
             item.get("requesting_provider")
@@ -254,6 +282,7 @@ def _dashboard_request(row):
         "extracted_fields": extracted_fields,
         "agent_result": agent_result,
         "agent_logs": agent_logs or [],
+        "patient_pa_count": (row["patient_pa_count"] if "patient_pa_count" in row.keys() else None),
     }
 
 
@@ -333,39 +362,53 @@ async def login(payload: LoginPayload):
 
 
 # ─────────────────────────────────────────────
-# Generate API key (user-owned)
+# API keys (user-owned, multiple per user)
 # ─────────────────────────────────────────────
 
+class GenerateKeyPayload(BaseModel):
+    name: str | None = None
+
+
+def _mask_key(k: str) -> str:
+    if not k or len(k) < 4:
+        return "••••"
+    return "••••" + k[-4:]
+
+
 @router.get("/api-key")
-async def get_user_api_key(claims: dict = Depends(verify_session_token)):
-    api_client = await pg_query_one(
+async def list_user_api_keys(claims: dict = Depends(verify_session_token)):
+    rows = await pg_query_all(
         """
-        SELECT id, created_at
+        SELECT id, client_name, api_key, created_at, last_used_at
         FROM api_clients
         WHERE org_id = $1 AND user_id = $2 AND is_active = TRUE
         ORDER BY created_at DESC
-        LIMIT 1
         """,
         claims["org_id"], int(claims["sub"])
     )
-
-    if not api_client:
-        return {"has_api_key": False}
-
     return {
-        "has_api_key": True,
-        "masked_api_key": "*****",
-        "created_at": api_client["created_at"],
+        "keys": [
+            {
+                "id": r["id"],
+                "name": r["client_name"],
+                "masked_api_key": _mask_key(r["api_key"]),
+                "created_at": r["created_at"],
+                "last_used_at": r["last_used_at"],
+            }
+            for r in rows
+        ]
     }
 
 
 @router.post("/api-key/generate")
-async def generate_user_api_key(claims: dict = Depends(verify_session_token)):
+async def generate_user_api_key(payload: GenerateKeyPayload, claims: dict = Depends(verify_session_token)):
+    if claims.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can generate API keys")
     org_id = claims["org_id"]
     user_id = int(claims["sub"])
     client = await pg_query_one(
         """
-        SELECT clients.name, clients.email, organizations.name AS org_name
+        SELECT clients.name, clients.email
         FROM clients
         JOIN organizations ON organizations.id = clients.org_id
         WHERE clients.id = $1 AND clients.org_id = $2
@@ -376,36 +419,41 @@ async def generate_user_api_key(claims: dict = Depends(verify_session_token)):
     if not client:
         raise HTTPException(status_code=404, detail="User or organization not found")
 
-    await pg_execute(
-        "DELETE FROM api_clients WHERE org_id = $1 AND user_id = $2 AND is_active = TRUE",
-        org_id, user_id
-    )
+    name = ((payload.name or "").strip()) or f"{client['name']} ({client['email']})"
 
     api_key = generate_api_key()
-    api_client = await pg_query_one(
+    row = await pg_query_one(
         """
         INSERT INTO api_clients (org_id, user_id, client_name, api_key)
         VALUES ($1, $2, $3, $4)
-        RETURNING created_at
+        RETURNING id, client_name, created_at
         """,
-        org_id, user_id, f"{client['name']} ({client['email']})", api_key
+        org_id, user_id, name, api_key
     )
 
     return {
         "message": "API key generated",
+        "id": row["id"],
+        "name": row["client_name"],
         "api_key": api_key,
-        "created_at": api_client["created_at"],
-        "note": "Save your API key — it won't be shown again"
+        "masked_api_key": _mask_key(api_key),
+        "created_at": row["created_at"],
+        "note": "Save your API key — it won't be shown again",
     }
 
 
-@router.delete("/api-key")
-async def revoke_user_api_key(claims: dict = Depends(verify_session_token)):
+@router.delete("/api-key/{key_id}")
+async def revoke_user_api_key(key_id: int, claims: dict = Depends(verify_session_token)):
+    if claims.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can revoke API keys")
+    # Revoke any key in the caller's org (not just keys the caller created
+    # themselves). Org admins manage org-level credentials. The previous
+    # `AND user_id = $3` clause made revocation impossible for keys issued
+    # by a different admin.
     await pg_execute(
-        "DELETE FROM api_clients WHERE org_id = $1 AND user_id = $2 AND is_active = TRUE",
-        claims["org_id"], int(claims["sub"])
+        "DELETE FROM api_clients WHERE id = $1 AND org_id = $2",
+        key_id, claims["org_id"]
     )
-
     return {"message": "API key revoked"}
 
 
@@ -448,15 +496,39 @@ async def list_preauth_payloads(claims: dict = Depends(verify_session_token)):
 async def preauth_dashboard(
     date_from: date | None = None,
     date_to: date | None = None,
+    org_id: int | None = None,
+    page: int = 1,
+    page_size: int = 25,
+    plan: str | None = None,
+    q: str | None = None,
     claims: dict = Depends(verify_session_token)
 ):
-    org_id = await _preauth_dashboard_org_id(claims)
+    # Platform admins (SaaSPro org admins) can pass ?org_id= to view a
+    # client org's activity. Anyone else is strictly scoped to their own
+    # org_id from the JWT.
+    if org_id is not None:
+        if not await is_platform_admin(claims):
+            raise HTTPException(status_code=403, detail="Only platform admins (SaaSPro org) can view another org's data")
+    else:
+        org_id = _dashboard_org_id(claims)
+
+    page = max(1, page)
+    page_size = min(max(1, page_size), 200)
+    offset = (page - 1) * page_size
 
     if date_from and date_to and date_from > date_to:
         raise HTTPException(status_code=400, detail="Start date cannot be after end date")
 
     date_from_start = datetime.combine(date_from, time.min) if date_from else None
     date_to_end = datetime.combine(date_to + timedelta(days=1), time.min) if date_to else None
+    plan_filter = plan.strip() if plan and plan.strip() and plan.strip().lower() != 'all' else None
+    # Trim + wildcard the search term once so every clause uses the same value.
+    # Searches against patient_id, request_id, decision, and the raw payload
+    # JSON-cast-to-text (catches patient names, facilities, plans, etc.).
+    search_q = q.strip() if q and q.strip() else None
+    search_pattern = f"%{search_q}%" if search_q else None
+    # Africa/Lagos windowing for the preauth_events summaries added on
+    # origin/main — keeps "today" aligned with operator-local midnight.
     lagos_tz = ZoneInfo("Africa/Lagos")
     event_date_from_start = datetime.combine(date_from, time.min, tzinfo=lagos_tz) if date_from else None
     event_date_to_end = datetime.combine(date_to + timedelta(days=1), time.min, tzinfo=lagos_tz) if date_to else None
@@ -505,14 +577,21 @@ async def preauth_dashboard(
                 ),
                 0
             )::float AS total_amount_approved,
-            (AVG(EXTRACT(EPOCH FROM (processed_at::timestamp - received_at)))
+            (AVG(EXTRACT(EPOCH FROM (processed_at - received_at)))
                 FILTER (WHERE processed_at IS NOT NULL))::float AS avg_processing_seconds
         FROM preauth_logs
         WHERE org_id = $1
           AND ($2::timestamp IS NULL OR received_at >= $2::timestamp)
           AND ($3::timestamp IS NULL OR received_at < $3::timestamp)
+          AND ($4::text IS NULL OR COALESCE(extracted_fields->>'plan', raw_payload->'policy'->>'plan_name', raw_payload->'policy'->>'insurance_package') ILIKE $4)
+          AND ($5::text IS NULL OR (
+                patient_id ILIKE $5
+                OR request_id ILIKE $5
+                OR COALESCE(decision, '') ILIKE $5
+                OR raw_payload::text ILIKE $5
+          ))
         """,
-        org_id, date_from_start, date_to_end
+        org_id, date_from_start, date_to_end, plan_filter, search_pattern
     )
 
     event_summary = await pg_query_one(
@@ -625,7 +704,12 @@ async def preauth_dashboard(
                     ORDER BY al.agent_num, al.logged_at
                 ) FILTER (WHERE al.id IS NOT NULL),
                 '[]'::jsonb
-            ) AS agent_logs
+            ) AS agent_logs,
+            CASE
+                WHEN p.patient_id IS NULL OR p.patient_id = 'unknown' THEN 0
+                ELSE (SELECT COUNT(*)::int FROM preauth_logs p2
+                      WHERE p2.org_id = p.org_id AND p2.patient_id = p.patient_id)
+            END AS patient_pa_count
         FROM preauth_logs p
         LEFT JOIN LATERAL (
             SELECT
@@ -648,6 +732,13 @@ async def preauth_dashboard(
         WHERE p.org_id = $1
           AND ($2::timestamp IS NULL OR p.received_at >= $2::timestamp)
           AND ($3::timestamp IS NULL OR p.received_at < $3::timestamp)
+          AND ($4::text IS NULL OR COALESCE(p.extracted_fields->>'plan', p.raw_payload->'policy'->>'plan_name', p.raw_payload->'policy'->>'insurance_package') ILIKE $4)
+          AND ($5::text IS NULL OR (
+                p.patient_id ILIKE $5
+                OR p.request_id ILIKE $5
+                OR COALESCE(p.decision, '') ILIKE $5
+                OR p.raw_payload::text ILIKE $5
+          ))
         GROUP BY
             p.id,
             p.request_id,
@@ -669,15 +760,100 @@ async def preauth_dashboard(
             ev.duplicate_event_attempts,
             ev.total_intake_value
         ORDER BY p.received_at DESC
-        LIMIT 100
+        LIMIT $6 OFFSET $7
         """,
-        org_id, date_from_start, date_to_end
+        org_id, date_from_start, date_to_end, plan_filter, search_pattern, page_size, offset
     )
 
+    series_rows = await pg_query_all(
+        """
+        SELECT
+            to_char(date(received_at), 'YYYY-MM-DD') AS day,
+            COUNT(*)::int AS received,
+            COALESCE(
+                AVG(EXTRACT(EPOCH FROM (processed_at - received_at)))
+                    FILTER (WHERE processed_at IS NOT NULL),
+                0
+            )::float AS avg_latency,
+            COALESCE(
+                SUM(
+                    CASE
+                        WHEN LOWER(COALESCE(decision, status, '')) IN ('approve', 'approved')
+                            AND (agent_result->>'amount_approved') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                        THEN (agent_result->>'amount_approved')::numeric
+                        ELSE 0
+                    END
+                ),
+                0
+            )::float AS approved_value
+        FROM preauth_logs
+        WHERE org_id = $1
+          AND ($2::timestamp IS NULL OR received_at >= $2::timestamp)
+          AND ($3::timestamp IS NULL OR received_at < $3::timestamp)
+          AND ($4::text IS NULL OR COALESCE(extracted_fields->>'plan', raw_payload->'policy'->>'plan_name', raw_payload->'policy'->>'insurance_package') ILIKE $4)
+          AND ($5::text IS NULL OR (
+                patient_id ILIKE $5
+                OR request_id ILIKE $5
+                OR COALESCE(decision, '') ILIKE $5
+                OR raw_payload::text ILIKE $5
+          ))
+        GROUP BY date(received_at)
+        ORDER BY day
+        """,
+        org_id, date_from_start, date_to_end, plan_filter, search_pattern
+    )
+
+    plans_rows = await pg_query_all(
+        """
+        SELECT DISTINCT
+            COALESCE(extracted_fields->>'plan', raw_payload->'policy'->>'plan_name', raw_payload->'policy'->>'insurance_package') AS plan
+        FROM preauth_logs
+        WHERE org_id = $1
+          AND COALESCE(extracted_fields->>'plan', raw_payload->'policy'->>'plan_name', raw_payload->'policy'->>'insurance_package') IS NOT NULL
+        ORDER BY plan
+        """,
+        org_id
+    )
+    # The full date span the org has ever received PAs over (ignores active filters).
+    # Used by the dashboard header so the visible timeframe is always honest.
+    window_row = await pg_query_one(
+        "SELECT MIN(received_at) AS earliest, MAX(received_at) AS latest FROM preauth_logs WHERE org_id = $1",
+        org_id
+    )
+    data_window = {
+        "earliest": window_row["earliest"].isoformat() if window_row and window_row.get("earliest") else None,
+        "latest": window_row["latest"].isoformat() if window_row and window_row.get("latest") else None,
+    }
+
+    # Dedupe case variants ("Gold" vs "GOLD") — prefer the non-all-caps form
+    _plan_groups: dict[str, list[str]] = {}
+    for r in plans_rows:
+        p = r["plan"]
+        if not p:
+            continue
+        _plan_groups.setdefault(p.lower(), []).append(p)
+    available_plans: list[str] = []
+    for variants in _plan_groups.values():
+        non_upper = [v for v in variants if not v.isupper()]
+        available_plans.append(non_upper[0] if non_upper else variants[0].title())
+    available_plans.sort(key=lambda s: s.lower())
+
+    total = summary["total"] if summary else 0
     return {
         "filters": {
             "date_from": date_from.isoformat() if date_from else None,
             "date_to": date_to.isoformat() if date_to else None,
+            "plan": plan_filter,
+        },
+        "meta": {
+            "plans": available_plans,
+            "data_window": data_window,
+        },
+        "pagination": {
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "total_pages": ((total + page_size - 1) // page_size) if page_size > 0 else 0,
         },
         "summary": {
             "total": summary["total"] if summary else 0,
@@ -709,7 +885,443 @@ async def preauth_dashboard(
             "today_duplicate_event_attempts": today_duplicate_summary["duplicate_event_attempts"] if today_duplicate_summary else 0,
         },
         "requests": [_dashboard_request(row) for row in rows],
+        "series": [
+            {
+                "day": r["day"],
+                "received": r["received"],
+                "avg_latency": r["avg_latency"],
+                "approved_value": r["approved_value"],
+            }
+            for r in series_rows
+        ],
     }
+
+
+class AuditEventPayload(BaseModel):
+    event_type: str
+    target_kind: str | None = None
+    target_id: str | None = None
+    metadata: dict | None = None
+
+
+@router.post("/audit/log-event")
+async def log_audit_event(payload: AuditEventPayload, claims: dict = Depends(verify_session_token)):
+    """Append-only record of compliance-sensitive UI actions.
+
+    The client posts here when an operator does something we want a trail for
+    (PDF export, drill-in view, override, etc.). Org-scoped via the JWT — a
+    client can't write an event into a different org's audit log.
+    """
+    org_id = _dashboard_org_id(claims)
+    try:
+        user_id = int(claims["sub"])
+    except (KeyError, TypeError, ValueError):
+        user_id = None
+    user_email = claims.get("email")
+    await pg_execute(
+        """
+        INSERT INTO audit_events (org_id, user_id, user_email, event_type, target_kind, target_id, metadata)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        """,
+        org_id, user_id, user_email,
+        payload.event_type[:50],
+        (payload.target_kind or None) and payload.target_kind[:50],
+        (payload.target_id or None) and payload.target_id[:200],
+        json.dumps(payload.metadata or {}),
+    )
+    return {"status": "logged"}
+
+
+@router.get("/audit/events")
+async def list_audit_events(
+    event_type: str | None = None,
+    target_kind: str | None = None,
+    target_id: str | None = None,
+    page: int = 1,
+    page_size: int = 50,
+    claims: dict = Depends(verify_session_token),
+):
+    """List audit events for the caller's org. Admin-only — members can't
+    inspect who's been exporting what.
+    """
+    if claims.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can view the audit trail")
+    org_id = _dashboard_org_id(claims)
+    page = max(1, page)
+    page_size = min(max(1, page_size), 200)
+    offset = (page - 1) * page_size
+
+    rows = await pg_query_all(
+        """
+        SELECT id, user_id, user_email, event_type, target_kind, target_id, metadata, created_at
+        FROM audit_events
+        WHERE org_id = $1
+          AND ($2::text IS NULL OR event_type = $2)
+          AND ($3::text IS NULL OR target_kind = $3)
+          AND ($4::text IS NULL OR target_id = $4)
+        ORDER BY created_at DESC
+        LIMIT $5 OFFSET $6
+        """,
+        org_id, event_type, target_kind, target_id, page_size, offset,
+    )
+    total_row = await pg_query_one(
+        """
+        SELECT COUNT(*)::int AS total FROM audit_events
+        WHERE org_id = $1
+          AND ($2::text IS NULL OR event_type = $2)
+          AND ($3::text IS NULL OR target_kind = $3)
+          AND ($4::text IS NULL OR target_id = $4)
+        """,
+        org_id, event_type, target_kind, target_id,
+    )
+    return {
+        "pagination": {"page": page, "page_size": page_size, "total": total_row["total"] if total_row else 0},
+        "events": [
+            {
+                "id": r["id"],
+                "user_id": r["user_id"],
+                "user_email": r["user_email"],
+                "event_type": r["event_type"],
+                "target_kind": r["target_kind"],
+                "target_id": r["target_id"],
+                "metadata": parse_json_field(r["metadata"]) if r["metadata"] else {},
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            }
+            for r in rows
+        ],
+    }
+
+
+@router.get("/patients")
+async def patients_list(
+    q: str | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    outcome: str | None = None,  # 'all' | 'denials' | 'escalations' | 'approvals' | 'open'
+    sort: str | None = None,     # 'latest' | 'count' | 'requested' | 'approved' | 'denials'
+    page: int = 1,
+    page_size: int = 25,
+    org_id: int | None = None,
+    claims: dict = Depends(verify_session_token),
+):
+    """Group preauth_logs by patient_id and return per-patient aggregates.
+
+    Org-scoped via the JWT (or via platform-admin ?org_id= drill-in).
+    Skips rows with patient_id IS NULL or 'unknown' — those aren't reliably
+    the same patient and shouldn't be grouped.
+    """
+    if org_id is not None:
+        if not await is_platform_admin(claims):
+            raise HTTPException(status_code=403, detail="Only platform admins (SaaSPro org) can view another org's data")
+    else:
+        org_id = _dashboard_org_id(claims)
+
+    page = max(1, page)
+    page_size = min(max(1, page_size), 200)
+    offset = (page - 1) * page_size
+
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(status_code=400, detail="Start date cannot be after end date")
+    date_from_start = datetime.combine(date_from, time.min) if date_from else None
+    date_to_end = datetime.combine(date_to + timedelta(days=1), time.min) if date_to else None
+
+    search_q = q.strip() if q and q.strip() else None
+    search_pattern = f"%{search_q}%" if search_q else None
+
+    order_clause = {
+        "latest":    "latest_received_at DESC NULLS LAST",
+        "count":     "pa_count DESC, latest_received_at DESC NULLS LAST",
+        "requested": "total_requested DESC NULLS LAST, latest_received_at DESC NULLS LAST",
+        "approved":  "total_approved DESC NULLS LAST, latest_received_at DESC NULLS LAST",
+        "denials":   "deny_count DESC, escalate_count DESC, latest_received_at DESC NULLS LAST",
+    }.get(sort or "latest", "latest_received_at DESC NULLS LAST")
+
+    outcome_clause = {
+        "denials":     "deny_count > 0",
+        "escalations": "escalate_count > 0",
+        "approvals":   "approve_count > 0",
+        "open":        "(processing_count + pending_count + received_count) > 0",
+    }.get(outcome or "all", "TRUE")
+
+    # Single aggregating query: filter rows, compute per-row requested cost
+    # from raw_payload, group by patient_id, and pull the most recent payload
+    # for each patient to read their display name + insurance no + plan.
+    base_sql = f"""
+        WITH pa_with_cost AS (
+            SELECT
+                p.id,
+                p.patient_id,
+                p.received_at,
+                p.status,
+                p.decision,
+                p.agent_result,
+                p.raw_payload,
+                COALESCE(
+                    NULLIF(p.raw_payload->>'total_requested_cost', '')::numeric,
+                    (
+                        SELECT COALESCE(SUM(
+                            COALESCE(
+                                NULLIF(it->>'requested_cost', '')::numeric,
+                                NULLIF(it->>'estimated_cost', '')::numeric,
+                                NULLIF(it->>'cost', '')::numeric,
+                                NULLIF(it->>'amount', '')::numeric,
+                                NULLIF(it->>'unit_cost', '')::numeric
+                                    * COALESCE(NULLIF(it->>'quantity', '')::numeric, 1),
+                                0
+                            )
+                        ), 0)
+                        FROM jsonb_array_elements(
+                            COALESCE(
+                                CASE jsonb_typeof(p.raw_payload->'pa_items') WHEN 'array' THEN p.raw_payload->'pa_items' END,
+                                CASE jsonb_typeof(p.raw_payload->'items')    WHEN 'array' THEN p.raw_payload->'items'    END,
+                                '[]'::jsonb
+                            )
+                        ) AS it
+                    ),
+                    0
+                ) AS req_cost
+            FROM preauth_logs p
+            WHERE p.org_id = $1
+              AND p.patient_id IS NOT NULL
+              AND p.patient_id <> 'unknown'
+              AND ($2::timestamp IS NULL OR p.received_at >= $2::timestamp)
+              AND ($3::timestamp IS NULL OR p.received_at <  $3::timestamp)
+        ),
+        aggregated AS (
+            SELECT
+                patient_id,
+                COUNT(*)::int AS pa_count,
+                SUM(req_cost)::float AS total_requested,
+                SUM(
+                    CASE
+                        WHEN LOWER(COALESCE(decision, status, '')) IN ('approve', 'approved')
+                          AND (agent_result->>'amount_approved') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                        THEN (agent_result->>'amount_approved')::numeric
+                        ELSE 0
+                    END
+                )::float AS total_approved,
+                COUNT(*) FILTER (WHERE LOWER(COALESCE(decision, status, '')) IN ('approve', 'approved'))::int AS approve_count,
+                COUNT(*) FILTER (WHERE LOWER(COALESCE(decision, status, '')) IN ('deny', 'denied', 'reject', 'rejected'))::int AS deny_count,
+                COUNT(*) FILTER (WHERE LOWER(COALESCE(decision, status, '')) IN ('escalate', 'escalated'))::int AS escalate_count,
+                COUNT(*) FILTER (WHERE LOWER(status) = 'processing')::int AS processing_count,
+                COUNT(*) FILTER (WHERE LOWER(status) = 'pending')::int    AS pending_count,
+                COUNT(*) FILTER (WHERE LOWER(status) = 'received')::int   AS received_count,
+                COUNT(*) FILTER (WHERE LOWER(status) = 'error')::int      AS error_count,
+                MAX(received_at) AS latest_received_at
+            FROM pa_with_cost
+            GROUP BY patient_id
+        ),
+        enriched AS (
+            SELECT
+                a.*,
+                (SELECT raw_payload FROM pa_with_cost p2
+                 WHERE p2.patient_id = a.patient_id
+                 ORDER BY p2.received_at DESC NULLS LAST
+                 LIMIT 1) AS latest_payload
+            FROM aggregated a
+            WHERE {outcome_clause}
+        )
+        SELECT
+            e.patient_id,
+            e.pa_count,
+            e.total_requested,
+            e.total_approved,
+            e.approve_count,
+            e.deny_count,
+            e.escalate_count,
+            e.processing_count,
+            e.pending_count,
+            e.received_count,
+            e.error_count,
+            e.latest_received_at,
+            TRIM(
+                COALESCE(e.latest_payload->'enrollee'->>'first_name', '')
+                || ' '
+                || COALESCE(e.latest_payload->'enrollee'->>'surname', '')
+            ) AS patient_name,
+            COALESCE(
+                e.latest_payload->'enrollee'->>'insurance_no',
+                e.latest_payload->'policy'->>'insurance_no'
+            ) AS insurance_no,
+            COALESCE(
+                e.latest_payload->'policy'->>'plan_name',
+                e.latest_payload->'policy'->>'insurance_package'
+            ) AS plan
+        FROM enriched e
+        WHERE ($4::text IS NULL OR (
+            e.patient_id ILIKE $4
+            OR COALESCE(e.latest_payload->'enrollee'->>'first_name', '') ILIKE $4
+            OR COALESCE(e.latest_payload->'enrollee'->>'surname',    '') ILIKE $4
+            OR COALESCE(e.latest_payload->'enrollee'->>'insurance_no', '') ILIKE $4
+        ))
+        ORDER BY {order_clause}
+        LIMIT $5 OFFSET $6
+    """
+
+    rows = await pg_query_all(base_sql, org_id, date_from_start, date_to_end, search_pattern, page_size, offset)
+
+    # Total count (post-filter) for pagination — reuses the same CTEs minus LIMIT/OFFSET
+    count_sql = f"""
+        WITH pa_with_cost AS (
+            SELECT p.patient_id, p.received_at, p.status, p.decision, p.agent_result, p.raw_payload
+            FROM preauth_logs p
+            WHERE p.org_id = $1
+              AND p.patient_id IS NOT NULL
+              AND p.patient_id <> 'unknown'
+              AND ($2::timestamp IS NULL OR p.received_at >= $2::timestamp)
+              AND ($3::timestamp IS NULL OR p.received_at <  $3::timestamp)
+        ),
+        aggregated AS (
+            SELECT
+                patient_id,
+                COUNT(*) FILTER (WHERE LOWER(COALESCE(decision, status, '')) IN ('approve', 'approved'))::int AS approve_count,
+                COUNT(*) FILTER (WHERE LOWER(COALESCE(decision, status, '')) IN ('deny', 'denied', 'reject', 'rejected'))::int AS deny_count,
+                COUNT(*) FILTER (WHERE LOWER(COALESCE(decision, status, '')) IN ('escalate', 'escalated'))::int AS escalate_count,
+                COUNT(*) FILTER (WHERE LOWER(status) = 'processing')::int AS processing_count,
+                COUNT(*) FILTER (WHERE LOWER(status) = 'pending')::int AS pending_count,
+                COUNT(*) FILTER (WHERE LOWER(status) = 'received')::int AS received_count
+            FROM pa_with_cost
+            GROUP BY patient_id
+        ),
+        outcome_filtered AS (
+            SELECT a.patient_id,
+                (SELECT raw_payload FROM pa_with_cost p2 WHERE p2.patient_id = a.patient_id ORDER BY p2.received_at DESC NULLS LAST LIMIT 1) AS latest_payload
+            FROM aggregated a
+            WHERE {outcome_clause}
+        )
+        SELECT COUNT(*)::int AS total FROM outcome_filtered
+        WHERE ($4::text IS NULL OR (
+            patient_id ILIKE $4
+            OR COALESCE(latest_payload->'enrollee'->>'first_name', '') ILIKE $4
+            OR COALESCE(latest_payload->'enrollee'->>'surname',    '') ILIKE $4
+            OR COALESCE(latest_payload->'enrollee'->>'insurance_no', '') ILIKE $4
+        ))
+    """
+    total_row = await pg_query_one(count_sql, org_id, date_from_start, date_to_end, search_pattern)
+    total = total_row["total"] if total_row else 0
+
+    # Org-wide window (not filtered) — useful for the page subtitle
+    window_row = await pg_query_one(
+        """
+        SELECT MIN(received_at) AS earliest, MAX(received_at) AS latest,
+               COUNT(DISTINCT patient_id) FILTER (WHERE patient_id IS NOT NULL AND patient_id <> 'unknown')::int AS distinct_patients
+        FROM preauth_logs WHERE org_id = $1
+        """,
+        org_id,
+    )
+
+    return {
+        "filters": {
+            "q": search_q,
+            "date_from": date_from.isoformat() if date_from else None,
+            "date_to": date_to.isoformat() if date_to else None,
+            "outcome": outcome or "all",
+            "sort": sort or "latest",
+        },
+        "pagination": {
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "total_pages": ((total + page_size - 1) // page_size) if page_size > 0 else 0,
+        },
+        "meta": {
+            "distinct_patients_org_total": window_row["distinct_patients"] if window_row else 0,
+            "data_window": {
+                "earliest": window_row["earliest"].isoformat() if window_row and window_row.get("earliest") else None,
+                "latest":   window_row["latest"].isoformat()   if window_row and window_row.get("latest")   else None,
+            },
+        },
+        "patients": [
+            {
+                "patient_id":          r["patient_id"],
+                "patient_name":        r["patient_name"] or None,
+                "insurance_no":        r["insurance_no"] or None,
+                "plan":                r["plan"] or None,
+                "pa_count":            r["pa_count"],
+                "total_requested":     float(r["total_requested"] or 0),
+                "total_approved":      float(r["total_approved"] or 0),
+                "latest_received_at":  r["latest_received_at"].isoformat() if r["latest_received_at"] else None,
+                "outcome_counts": {
+                    "approve":    r["approve_count"],
+                    "deny":       r["deny_count"],
+                    "escalate":   r["escalate_count"],
+                    "processing": r["processing_count"],
+                    "pending":    r["pending_count"],
+                    "received":   r["received_count"],
+                    "error":      r["error_count"],
+                },
+            }
+            for r in rows
+        ],
+    }
+
+
+@router.get("/patient-history")
+async def patient_history(
+    patient_id: str,
+    org_id: int | None = None,
+    claims: dict = Depends(verify_session_token),
+):
+    """Return every PA in the caller's org for a single patient.
+
+    Matches on the stored patient_id, and also (when stored is null/'unknown')
+    on raw_payload.enrollee.insurance_no — that's the same fallback used when
+    surfacing patient_id to the dashboard. Returns an empty list for a bare
+    'unknown' so we never group unrelated parse-failure rows together.
+    """
+    if org_id is not None:
+        if not await is_platform_admin(claims):
+            raise HTTPException(status_code=403, detail="Only platform admins (SaaSPro org) can view another org's data")
+    else:
+        org_id = _dashboard_org_id(claims)
+
+    pid = (patient_id or "").strip()
+    if not pid or pid.lower() == "unknown":
+        return {"patient_id": pid, "requests": []}
+
+    rows = await pg_query_all(
+        """
+        SELECT
+            p.id,
+            p.request_id,
+            p.patient_id,
+            p.status,
+            p.received_at,
+            p.raw_payload,
+            p.extracted_fields,
+            p.agent_step,
+            p.decision,
+            p.agent_result,
+            p.error_message,
+            p.processed_at,
+            COALESCE(
+                jsonb_agg(
+                    jsonb_build_object(
+                        'agent_num', al.agent_num,
+                        'agent_name', al.agent_name,
+                        'status', al.status,
+                        'result', al.result,
+                        'logged_at', al.logged_at
+                    )
+                    ORDER BY al.agent_num, al.logged_at
+                ) FILTER (WHERE al.id IS NOT NULL),
+                '[]'::jsonb
+            ) AS agent_logs
+        FROM preauth_logs p
+        LEFT JOIN agent_logs al ON al.request_id = p.request_id
+        WHERE p.org_id = $1
+          AND (
+                p.patient_id = $2
+                OR ((p.patient_id IS NULL OR p.patient_id = 'unknown') AND p.raw_payload->'enrollee'->>'insurance_no' = $2)
+              )
+        GROUP BY p.id, p.request_id, p.patient_id, p.status, p.received_at,
+                 p.raw_payload, p.extracted_fields, p.agent_step, p.decision,
+                 p.agent_result, p.error_message, p.processed_at
+        ORDER BY p.received_at DESC
+        """,
+        org_id, pid,
+    )
+    return {"patient_id": pid, "requests": [_dashboard_request(row) for row in rows]}
 
 
 @router.get("/webhook-delivery-logs")
@@ -720,14 +1332,11 @@ async def webhook_delivery_logs(
     limit: int = 100,
     claims: dict = Depends(verify_session_token)
 ):
-    if claims["role"] != "admin":
-        raise HTTPException(status_code=403, detail="Only admins can view webhook delivery logs")
-
     if date_from and date_to and date_from > date_to:
         raise HTTPException(status_code=400, detail="Start date cannot be after end date")
 
     org_id = _dashboard_org_id(claims)
-    can_view_all = str(claims.get("email", "")).lower() == "kalycodes@gmail.com"
+    can_view_all = False
     safe_limit = min(max(limit, 1), 250)
     date_from_start = datetime.combine(date_from, time.min) if date_from else None
     date_to_end = datetime.combine(date_to + timedelta(days=1), time.min) if date_to else None
@@ -890,11 +1499,8 @@ async def webhook_audit_trail(
     limit: int = 50,
     claims: dict = Depends(verify_session_token)
 ):
-    if claims["role"] != "admin":
-        raise HTTPException(status_code=403, detail="Only admins can view webhook audit trails")
-
     org_id = _dashboard_org_id(claims)
-    can_view_all = str(claims.get("email", "")).lower() == "kalycodes@gmail.com"
+    can_view_all = False
     safe_limit = min(max(limit, 1), 100)
 
     rows = await pg_query_all(
@@ -1188,9 +1794,6 @@ async def preauth_events(
 
 @router.get("/team")
 async def list_team_members(claims: dict = Depends(verify_session_token)):
-    if claims["role"] != "admin":
-        raise HTTPException(status_code=403, detail="Only admins can view team members")
-
     rows = await pg_query_all(
         """
         SELECT name, email, role, created_at, 'active' AS status
@@ -1320,6 +1923,148 @@ async def invite_member(request: Request, claims: dict = Depends(verify_session_
         "email_sent": True,
         "email_id": email_result.get("id")
     }
+
+
+# ─────────────────────────────────────────────
+# Onboarding (platform admin: cross-org)
+# Platform admin = admin of the SAASPRO platform org. Only role+org
+# membership determines this — there's no separate flag, table, or URL.
+# ─────────────────────────────────────────────
+
+@router.get("/onboarding/orgs")
+async def onboarding_list_orgs(claims: dict = Depends(verify_session_token)):
+    if not await is_platform_admin(claims):
+        raise HTTPException(status_code=403, detail="Only SaaSPro platform admins can list organizations")
+
+    rows = await pg_query_all(
+        """
+        SELECT
+            o.id,
+            o.name,
+            o.is_active,
+            o.created_at,
+            (SELECT COUNT(*) FROM clients WHERE org_id = o.id AND is_active = TRUE)::int AS members,
+            (SELECT COUNT(*) FROM invites WHERE org_id = o.id AND used = FALSE)::int AS pending_invites,
+            (SELECT COUNT(*) FROM api_clients WHERE org_id = o.id AND is_active = TRUE)::int AS api_keys,
+            (SELECT COUNT(*) FROM preauth_logs WHERE org_id = o.id)::int AS requests,
+            (SELECT MAX(received_at) FROM preauth_logs WHERE org_id = o.id) AS last_activity
+        FROM organizations o
+        ORDER BY o.created_at DESC
+        """
+    )
+    return {"orgs": [dict(r) for r in rows]}
+
+
+@router.post("/onboarding/create-org")
+async def onboarding_create_org(payload: CreateOrgPayload, claims: dict = Depends(verify_session_token)):
+    if not await is_platform_admin(claims):
+        raise HTTPException(status_code=403, detail="Only SaaSPro platform admins can create organizations")
+
+    org_name = payload.org_name.strip()
+    admin_email = payload.admin_email.strip().lower()
+    if not org_name or not admin_email or "@" not in admin_email:
+        raise HTTPException(status_code=400, detail="org_name and a valid admin_email are required")
+
+    existing_client = await pg_query_one(
+        "SELECT id FROM clients WHERE LOWER(email) = $1",
+        admin_email,
+    )
+    if existing_client:
+        raise HTTPException(status_code=400, detail="That email is already registered to an organization")
+
+    existing_org = await pg_query_one(
+        "SELECT id, name FROM organizations WHERE LOWER(name) = LOWER($1) AND is_active = TRUE",
+        org_name,
+    )
+    if existing_org:
+        raise HTTPException(status_code=400, detail=f"Organization '{existing_org['name']}' already exists")
+
+    org = await pg_query_one(
+        "INSERT INTO organizations (name) VALUES ($1) RETURNING id, name, created_at",
+        org_name,
+    )
+
+    token = secrets.token_hex(16)
+    await pg_execute(
+        """
+        INSERT INTO invites (org_id, email, token, role, invited_by)
+        VALUES ($1, $2, $3, 'admin', $4)
+        """,
+        org["id"], admin_email, token, int(claims["sub"]),
+    )
+
+    invite_link = build_invite_link(token, admin_email)
+
+    email_sent = False
+    email_error = None
+    try:
+        await asyncio.to_thread(
+            send_invite_email,
+            admin_email,
+            invite_link,
+            org_name,
+            None,
+        )
+    except EmailDeliveryError as exc:
+        email_error = str(exc)
+    else:
+        email_sent = True
+
+    return {
+        "org": {"id": org["id"], "name": org["name"], "created_at": org["created_at"]},
+        "invite": {
+            "email": admin_email,
+            "invite_link": invite_link,
+            "email_sent": email_sent,
+            "email_error": email_error,
+        },
+    }
+
+
+class UpdateOrgPayload(BaseModel):
+    name: str | None = None
+    is_active: bool | None = None
+
+
+@router.patch("/onboarding/orgs/{org_id}")
+async def onboarding_update_org(org_id: int, payload: UpdateOrgPayload, claims: dict = Depends(verify_session_token)):
+    if not await is_platform_admin(claims):
+        raise HTTPException(status_code=403, detail="Only SaaSPro platform admins can edit organizations")
+
+    org = await pg_query_one(
+        "SELECT id, name, is_active FROM organizations WHERE id = $1",
+        org_id,
+    )
+    if not org:
+        raise HTTPException(status_code=404, detail="Organization not found")
+
+    if payload.is_active is False and org["name"].upper() == "SAASPRO":
+        raise HTTPException(status_code=400, detail="Cannot deactivate the SaaSPro platform org")
+
+    new_name = payload.name.strip() if payload.name is not None else None
+    if new_name:
+        existing = await pg_query_one(
+            "SELECT id FROM organizations WHERE LOWER(name) = LOWER($1) AND id <> $2",
+            new_name, org_id,
+        )
+        if existing:
+            raise HTTPException(status_code=400, detail=f"Another organization is already named '{new_name}'")
+
+    updates = []
+    args = [org_id]
+    if new_name:
+        args.append(new_name)
+        updates.append(f"name = ${len(args)}")
+    if payload.is_active is not None:
+        args.append(payload.is_active)
+        updates.append(f"is_active = ${len(args)}")
+
+    if not updates:
+        return {"org": {"id": org["id"], "name": org["name"], "is_active": org["is_active"]}, "message": "No changes"}
+
+    sql = f"UPDATE organizations SET {', '.join(updates)} WHERE id = $1 RETURNING id, name, is_active, created_at"
+    updated = await pg_query_one(sql, *args)
+    return {"org": dict(updated), "message": "Updated"}
 
 
 # ─────────────────────────────────────────────
