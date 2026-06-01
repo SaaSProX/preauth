@@ -161,14 +161,67 @@ def normalize_plan_tier(plan_name):
 
 def normalize_item_type(category_id):
     categories = {
-        1: "medication",
-        2: "consultation",
-        3: "laboratory",
+        1: "drugs_and_consumables",
+        2: "services_and_procedures",
+        3: "laboratory_investigations",
+        4: "radiological_investigations",
+        5: "dental_care",
+        6: "optical_care",
+        7: "immunization_and_vaccine",
+        8: "wellness",
     }
     try:
         return categories.get(int(category_id), "service")
     except (TypeError, ValueError):
         return "service"
+
+
+def category_label(category_id):
+    labels = {
+        1: "Drugs and consumables",
+        2: "Services and procedures",
+        3: "Laboratory investigations",
+        4: "Radiological investigations",
+        5: "Dental care",
+        6: "Optical care",
+        7: "Immunization and vaccine",
+        8: "Wellness",
+    }
+    try:
+        return labels.get(int(category_id))
+    except (TypeError, ValueError):
+        return None
+
+
+def care_type_label(care_type):
+    labels = {
+        1: "Inpatient",
+        2: "Outpatient",
+        3: "Antenatal",
+        4: "Dental Care",
+        5: "Optical care",
+        6: "Telemedicine",
+        7: "Wellness",
+    }
+    try:
+        return labels.get(int(care_type))
+    except (TypeError, ValueError):
+        return None
+
+
+def item_status_label(status):
+    labels = {
+        0: "pending",
+        1: "approved",
+        2: "queried",
+        3: "rejected",
+    }
+    try:
+        return labels.get(int(status))
+    except (TypeError, ValueError):
+        if isinstance(status, str) and status.strip():
+            return status.strip().lower()
+        return None
 
 
 def normalize_items(raw_items):
@@ -200,6 +253,8 @@ def normalize_items(raw_items):
             **item,
             "id": item_id,
             "type": item.get("type") or normalize_item_type(item.get("category_id")),
+            "category_label": item.get("category_label") or category_label(item.get("category_id")),
+            "item_status_label": item.get("item_status_label") or item_status_label(item.get("status")),
             "description": description,
             "name": description,
             "estimated_cost": requested_cost,
@@ -327,6 +382,7 @@ def extract_preauth_fields(payload: dict):
         "diagnosis": get_nested(payload, "encounter.diagnosis"),
         "care_category": get_nested(payload, "encounter.care_category"),
         "care_type": get_nested(payload, "encounter.care_type"),
+        "care_type_label": care_type_label(get_nested(payload, "encounter.care_type")),
         "item_counts": get_nested(payload, "encounter.item_counts"),
         "submitted_at": get_nested(payload, "submission.submitted_at"),
         "submitted_by": get_nested(payload, "submission.submitted_by"),
