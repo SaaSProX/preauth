@@ -204,3 +204,20 @@ CREATE INDEX IF NOT EXISTS idx_webhook_delivery_logs_final_status ON webhook_del
 CREATE INDEX IF NOT EXISTS idx_webhook_delivery_logs_preauth_log_id ON webhook_delivery_logs(preauth_log_id);
 CREATE INDEX IF NOT EXISTS idx_webhook_delivery_logs_preauth_event_id ON webhook_delivery_logs(preauth_event_id);
 CREATE INDEX IF NOT EXISTS idx_webhook_delivery_logs_insurance_no ON webhook_delivery_logs(insurance_no);
+
+-- PA comments/feedback from HMO team members
+CREATE TABLE IF NOT EXISTS pa_comments (
+    id              SERIAL PRIMARY KEY,
+    org_id          INT NOT NULL REFERENCES organizations(id),
+    request_id      VARCHAR(100) NOT NULL,
+    user_id         INT REFERENCES clients(id),
+    user_email      VARCHAR(200),
+    user_name       VARCHAR(200),
+    comment_text    TEXT NOT NULL,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_pa_comments_org_id ON pa_comments(org_id);
+CREATE INDEX IF NOT EXISTS idx_pa_comments_request_id ON pa_comments(request_id);
+CREATE INDEX IF NOT EXISTS idx_pa_comments_created_at ON pa_comments(created_at DESC);
