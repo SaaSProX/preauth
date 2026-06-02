@@ -6,6 +6,7 @@ from datetime import date, datetime
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from agent import agent
+from config.settings import settings
 from services.db import pg_execute, pg_query_one
 from services.preauth_events import persist_preauth_intake_event
 from services.webhook_delivery import (
@@ -545,8 +546,17 @@ async def receive_preauth(
             processing_time_ms=elapsed_ms(started_at),
         )
 
-        # Kick off agent in background
-        background.add_task(agent.run, str(patient_id), str(request_id))
+        # Kick off agent in background (if enabled)
+        agent_triggered = False
+        if settings.agent_enabled:
+            background.add_task(agent.run, str(patient_id), str(request_id))
+            agent_triggered = True
+        else:
+            logger.info(
+                "Agent is paused (AGENT_ENABLED=false). Skipping auto-decision for request_id=%s",
+                request_id,
+            )
+
         return {
             "status": "received",
             "request_id": str(request_id),
@@ -554,6 +564,7 @@ async def receive_preauth(
             "event_sequence": event_row["event_sequence"] if event_row else None,
             "duplicate_event": duplicate_event,
             "latest_state_updated": persisted["latest_state_updated"],
+            "agent_triggered": agent_triggered,
             "captured_fields": extracted_fields,
             "missing_recommended_fields": missing_recommended_fields,
         }
