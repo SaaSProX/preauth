@@ -3072,3 +3072,109 @@ async def me(claims: dict = Depends(verify_session_token)):
     if not client:
         raise HTTPException(status_code=404, detail="User not found")
     return dict(client)
+
+
+# ─────────────────────────────────────────────
+# PA Comments / Feedback
+# ─────────────────────────────────────────────
+
+class AddPACommentPayload(BaseModel):
+    request_id: str
+    comment_text: str
+
+
+@router.post("/pa-comments")
+async def add_pa_comment(payload: AddPACommentPayload, claims: dict = Depends(verify_session_token)):
+    """Add a comment/feedback to a pre-auth request."""
+    org_id = _dashboard_org_id(claims)
+    request_id = payload.request_id.strip()
+    comment_text = payload.comment_text.strip()
+
+    if not request_id:
+        raise HTTPException(status_code=400, detail="request_id is required")
+    if not comment_text:
+        raise HTTPException(status_code=400, detail="comment_text is required")
+
+    # Verify the PA exists and belongs to this org
+    pa = await pg_query_one(
+        "SELECT id FROM preauth_logs WHERE org_id = $1 AND request_id = $2",
+        org_id, request_id
+    )
+    if not pa:
+        raise HTTPException(status_code=404, detail="Pre-auth request not found")
+
+    # Get user info
+    user_id = int(claims["sub"])
+    user = await pg_query_one(
+        "SELECT name, email FROM clients WHERE id = $1",
+        user_id
+    )
+
+    # Insert comment
+    row = await pg_query_one(
+        """
+        INSERT INTO pa_comments (org_id, request_id, user_id, user_email, user_name, comment_text)
+        VALUES ($1, $2, $3, $4, $5, $6)
+        RETURNING id, created_at
+        """,
+        org_id,
+        request_id,
+        user_id,
+        user["email"] if user else claims.get("email"),
+        user["name"] if user else None,
+        comment_text
+    )
+
+    return {
+        "id": row["id"],
+        "request_id": request_id,
+        "user_name": user["name"] if user else None,
+        "user_email": user["email"] if user else claims.get("email"),
+        "comment_text": comment_text,
+        "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+    }
+
+
+async def _list_pa_comments_response(request_id: str, claims: dict):
+    org_id = _dashboard_org_id(claims)
+    request_id = request_id.strip()
+    if not request_id:
+        raise HTTPException(status_code=400, detail="request_id is required")
+
+    rows = await pg_query_all(
+        """
+        SELECT id, user_id, user_email, user_name, comment_text, created_at
+        FROM pa_comments
+        WHERE org_id = $1 AND request_id = $2
+        ORDER BY created_at DESC
+        """,
+        org_id, request_id
+    )
+
+    return {
+        "request_id": request_id,
+        "comments": [
+            {
+                "id": row["id"],
+                "user_id": row["user_id"],
+                "user_name": row["user_name"],
+                "user_email": row["user_email"],
+                "comment_text": row["comment_text"],
+                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+            }
+            for row in rows
+        ],
+        "count": len(rows),
+    }
+
+
+@router.get("/pa-comments")
+async def list_pa_comments_by_query(request_id: str, claims: dict = Depends(verify_session_token)):
+    """List all comments for a pre-auth request."""
+    return await _list_pa_comments_response(request_id, claims)
+
+
+@router.get("/pa-comments/{request_id:path}")
+async def list_pa_comments(request_id: str, claims: dict = Depends(verify_session_token)):
+    """List all comments for a pre-auth request."""
+    return await _list_pa_comments_response(request_id, claims)
