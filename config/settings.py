@@ -1,3 +1,4 @@
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
  
 class Settings(BaseSettings):
@@ -44,6 +45,34 @@ class Settings(BaseSettings):
     google_pubsub_topic_name: str = ""
     gmail_watch_label_ids: str = "INBOX"
     gmail_pubsub_verification_token: str = ""
+
+    @field_validator(
+        "aman_callback_enabled",
+        "agent_enabled",
+        mode="before",
+    )
+    @classmethod
+    def _strip_bool_env(cls, value):
+        if isinstance(value, str):
+            return value.strip()
+        return value
+
+    @field_validator(
+        "aman_decisions_url",
+        "kpa_key",
+        "cors_origins",
+        "dashboard_base_url",
+        "google_oauth_redirect_uri",
+        "google_pubsub_topic_name",
+        "gmail_watch_label_ids",
+        "gmail_pubsub_verification_token",
+        mode="before",
+    )
+    @classmethod
+    def _strip_string_env(cls, value):
+        if isinstance(value, str):
+            return value.strip()
+        return value
  
     model_config = {"env_file": ".env", "extra": "ignore"}
  
