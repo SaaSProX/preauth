@@ -178,11 +178,105 @@ CREATE TABLE IF NOT EXISTS audit_events (
     created_at      TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- Gmail / Google Workspace connections for managed support inbox intake.
+-- Tokens are never returned to the dashboard; UI only sees mailbox/status
+-- metadata. One organization can connect more than one mailbox later.
+CREATE TABLE IF NOT EXISTS gmail_connections (
+    id                      SERIAL PRIMARY KEY,
+    org_id                  INT NOT NULL REFERENCES organizations(id),
+    connected_by            INT REFERENCES clients(id),
+    provider                VARCHAR(30) NOT NULL DEFAULT 'google',
+    email                   VARCHAR(255) NOT NULL,
+    scopes                  JSONB DEFAULT '[]'::jsonb,
+    access_token            TEXT,
+    refresh_token           TEXT,
+    token_expiry            TIMESTAMPTZ,
+    status                  VARCHAR(30) NOT NULL DEFAULT 'connected',
+    watch_history_id        VARCHAR(100),
+    watch_expiration        TIMESTAMPTZ,
+    watch_status            VARCHAR(30) NOT NULL DEFAULT 'not_started',
+    watch_started_at        TIMESTAMPTZ,
+    watch_last_notification_at TIMESTAMPTZ,
+    watch_error             TEXT,
+    last_sync_at            TIMESTAMPTZ,
+    last_error              TEXT,
+    created_at              TIMESTAMPTZ DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_gmail_connections_org_provider_email
+ON gmail_connections(org_id, provider, email);
+
+ALTER TABLE gmail_connections ADD COLUMN IF NOT EXISTS watch_history_id VARCHAR(100);
+ALTER TABLE gmail_connections ADD COLUMN IF NOT EXISTS watch_expiration TIMESTAMPTZ;
+ALTER TABLE gmail_connections ADD COLUMN IF NOT EXISTS watch_status VARCHAR(30) NOT NULL DEFAULT 'not_started';
+ALTER TABLE gmail_connections ADD COLUMN IF NOT EXISTS watch_started_at TIMESTAMPTZ;
+ALTER TABLE gmail_connections ADD COLUMN IF NOT EXISTS watch_last_notification_at TIMESTAMPTZ;
+ALTER TABLE gmail_connections ADD COLUMN IF NOT EXISTS watch_error TEXT;
+
+-- Normalized email intake records created from Gmail history changes.
+-- Pub/Sub only sends an email address + historyId, so the backend fetches
+-- message details from Gmail and stores a durable local support queue here.
+CREATE TABLE IF NOT EXISTS support_messages (
+    id                      SERIAL PRIMARY KEY,
+    org_id                  INT NOT NULL REFERENCES organizations(id),
+    gmail_connection_id     INT REFERENCES gmail_connections(id),
+    provider                VARCHAR(30) NOT NULL DEFAULT 'google',
+    mailbox_email           VARCHAR(255),
+    gmail_message_id        VARCHAR(255) NOT NULL,
+    gmail_thread_id         VARCHAR(255),
+    history_id              VARCHAR(100),
+    from_email              TEXT,
+    to_email                TEXT,
+    subject                 TEXT,
+    snippet                 TEXT,
+    body_text               TEXT,
+    internal_date           TIMESTAMPTZ,
+    received_at             TIMESTAMPTZ,
+    label_ids               JSONB DEFAULT '[]'::jsonb,
+    status                  VARCHAR(30) NOT NULL DEFAULT 'new',
+    raw_payload             JSONB,
+    created_at              TIMESTAMPTZ DEFAULT NOW(),
+    updated_at              TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (org_id, provider, gmail_message_id)
+);
+
+-- Append-only Pub/Sub delivery log for Gmail notifications. This is separate
+-- from support_messages because one Pub/Sub notification can contain zero,
+-- one, or many new Gmail messages after history sync.
+CREATE TABLE IF NOT EXISTS gmail_notification_logs (
+    id                      SERIAL PRIMARY KEY,
+    org_id                  INT REFERENCES organizations(id),
+    gmail_connection_id     INT REFERENCES gmail_connections(id),
+    email                   VARCHAR(255),
+    history_id              VARCHAR(100),
+    pubsub_message_id       VARCHAR(255),
+    subscription            TEXT,
+    raw_payload             JSONB,
+    decoded_payload         JSONB,
+    processed_status        VARCHAR(40) NOT NULL DEFAULT 'received',
+    error_message           TEXT,
+    message_count           INT NOT NULL DEFAULT 0,
+    received_at             TIMESTAMPTZ DEFAULT NOW(),
+    processed_at            TIMESTAMPTZ,
+    created_at              TIMESTAMPTZ DEFAULT NOW()
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_audit_events_org_id ON audit_events(org_id);
 CREATE INDEX IF NOT EXISTS idx_audit_events_created_at ON audit_events(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_audit_events_event_type ON audit_events(event_type);
 CREATE INDEX IF NOT EXISTS idx_audit_events_target ON audit_events(target_kind, target_id);
+CREATE INDEX IF NOT EXISTS idx_gmail_connections_org_id ON gmail_connections(org_id);
+CREATE INDEX IF NOT EXISTS idx_gmail_connections_status ON gmail_connections(status);
+CREATE INDEX IF NOT EXISTS idx_gmail_connections_watch_status ON gmail_connections(watch_status);
+CREATE INDEX IF NOT EXISTS idx_support_messages_org_id ON support_messages(org_id);
+CREATE INDEX IF NOT EXISTS idx_support_messages_gmail_connection_id ON support_messages(gmail_connection_id);
+CREATE INDEX IF NOT EXISTS idx_support_messages_received_at ON support_messages(received_at DESC);
+CREATE INDEX IF NOT EXISTS idx_support_messages_status ON support_messages(status);
+CREATE INDEX IF NOT EXISTS idx_gmail_notification_logs_org_id ON gmail_notification_logs(org_id);
+CREATE INDEX IF NOT EXISTS idx_gmail_notification_logs_connection_id ON gmail_notification_logs(gmail_connection_id);
+CREATE INDEX IF NOT EXISTS idx_gmail_notification_logs_received_at ON gmail_notification_logs(received_at DESC);
 CREATE INDEX IF NOT EXISTS idx_agent_logs_request_id ON agent_logs(request_id);
 CREATE INDEX IF NOT EXISTS idx_agent_logs_logged_at ON agent_logs(logged_at DESC);
 CREATE INDEX IF NOT EXISTS idx_preauth_logs_status ON preauth_logs(status);

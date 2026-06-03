@@ -32,6 +32,15 @@ def _decision_to_recommendation(decision: str) -> str:
     return "review"
 
 
+def _item_decision_to_recommendation(decision: str) -> str:
+    d = (decision or "").upper()
+    if d == "APPROVE":
+        return "approve"
+    if d == "DENY":
+        return "reject"
+    return "review"
+
+
 def _coerce_dict(value):
     if isinstance(value, dict):
         return value
@@ -48,8 +57,15 @@ def _line_decisions(raw_payload, decision, agent_result):
     items = raw.get("pa_items") or []
     if not isinstance(items, list):
         return []
-    rec = _decision_to_recommendation(decision)
     ar = _coerce_dict(agent_result)
+    item_results = ar.get("item_decisions") if isinstance(ar.get("item_decisions"), list) else []
+    item_results_by_claim_id = {}
+    for item in item_results:
+        if not isinstance(item, dict):
+            continue
+        for key in (item.get("claim_item_id"), item.get("id"), item.get("facility_tariff_item_id")):
+            if key is not None:
+                item_results_by_claim_id[str(key)] = item
     rationale = (
         ar.get("reasoning")
         or ar.get("denial_reason")
@@ -62,22 +78,29 @@ def _line_decisions(raw_payload, decision, agent_result):
     for it in items:
         if not isinstance(it, dict):
             continue
+        item_result = item_results_by_claim_id.get(str(it.get("claim_item_id") or it.get("id") or it.get("facility_tariff_item_id")))
+        rec = _item_decision_to_recommendation(item_result.get("decision")) if item_result else _decision_to_recommendation(decision)
         approved = None
+        item_rationale = rationale
+        if item_result:
+            item_rationale = item_result.get("reason") or item_result.get("coverage_reason") or rationale
+            approved = item_result.get("recommended_approved_cost")
         if rec == "approve":
-            requested = it.get("requested_cost")
-            try:
-                if requested is not None:
-                    approved = float(requested)
-                else:
-                    approved = float(it.get("unit_cost") or 0) * (float(it.get("quantity")) or 1)
-            except (TypeError, ValueError):
-                approved = None
+            if approved is None:
+                requested = it.get("requested_cost")
+                try:
+                    if requested is not None:
+                        approved = float(requested)
+                    else:
+                        approved = float(it.get("unit_cost") or 0) * (float(it.get("quantity")) or 1)
+                except (TypeError, ValueError):
+                    approved = None
         out.append({
             "claim_item_id": it.get("claim_item_id") or it.get("id"),
             "recommendation": rec,
             "recommended_approved_cost": approved,
             "confidence": conf_num,
-            "rationale": rationale,
+            "rationale": item_rationale,
             "policy_citations": [],
         })
     return out

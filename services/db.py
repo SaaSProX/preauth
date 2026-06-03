@@ -51,7 +51,10 @@ async def aman_execute(sql: str, *args):
 # ─────────────────────────────────────────────
 
 async def get_pg_conn():
-    return await asyncpg.connect(settings.our_db_url)
+    # Supabase's transaction pooler sits behind PgBouncer. Disabling asyncpg's
+    # statement cache keeps the same code safe on both direct Postgres and
+    # PgBouncer-backed production URLs.
+    return await asyncpg.connect(settings.our_db_url, statement_cache_size=0)
 
 async def pg_query_one(sql: str, *args):
     conn = await get_pg_conn()

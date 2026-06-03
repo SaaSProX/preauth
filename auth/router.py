@@ -1,13 +1,26 @@
 import json
 import secrets
 import asyncio
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
+from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
+import httpx
+import jwt
 from fastapi import APIRouter, HTTPException, Depends, Request, BackgroundTasks
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from agent import agent
+from config.settings import settings
 from services.db import pg_execute, pg_query_all, pg_query_one
+from services.gmail import (
+    GmailIntegrationError,
+    create_notification_log,
+    decode_pubsub_data,
+    gmail_connections_for_email,
+    start_gmail_watch,
+    sync_gmail_history,
+)
 from services.invites import build_invite_link
 from services.notifier import EmailDeliveryError, send_invite_email
 from auth.utils import (
@@ -17,6 +30,16 @@ from auth.utils import (
 )
 
 router = APIRouter(prefix="/auth")
+
+GOOGLE_OAUTH_AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_GMAIL_PROFILE_URL = "https://gmail.googleapis.com/gmail/v1/users/me/profile"
+GMAIL_READONLY_SCOPES = [
+    "openid",
+    "email",
+    "profile",
+    "https://www.googleapis.com/auth/gmail.readonly",
+]
 
 
 # ─────────────────────────────────────────────
@@ -372,10 +395,141 @@ class GenerateKeyPayload(BaseModel):
     name: str | None = None
 
 
+class GmailDisconnectPayload(BaseModel):
+    connection_id: int | None = None
+    email: str | None = None
+
+
+class GmailWatchStartPayload(BaseModel):
+    connection_id: int | None = None
+    org_id: int | None = None
+
+
 def _mask_key(k: str) -> str:
     if not k or len(k) < 4:
         return "••••"
     return "••••" + k[-4:]
+
+
+def _gmail_oauth_configured() -> bool:
+    return bool(settings.google_oauth_client_id and settings.google_oauth_client_secret)
+
+
+def _gmail_redirect_uri(request: Request) -> str:
+    configured = (settings.google_oauth_redirect_uri or "").strip()
+    if configured:
+        return configured
+    return str(request.url_for("gmail_oauth_callback"))
+
+
+def _dashboard_redirect_url(status: str, detail: str | None = None) -> str:
+    params = {"nav": "support", "gmail": status}
+    if detail:
+        params["detail"] = detail[:140]
+    return f"{settings.dashboard_base_url.rstrip('/')}/?{urlencode(params)}"
+
+
+def _build_gmail_state(claims: dict, org_id: int | None = None) -> str:
+    now = datetime.now(timezone.utc)
+    return jwt.encode(
+        {
+            "sub": str(claims["sub"]),
+            "email": claims.get("email"),
+            "org_id": org_id if org_id is not None else claims["org_id"],
+            "role": claims.get("role"),
+            "nonce": secrets.token_urlsafe(18),
+            "iat": int(now.timestamp()),
+            "exp": now + timedelta(minutes=15),
+        },
+        settings.jwt_secret,
+        algorithm="HS256",
+    )
+
+
+def _decode_gmail_state(state: str) -> dict:
+    try:
+        return jwt.decode(state, settings.jwt_secret, algorithms=["HS256"])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=400, detail="Gmail connection expired. Please try again.")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=400, detail="Invalid Gmail connection state")
+
+
+async def _resolve_read_org_id(claims: dict, requested_org_id: int | None = None) -> int:
+    if requested_org_id is None or requested_org_id == claims["org_id"]:
+        return claims["org_id"]
+    if not await is_platform_admin(claims):
+        raise HTTPException(status_code=403, detail="Only SaaSPro platform admins can view another organization")
+    return requested_org_id
+
+
+def _gmail_connection_row(row):
+    return {
+        "id": row["id"],
+        "email": row["email"],
+        "provider": row["provider"],
+        "status": row["status"],
+        "scopes": parse_json_field(row["scopes"]) or [],
+        "token_expiry": row["token_expiry"],
+        "watch_history_id": row["watch_history_id"],
+        "watch_expiration": row["watch_expiration"],
+        "watch_status": row["watch_status"],
+        "watch_started_at": row["watch_started_at"],
+        "watch_last_notification_at": row["watch_last_notification_at"],
+        "watch_error": row["watch_error"],
+        "last_sync_at": row["last_sync_at"],
+        "last_error": row["last_error"],
+        "support_message_count": row.get("support_message_count", 0) if hasattr(row, "get") else row["support_message_count"],
+        "last_message_received_at": row.get("last_message_received_at") if hasattr(row, "get") else row["last_message_received_at"],
+        "connected_by_email": row["connected_by_email"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _support_message_row(row):
+    received_at = row["received_at"] or row["internal_date"] or row["created_at"]
+    return {
+        "id": row["id"],
+        "provider": row["provider"],
+        "channel": "gmail" if row["provider"] == "google" else row["provider"],
+        "mailbox_email": row["mailbox_email"],
+        "message_id": row["gmail_message_id"],
+        "thread_id": row["gmail_thread_id"],
+        "from_email": row["from_email"],
+        "to_email": row["to_email"],
+        "subject": row["subject"] or "(No subject)",
+        "snippet": row["snippet"],
+        "body_text": row["body_text"],
+        "received_at": received_at,
+        "label_ids": parse_json_field(row["label_ids"]) or [],
+        "status": row["status"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "agent_activity": [
+            {
+                "step": "Intake",
+                "status": "done",
+                "title": "Message captured",
+                "detail": "Inbound message received from Gmail and stored in the support inbox.",
+                "at": row["created_at"],
+            },
+            {
+                "step": "Normalize",
+                "status": "done",
+                "title": "Headers and body extracted",
+                "detail": "Sender, recipient, subject, snippet, labels, and readable body text were extracted.",
+                "at": row["updated_at"],
+            },
+            {
+                "step": "Agent review",
+                "status": "pending",
+                "title": "Waiting for support agent workflow",
+                "detail": "Next step is classification, routing, answer drafting, and escalation rules.",
+                "at": None,
+            },
+        ],
+    }
 
 
 @router.get("/api-key")
@@ -474,6 +628,385 @@ async def revoke_user_api_key(key_id: int, claims: dict = Depends(verify_session
         key_id, claims["org_id"]
     )
     return {"message": "API key revoked"}
+
+
+# ─────────────────────────────────────────────
+# Gmail / Google Workspace support inbox integration
+# ─────────────────────────────────────────────
+
+@router.get("/integrations/gmail")
+async def gmail_connection_status(org_id: int | None = None, claims: dict = Depends(verify_session_token)):
+    resolved_org_id = await _resolve_read_org_id(claims, org_id)
+    rows = await pg_query_all(
+        """
+        SELECT
+            gc.id,
+            gc.provider,
+            gc.email,
+            gc.scopes,
+            gc.token_expiry,
+            gc.status,
+            gc.watch_history_id,
+            gc.watch_expiration,
+            gc.watch_status,
+            gc.watch_started_at,
+            gc.watch_last_notification_at,
+            gc.watch_error,
+            gc.last_sync_at,
+            gc.last_error,
+            gc.created_at,
+            gc.updated_at,
+            clients.email AS connected_by_email,
+            COALESCE(msgs.support_message_count, 0)::int AS support_message_count,
+            msgs.last_message_received_at
+        FROM gmail_connections gc
+        LEFT JOIN clients ON clients.id = gc.connected_by
+        LEFT JOIN LATERAL (
+            SELECT
+                COUNT(*)::int AS support_message_count,
+                MAX(received_at) AS last_message_received_at
+            FROM support_messages sm
+            WHERE sm.gmail_connection_id = gc.id
+        ) msgs ON TRUE
+        WHERE gc.org_id = $1
+        ORDER BY gc.updated_at DESC, gc.created_at DESC
+        """,
+        resolved_org_id,
+    )
+    connections = [_gmail_connection_row(row) for row in rows]
+    return {
+        "configured": _gmail_oauth_configured(),
+        "connected": any(row["status"] == "connected" for row in connections),
+        "connections": connections,
+        "scopes_required": GMAIL_READONLY_SCOPES,
+    }
+
+
+@router.get("/integrations/gmail/connect")
+async def gmail_connect(request: Request, org_id: int | None = None, claims: dict = Depends(verify_session_token)):
+    if claims.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can connect Gmail")
+    if not _gmail_oauth_configured():
+        raise HTTPException(status_code=503, detail="Google OAuth is not configured yet")
+
+    resolved_org_id = await _resolve_read_org_id(claims, org_id)
+    redirect_uri = _gmail_redirect_uri(request)
+    params = {
+        "client_id": settings.google_oauth_client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": " ".join(GMAIL_READONLY_SCOPES),
+        "access_type": "offline",
+        "prompt": "consent",
+        "state": _build_gmail_state(claims, resolved_org_id),
+    }
+    return {
+        "auth_url": f"{GOOGLE_OAUTH_AUTHORIZE_URL}?{urlencode(params)}",
+        "redirect_uri": redirect_uri,
+        "scopes": GMAIL_READONLY_SCOPES,
+    }
+
+
+@router.get("/integrations/gmail/callback", name="gmail_oauth_callback")
+async def gmail_oauth_callback(request: Request, code: str | None = None, state: str | None = None, error: str | None = None):
+    if error:
+        return RedirectResponse(_dashboard_redirect_url("error", error))
+    if not code or not state:
+        return RedirectResponse(_dashboard_redirect_url("error", "Missing Google OAuth callback code or state"))
+    if not _gmail_oauth_configured():
+        return RedirectResponse(_dashboard_redirect_url("error", "Google OAuth is not configured yet"))
+
+    try:
+        state_claims = _decode_gmail_state(state)
+    except HTTPException as exc:
+        return RedirectResponse(_dashboard_redirect_url("error", str(exc.detail)))
+
+    redirect_uri = _gmail_redirect_uri(request)
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            token_response = await client.post(
+                GOOGLE_OAUTH_TOKEN_URL,
+                data={
+                    "code": code,
+                    "client_id": settings.google_oauth_client_id,
+                    "client_secret": settings.google_oauth_client_secret,
+                    "redirect_uri": redirect_uri,
+                    "grant_type": "authorization_code",
+                },
+            )
+            token_response.raise_for_status()
+            token_data = token_response.json()
+
+            access_token = token_data.get("access_token")
+            if not access_token:
+                return RedirectResponse(_dashboard_redirect_url("error", "Google did not return an access token"))
+
+            profile_response = await client.get(
+                GOOGLE_GMAIL_PROFILE_URL,
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            profile_response.raise_for_status()
+            profile = profile_response.json()
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text[:140] if exc.response is not None else str(exc)
+        return RedirectResponse(_dashboard_redirect_url("error", detail))
+    except httpx.HTTPError as exc:
+        return RedirectResponse(_dashboard_redirect_url("error", str(exc)))
+
+    mailbox = (profile.get("emailAddress") or state_claims.get("email") or "").strip().lower()
+    if not mailbox:
+        return RedirectResponse(_dashboard_redirect_url("error", "Could not identify connected Gmail mailbox"))
+
+    expires_in = token_data.get("expires_in")
+    token_expiry = None
+    if expires_in is not None:
+        try:
+            token_expiry = datetime.now(timezone.utc) + timedelta(seconds=int(expires_in))
+        except (TypeError, ValueError):
+            token_expiry = None
+
+    scopes = (token_data.get("scope") or " ".join(GMAIL_READONLY_SCOPES)).split()
+    refresh_token = token_data.get("refresh_token")
+    connected_by = int(state_claims["sub"])
+    org_id = int(state_claims["org_id"])
+
+    await pg_execute(
+        """
+        INSERT INTO gmail_connections (
+            org_id,
+            connected_by,
+            provider,
+            email,
+            scopes,
+            access_token,
+            refresh_token,
+            token_expiry,
+            status,
+            last_error
+        )
+        VALUES ($1, $2, 'google', $3, $4::jsonb, $5, $6, $7, 'connected', NULL)
+        ON CONFLICT (org_id, provider, email)
+        DO UPDATE SET
+            connected_by = EXCLUDED.connected_by,
+            scopes = EXCLUDED.scopes,
+            access_token = EXCLUDED.access_token,
+            refresh_token = COALESCE(EXCLUDED.refresh_token, gmail_connections.refresh_token),
+            token_expiry = EXCLUDED.token_expiry,
+            status = 'connected',
+            last_error = NULL,
+            updated_at = NOW()
+        """,
+        org_id,
+        connected_by,
+        mailbox,
+        json.dumps(scopes),
+        access_token,
+        refresh_token,
+        token_expiry,
+    )
+
+    return RedirectResponse(_dashboard_redirect_url("connected", mailbox))
+
+
+@router.post("/integrations/gmail/watch/start")
+async def gmail_start_watch(payload: GmailWatchStartPayload, claims: dict = Depends(verify_session_token)):
+    if claims.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can start Gmail listener")
+
+    resolved_org_id = await _resolve_read_org_id(claims, payload.org_id)
+    connection_id = payload.connection_id
+    if connection_id is None:
+        row = await pg_query_one(
+            """
+            SELECT id
+            FROM gmail_connections
+            WHERE org_id = $1
+              AND provider = 'google'
+              AND status = 'connected'
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT 1
+            """,
+            resolved_org_id,
+        )
+        if not row:
+            raise HTTPException(status_code=404, detail="No connected Gmail mailbox found")
+        connection_id = row["id"]
+
+    try:
+        watch = await start_gmail_watch(connection_id, resolved_org_id)
+    except GmailIntegrationError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text[:500] if exc.response is not None else str(exc)
+        await pg_execute(
+            """
+            UPDATE gmail_connections
+            SET watch_status = 'error',
+                watch_error = $3,
+                last_error = $3,
+                updated_at = NOW()
+            WHERE id = $1
+              AND org_id = $2
+            """,
+            connection_id,
+            resolved_org_id,
+            detail,
+        )
+        raise HTTPException(status_code=502, detail=detail)
+    except httpx.HTTPError as exc:
+        detail = str(exc)
+        await pg_execute(
+            """
+            UPDATE gmail_connections
+            SET watch_status = 'error',
+                watch_error = $3,
+                last_error = $3,
+                updated_at = NOW()
+            WHERE id = $1
+              AND org_id = $2
+            """,
+            connection_id,
+            resolved_org_id,
+            detail,
+        )
+        raise HTTPException(status_code=502, detail=detail)
+
+    return {"message": "Gmail realtime listener started", "watch": watch}
+
+
+@router.post("/integrations/gmail/pubsub")
+async def gmail_pubsub_push(request: Request, background: BackgroundTasks):
+    expected_token = (settings.gmail_pubsub_verification_token or "").strip()
+    if expected_token:
+        provided_token = (
+            request.query_params.get("token")
+            or request.headers.get("X-Saaspro-Webhook-Token")
+            or ""
+        ).strip()
+        if provided_token != expected_token:
+            raise HTTPException(status_code=403, detail="Invalid Gmail Pub/Sub token")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return {"ok": True, "status": "ignored", "reason": "invalid_json"}
+
+    message = payload.get("message") if isinstance(payload, dict) else {}
+    try:
+        decoded = decode_pubsub_data(message.get("data") if isinstance(message, dict) else None)
+    except GmailIntegrationError as exc:
+        await create_notification_log(None, payload if isinstance(payload, dict) else {}, {"error": str(exc)}, "ignored")
+        return {"ok": True, "status": "ignored", "reason": str(exc)}
+
+    email = (decoded.get("emailAddress") or "").strip().lower()
+    history_id = str(decoded.get("historyId") or "").strip()
+    if not email or not history_id:
+        await create_notification_log(None, payload, decoded, "ignored_missing_fields")
+        return {"ok": True, "status": "ignored", "reason": "missing_email_or_history_id"}
+
+    connections = await gmail_connections_for_email(email)
+    if not connections:
+        await create_notification_log(None, payload, decoded, "no_connection")
+        return {"ok": True, "status": "no_connection"}
+
+    for connection in connections:
+        log_id = await create_notification_log(connection, payload, decoded)
+        background.add_task(sync_gmail_history, connection["id"], history_id, log_id)
+
+    return {"ok": True, "status": "queued", "connections": len(connections)}
+
+
+@router.post("/integrations/gmail/disconnect")
+async def gmail_disconnect(payload: GmailDisconnectPayload, claims: dict = Depends(verify_session_token)):
+    if claims.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Only admins can disconnect Gmail")
+
+    if payload.connection_id is None and not payload.email:
+        raise HTTPException(status_code=400, detail="connection_id or email is required")
+
+    email = (payload.email or "").strip().lower() or None
+    row = await pg_query_one(
+        """
+        UPDATE gmail_connections
+        SET status = 'disconnected',
+            access_token = NULL,
+            refresh_token = NULL,
+            last_error = NULL,
+            updated_at = NOW()
+        WHERE org_id = $1
+          AND ($2::int IS NULL OR id = $2::int)
+          AND ($3::text IS NULL OR LOWER(email) = $3::text)
+        RETURNING id, email, status
+        """,
+        claims["org_id"],
+        payload.connection_id,
+        email,
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Gmail connection not found")
+
+    return {"message": f"Disconnected {row['email']}", "connection": dict(row)}
+
+
+@router.get("/support/messages")
+async def list_support_messages(
+    org_id: int | None = None,
+    provider: str = "all",
+    status: str = "all",
+    page: int = 1,
+    page_size: int = 25,
+    claims: dict = Depends(verify_session_token),
+):
+    resolved_org_id = await _resolve_read_org_id(claims, org_id)
+    page = max(1, page)
+    page_size = max(1, min(100, page_size))
+    offset = (page - 1) * page_size
+    provider_filter = (provider or "all").strip().lower()
+    status_filter = (status or "all").strip().lower()
+
+    rows = await pg_query_all(
+        """
+        SELECT
+            id,
+            provider,
+            mailbox_email,
+            gmail_message_id,
+            gmail_thread_id,
+            from_email,
+            to_email,
+            subject,
+            snippet,
+            body_text,
+            internal_date,
+            received_at,
+            label_ids,
+            status,
+            created_at,
+            updated_at,
+            COUNT(*) OVER()::int AS total_count
+        FROM support_messages
+        WHERE org_id = $1
+          AND ($2 = 'all' OR provider = $2)
+          AND ($3 = 'all' OR status = $3)
+        ORDER BY COALESCE(received_at, internal_date, created_at) DESC, id DESC
+        LIMIT $4 OFFSET $5
+        """,
+        resolved_org_id,
+        provider_filter,
+        status_filter,
+        page_size,
+        offset,
+    )
+    total = rows[0]["total_count"] if rows else 0
+    return {
+        "messages": [_support_message_row(row) for row in rows],
+        "pagination": {
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "total_pages": max(1, (total + page_size - 1) // page_size) if total else 0,
+        },
+    }
 
 
 # ─────────────────────────────────────────────
@@ -588,14 +1121,59 @@ async def preauth_dashboard(
             COALESCE(
                 SUM(
                     CASE
-                        WHEN LOWER(COALESCE(p.decision, p.status, '')) IN ('approve', 'approved')
-                            AND (p.agent_result->>'amount_approved') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                        WHEN (p.agent_result->>'amount_approved') ~ '^-?[0-9]+(\\.[0-9]+)?$'
                         THEN (p.agent_result->>'amount_approved')::numeric
                         ELSE 0
                     END
                 ),
                 0
             )::float AS total_amount_approved,
+            COALESCE(SUM(item_stats.item_total), 0)::int AS item_total,
+            COALESCE(SUM(item_stats.item_approved), 0)::int AS item_approved,
+            COALESCE(SUM(item_stats.item_denied), 0)::int AS item_denied,
+            COALESCE(SUM(item_stats.item_escalated), 0)::int AS item_escalated,
+            COALESCE(SUM(item_stats.item_requested_value), 0)::float AS item_requested_value,
+            COALESCE(SUM(item_stats.item_approved_value), 0)::float AS item_approved_value,
+            COALESCE(SUM(item_stats.item_denied_value), 0)::float AS item_denied_value,
+            COALESCE(SUM(item_stats.item_escalated_value), 0)::float AS item_escalated_value,
+            COUNT(*) FILTER (
+                WHERE (
+                    item_stats.item_total > 0
+                    AND item_stats.item_approved = item_stats.item_total
+                )
+                OR (
+                    item_stats.item_total = 0
+                    AND LOWER(COALESCE(p.decision, p.status, '')) IN ('approve', 'approved')
+                )
+            )::int AS pa_full_approved,
+            COUNT(*) FILTER (
+                WHERE item_stats.item_total > 0
+                  AND item_stats.item_approved > 0
+                  AND item_stats.item_approved < item_stats.item_total
+            )::int AS pa_partial_approved,
+            COUNT(*) FILTER (
+                WHERE (
+                    item_stats.item_total > 0
+                    AND item_stats.item_approved = 0
+                    AND item_stats.item_denied = item_stats.item_total
+                )
+                OR (
+                    item_stats.item_total = 0
+                    AND LOWER(COALESCE(p.decision, p.status, '')) IN ('deny', 'denied', 'reject', 'rejected')
+                )
+            )::int AS pa_rejected,
+            COUNT(*) FILTER (
+                WHERE (
+                    item_stats.item_total > 0
+                    AND item_stats.item_approved = 0
+                    AND item_stats.item_denied < item_stats.item_total
+                    AND item_stats.item_escalated > 0
+                )
+                OR (
+                    item_stats.item_total = 0
+                    AND LOWER(COALESCE(p.decision, p.status, '')) IN ('escalate', 'escalated')
+                )
+            )::int AS pa_review,
             AVG(
                 CASE
                     WHEN ar.first_log_at IS NOT NULL
@@ -622,6 +1200,69 @@ async def preauth_dashboard(
              AND (p.processed_at IS NULL OR al.logged_at <= p.processed_at + INTERVAL '5 seconds')
             GROUP BY run_start.first_log_at
         ) ar ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT
+                COUNT(*)::int AS item_total,
+                COUNT(*) FILTER (
+                    WHERE LOWER(COALESCE(item.value->>'decision', '')) IN ('approve', 'approved')
+                )::int AS item_approved,
+                COUNT(*) FILTER (
+                    WHERE LOWER(COALESCE(item.value->>'decision', '')) IN ('deny', 'denied', 'reject', 'rejected')
+                )::int AS item_denied,
+                COUNT(*) FILTER (
+                    WHERE LOWER(COALESCE(item.value->>'decision', '')) IN ('escalate', 'escalated')
+                )::int AS item_escalated,
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN (item.value->>'requested_cost') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                            THEN (item.value->>'requested_cost')::numeric
+                            ELSE 0
+                        END
+                    ),
+                    0
+                )::float AS item_requested_value,
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN LOWER(COALESCE(item.value->>'decision', '')) IN ('approve', 'approved')
+                                AND (item.value->>'recommended_approved_cost') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                            THEN (item.value->>'recommended_approved_cost')::numeric
+                            ELSE 0
+                        END
+                    ),
+                    0
+                )::float AS item_approved_value,
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN LOWER(COALESCE(item.value->>'decision', '')) IN ('deny', 'denied', 'reject', 'rejected')
+                                AND (item.value->>'requested_cost') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                            THEN (item.value->>'requested_cost')::numeric
+                            ELSE 0
+                        END
+                    ),
+                    0
+                )::float AS item_denied_value,
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN LOWER(COALESCE(item.value->>'decision', '')) IN ('escalate', 'escalated')
+                                AND (item.value->>'requested_cost') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                            THEN (item.value->>'requested_cost')::numeric
+                            ELSE 0
+                        END
+                    ),
+                    0
+                )::float AS item_escalated_value
+            FROM jsonb_array_elements(
+                CASE
+                    WHEN jsonb_typeof(p.agent_result->'item_decisions') = 'array'
+                    THEN p.agent_result->'item_decisions'
+                    ELSE '[]'::jsonb
+                END
+            ) AS item(value)
+        ) item_stats ON TRUE
         WHERE p.org_id = $1
           AND ($2::timestamp IS NULL OR p.received_at >= $2::timestamp)
           AND ($3::timestamp IS NULL OR p.received_at < $3::timestamp)
@@ -850,8 +1491,7 @@ async def preauth_dashboard(
             COALESCE(
                 SUM(
                     CASE
-                        WHEN LOWER(COALESCE(p.decision, p.status, '')) IN ('approve', 'approved')
-                            AND (p.agent_result->>'amount_approved') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                        WHEN (p.agent_result->>'amount_approved') ~ '^-?[0-9]+(\\.[0-9]+)?$'
                         THEN (p.agent_result->>'amount_approved')::numeric
                         ELSE 0
                     END
@@ -955,6 +1595,18 @@ async def preauth_dashboard(
             "current_snapshot_value": summary["current_snapshot_value"] if summary else 0,
             "current_snapshot_line_items": summary["current_snapshot_line_items"] if summary else 0,
             "total_amount_approved": summary["total_amount_approved"] if summary else 0,
+            "item_total": summary["item_total"] if summary else 0,
+            "item_approved": summary["item_approved"] if summary else 0,
+            "item_denied": summary["item_denied"] if summary else 0,
+            "item_escalated": summary["item_escalated"] if summary else 0,
+            "item_requested_value": summary["item_requested_value"] if summary else 0,
+            "item_approved_value": summary["item_approved_value"] if summary else 0,
+            "item_denied_value": summary["item_denied_value"] if summary else 0,
+            "item_escalated_value": summary["item_escalated_value"] if summary else 0,
+            "pa_full_approved": summary["pa_full_approved"] if summary else 0,
+            "pa_partial_approved": summary["pa_partial_approved"] if summary else 0,
+            "pa_rejected": summary["pa_rejected"] if summary else 0,
+            "pa_review": summary["pa_review"] if summary else 0,
             "avg_processing_seconds": summary["avg_processing_seconds"] if summary else None,
             "event_count": event_summary["event_count"] if event_summary else 0,
             "unique_pa_count": event_summary["unique_pa_count"] if event_summary else 0,
@@ -1327,8 +1979,7 @@ async def patients_list(
                 SUM(req_cost)::float AS total_requested,
                 SUM(
                     CASE
-                        WHEN LOWER(COALESCE(decision, status, '')) IN ('approve', 'approved')
-                          AND (agent_result->>'amount_approved') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                        WHEN (agent_result->>'amount_approved') ~ '^-?[0-9]+(\\.[0-9]+)?$'
                         THEN (agent_result->>'amount_approved')::numeric
                         ELSE 0
                     END

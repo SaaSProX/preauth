@@ -35,6 +35,14 @@ class Settings(BaseSettings):
     # Email (Resend)
     resend_api_key: str = ""
     resend_from_email: str = ""
+
+    # Google OAuth / Gmail integration
+    google_oauth_client_id: str = ""
+    google_oauth_client_secret: str = ""
+    google_oauth_redirect_uri: str = ""
+    google_pubsub_topic_name: str = ""
+    gmail_watch_label_ids: str = "INBOX"
+    gmail_pubsub_verification_token: str = ""
  
     model_config = {"env_file": ".env", "extra": "ignore"}
  

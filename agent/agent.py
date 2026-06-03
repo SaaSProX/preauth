@@ -200,11 +200,96 @@ EXCLUSIONS — ALWAYS DENY (ALL PLANS)
 # ---------------------------------------------------------------------------
 # HELPERS
 # ---------------------------------------------------------------------------
-async def _call_claude(system_prompt: str, user_message: str) -> dict:
+PLAN_LIMITS = {
+    "Bronze": {
+        "annual_cap": 1_000_000,
+        "inpatient": 600_000,
+        "outpatient": 400_000,
+        "surgical": 200_000,
+        "dental": 15_000,
+        "optical_total": 30_000,
+        "cancer": 100_000,
+        "chronic": 80_000,
+        "hiv": 100_000,
+        "dialysis": None,
+        "neonatal": 50_000,
+    },
+    "Silver": {
+        "annual_cap": 1_700_000,
+        "inpatient": 1_000_000,
+        "outpatient": 700_000,
+        "surgical": 350_000,
+        "dental": 30_000,
+        "optical_total": 60_000,
+        "cancer": 150_000,
+        "chronic": 150_000,
+        "hiv": 150_000,
+        "dialysis": 70_000,
+        "neonatal": 100_000,
+    },
+    "Gold": {
+        "annual_cap": 2_500_000,
+        "inpatient": 1_500_000,
+        "outpatient": 1_000_000,
+        "surgical": 600_000,
+        "dental": 70_000,
+        "optical_total": 90_000,
+        "cancer": 250_000,
+        "chronic": 250_000,
+        "hiv": 350_000,
+        "dialysis": 90_000,
+        "neonatal": 250_000,
+    },
+    "Platinum": {
+        "annual_cap": 3_500_000,
+        "inpatient": 2_100_000,
+        "outpatient": 1_400_000,
+        "surgical": 1_000_000,
+        "dental": 100_000,
+        "optical_total": 130_000,
+        "cancer": 400_000,
+        "chronic": 350_000,
+        "hiv": 500_000,
+        "dialysis": 120_000,
+        "neonatal": 500_000,
+    },
+    "Platinum Plus": {
+        "annual_cap": 5_000_000,
+        "inpatient": 3_000_000,
+        "outpatient": 2_000_000,
+        "surgical": 1_500_000,
+        "dental": 200_000,
+        "optical_total": 350_000,
+        "cancer": 700_000,
+        "chronic": 500_000,
+        "hiv": 500_000,
+        "dialysis": 500_000,
+        "neonatal": 700_000,
+    },
+}
+
+CARE_TYPE_BUCKETS = {
+    1: ("inpatient", "Inpatient Limit"),
+    2: ("outpatient", "Outpatient Limit"),
+    3: ("maternity", "Antenatal/Maternity"),
+    4: ("dental", "Dental Care Limit"),
+    5: ("optical_total", "Optical Total Limit"),
+    6: ("outpatient", "Outpatient Limit"),
+    7: ("wellness", "Wellness"),
+}
+
+CATEGORY_BUCKET_OVERRIDES = {
+    5: ("dental", "Dental Care Limit"),
+    6: ("optical_total", "Optical Total Limit"),
+    8: ("wellness", "Wellness"),
+}
+
+
+async def _call_claude(system_prompt: str, user_message: str, *, max_tokens: int = 1000) -> dict:
     """Call Claude API and return parsed JSON response."""
     response = await client.messages.create(
         model="claude-sonnet-4-20250514",
-        max_tokens=1000,
+        max_tokens=max_tokens,
         system=system_prompt,
         messages=[{"role": "user", "content": user_message}],
     )
@@ -220,6 +305,178 @@ def _parse_json_field(value):
     if isinstance(value, str):
         return json.loads(value)
     return value
+
+
+def _number(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _plan_tier(pa: dict) -> str | None:
+    plan = str(pa.get("plan") or pa.get("plan_name") or "").lower()
+    if "platinum plus" in plan:
+        return "Platinum Plus"
+    if "platinum" in plan:
+        return "Platinum"
+    if "gold" in plan:
+        return "Gold"
+    if "silver" in plan:
+        return "Silver"
+    if "bronze" in plan:
+        return "Bronze"
+    return None
+
+
+def _items(pa: dict) -> list[dict]:
+    raw = _parse_json_field(pa.get("items") or pa.get("requested_items") or [])
+    if not isinstance(raw, list):
+        return []
+    return [item for item in raw if isinstance(item, dict)]
+
+
+def _item_id(item: dict):
+    return item.get("claim_item_id") or item.get("id") or item.get("facility_tariff_item_id")
+
+
+def _item_name(item: dict) -> str:
+    return str(item.get("name") or item.get("item_name") or item.get("description") or _item_id(item) or "Unknown item")
+
+
+def _item_cost(item: dict) -> float:
+    amount = _number(item.get("estimated_cost")) or _number(item.get("requested_cost")) or _number(item.get("cost")) or _number(item.get("amount"))
+    if amount is not None:
+        return amount
+
+    unit_cost = _number(item.get("unit_cost"))
+    quantity = _number(item.get("quantity")) or 1
+    return float(unit_cost * quantity) if unit_cost is not None else 0.0
+
+
+def _item_status(item: dict) -> str:
+    value = item.get("item_status_label", item.get("status"))
+    if isinstance(value, str):
+        return value.strip().lower()
+    labels = {0: "pending", 1: "approved", 2: "queried", 3: "rejected"}
+    try:
+        return labels.get(int(value), "unknown")
+    except (TypeError, ValueError):
+        return "unknown"
+
+
+def _all_limits(pa: dict) -> list[dict]:
+    utilization = pa.get("utilization") if isinstance(pa.get("utilization"), dict) else {}
+    limits = []
+    for key in ("enrollee_limits", "policy_limits"):
+        value = utilization.get(key) or []
+        if isinstance(value, list):
+            limits.extend(limit for limit in value if isinstance(limit, dict))
+    return limits
+
+
+def _limit_row_by_value(limits: list[dict], expected_value: float | None) -> dict | None:
+    if expected_value is None:
+        return None
+    for limit in limits:
+        actual = _number(limit.get("limit_value"))
+        if actual is not None and abs(actual - float(expected_value)) < 0.01:
+            return limit
+    return None
+
+
+def _coverage_key(value) -> str:
+    return str(value or "").strip().lower()
+
+
+def _coverage_by_item(agent2: dict, items: list[dict]) -> dict[str, dict]:
+    results = agent2.get("item_results") if isinstance(agent2, dict) else None
+    mapped: dict[str, dict] = {}
+    if isinstance(results, list):
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            for key in (
+                result.get("claim_item_id"),
+                result.get("id"),
+                result.get("item_id"),
+                result.get("item_name"),
+                result.get("name"),
+            ):
+                if key is not None:
+                    mapped[_coverage_key(key)] = result
+
+    denied_text = " | ".join(str(item) for item in (agent2.get("denied_items") or [])) if isinstance(agent2, dict) else ""
+    for item in items:
+        iid = _item_id(item)
+        name = _item_name(item)
+        result = mapped.get(_coverage_key(iid)) or mapped.get(_coverage_key(name))
+        if result:
+            mapped[_coverage_key(iid)] = result
+            continue
+
+        if denied_text and name.lower() in denied_text.lower():
+            mapped[_coverage_key(iid)] = {
+                "decision": "DENY",
+                "reason": "Coverage denied by Agent 2.",
+                "benefit_category": agent2.get("benefit_category"),
+            }
+        else:
+            mapped[_coverage_key(iid)] = {
+                "decision": "APPROVE" if agent2.get("pass") else "DENY",
+                "reason": agent2.get("reason") or "Coverage result inherited from Agent 2.",
+                "benefit_category": agent2.get("benefit_category"),
+            }
+    return mapped
+
+
+def _item_bucket(pa: dict, item: dict, coverage: dict | None = None) -> tuple[str | None, str, str | None]:
+    try:
+        category_id = int(item.get("category_id"))
+    except (TypeError, ValueError):
+        category_id = None
+
+    if category_id in CATEGORY_BUCKET_OVERRIDES:
+        bucket_key, bucket_name = CATEGORY_BUCKET_OVERRIDES[category_id]
+        return bucket_key, bucket_name, "item_category"
+
+    benefit_category = str((coverage or {}).get("benefit_category") or "").lower()
+    if "surgery" in benefit_category or "surgical" in benefit_category:
+        return "surgical", "Surgical Care Limit", "coverage_category"
+    if "cancer" in benefit_category:
+        return "cancer", "Cancer Care Limit", "coverage_category"
+    if "chronic" in benefit_category:
+        return "chronic", "Chronic Disease Medication Limit", "coverage_category"
+    if "dialysis" in benefit_category or "kidney" in benefit_category:
+        return "dialysis", "Kidney Dialysis Limit", "coverage_category"
+    if "neonatal" in benefit_category:
+        return "neonatal", "Neonatal Care Limit", "coverage_category"
+
+    try:
+        care_type = int(pa.get("care_type"))
+    except (TypeError, ValueError):
+        care_type = None
+
+    if care_type in CARE_TYPE_BUCKETS:
+        bucket_key, bucket_name = CARE_TYPE_BUCKETS[care_type]
+        return bucket_key, bucket_name, "care_type"
+
+    return None, "Unknown Limit Bucket", None
+
+
+def _coverage_decision(coverage: dict | None) -> str:
+    if not isinstance(coverage, dict):
+        return "ESCALATE"
+    raw = str(coverage.get("decision") or coverage.get("coverage_decision") or "").upper()
+    if raw in {"APPROVE", "COVERED", "PASS"}:
+        return "APPROVE"
+    if raw in {"DENY", "REJECT", "REJECTED", "DENIED", "NOT_COVERED", "NOT COVERED", "FAIL"}:
+        return "DENY"
+    if coverage.get("pass") is True:
+        return "APPROVE"
+    if coverage.get("pass") is False:
+        return "DENY"
+    return "ESCALATE"
 
 
 async def _log_agent(request_id: str, agent_num: int, agent_name: str, result: dict):
@@ -317,6 +574,18 @@ Return ONLY this JSON:
   "benefit_category": "exact bucket name (e.g. Intermediate Surgery / Major Surgery / Minor Surgery / Inpatient / Outpatient / Dental / Optical / Cancer Care / Chronic Disease Medication / Physiotherapy / Psychiatric Care / Maternity / Neonatal / Kidney Dialysis / HIV/AIDS Care / CT/MRI Scan / Endoscopy / Immunization / Emergency)",
   "covered_items": ["item descriptions that are covered"],
   "denied_items": ["item description — reason for denial"],
+  "item_results": [
+    {{
+      "claim_item_id": number or string or null,
+      "item_name": "item name",
+      "decision": "APPROVE" or "DENY" or "ESCALATE",
+      "benefit_category": "benefit bucket for this specific item",
+      "reason": "one sentence item-level reason",
+      "exclusion_triggered": true or false,
+      "waiting_period_issue": true or false,
+      "plan_restriction": true or false
+    }}
+  ],
   "exclusion_triggered": true or false,
   "exclusion_detail": "which exclusion rule, or null",
   "waiting_period_issue": true or false,
@@ -325,7 +594,7 @@ Return ONLY this JSON:
   "plan_restriction_detail": "which plan restriction applies, or null"
 }}"""
 
-    return await _call_claude(system_prompt, user_message)
+    return await _call_claude(system_prompt, user_message, max_tokens=3000)
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +647,337 @@ Return ONLY this JSON:
 
     result = await _call_claude(system_prompt, user_message)
     return _normalize_utilization_result(result)
+
+
+def agent_item_utilization(pa: dict, agent2: dict) -> dict:
+    items = _items(pa)
+    plan = _plan_tier(pa)
+    plan_limits = PLAN_LIMITS.get(plan or "")
+    limits = _all_limits(pa)
+    coverage_map = _coverage_by_item(agent2, items)
+
+    if not items:
+        return {
+            "pass": None,
+            "reason": "No requested items were available for item-level utilization.",
+            "item_decisions": [],
+            "utilization_data_missing": True,
+        }
+
+    if not plan or not plan_limits:
+        item_decisions = [
+            _build_item_decision(
+                item,
+                "ESCALATE",
+                "Unknown plan tier; cannot choose a benefit limit.",
+                coverage_map.get(_coverage_key(_item_id(item))),
+                bucket_key=None,
+                bucket_name="Unknown Limit Bucket",
+            )
+            for item in items
+        ]
+        return _summarize_item_utilization(item_decisions, "Unknown plan tier; cannot choose a benefit limit.")
+
+    if not limits:
+        item_decisions = [
+            _build_item_decision(
+                item,
+                "ESCALATE",
+                "Consumption data missing; cannot verify remaining limits.",
+                coverage_map.get(_coverage_key(_item_id(item))),
+                bucket_key=None,
+                bucket_name="Unknown Limit Bucket",
+            )
+            for item in items
+        ]
+        return _summarize_item_utilization(item_decisions, "Consumption data missing; cannot verify remaining limits.")
+
+    running_used_by_bucket: dict[str, float] = {}
+    item_decisions = []
+    for item in items:
+        coverage = coverage_map.get(_coverage_key(_item_id(item)))
+        coverage_decision = _coverage_decision(coverage)
+        bucket_key, bucket_name, bucket_source = _item_bucket(pa, item, coverage)
+        expected_limit = plan_limits.get(bucket_key) if bucket_key else None
+        limit_row = _limit_row_by_value(limits, expected_limit)
+        amount = _item_cost(item)
+
+        if coverage_decision == "DENY":
+            item_decisions.append(_build_item_decision(
+                item,
+                "DENY",
+                (coverage or {}).get("reason") or "Item is not covered under the plan.",
+                coverage,
+                bucket_key=bucket_key,
+                bucket_name=bucket_name,
+                bucket_source=bucket_source,
+                requested_cost=amount,
+            ))
+            continue
+
+        if coverage_decision == "ESCALATE":
+            item_decisions.append(_build_item_decision(
+                item,
+                "ESCALATE",
+                (coverage or {}).get("reason") or "Coverage is uncertain for this item.",
+                coverage,
+                bucket_key=bucket_key,
+                bucket_name=bucket_name,
+                bucket_source=bucket_source,
+                requested_cost=amount,
+            ))
+            continue
+
+        if bucket_key in {"maternity", "wellness"}:
+            item_decisions.append(_build_item_decision(
+                item,
+                "ESCALATE",
+                f"{bucket_name} has no deterministic limit mapping yet; AMAN limit_definition_id mapping is required.",
+                coverage,
+                bucket_key=bucket_key,
+                bucket_name=bucket_name,
+                bucket_source=bucket_source,
+                requested_cost=amount,
+                bucket_limit=expected_limit,
+            ))
+            continue
+
+        if expected_limit is None:
+            item_decisions.append(_build_item_decision(
+                item,
+                "DENY",
+                f"{bucket_name} is not covered for {plan}.",
+                coverage,
+                bucket_key=bucket_key,
+                bucket_name=bucket_name,
+                bucket_source=bucket_source,
+                requested_cost=amount,
+            ))
+            continue
+
+        if not limit_row:
+            item_decisions.append(_build_item_decision(
+                item,
+                "ESCALATE",
+                f"Could not find the {bucket_name} row in AMAN consumption data.",
+                coverage,
+                bucket_key=bucket_key,
+                bucket_name=bucket_name,
+                bucket_source=bucket_source,
+                requested_cost=amount,
+                bucket_limit=expected_limit,
+            ))
+            continue
+
+        base_used = _number(limit_row.get("consumed_value")) or 0.0
+        used_before = running_used_by_bucket.get(bucket_key, base_used)
+        remaining_before = (_number(limit_row.get("limit_value")) or expected_limit) - used_before
+        remaining_after = remaining_before - amount
+        bucket_exceeded = remaining_after < -0.01
+
+        decision = "DENY" if bucket_exceeded else "APPROVE"
+        reason = (
+            f"{bucket_name} remaining balance is insufficient for this item."
+            if bucket_exceeded
+            else f"Item fits within the {bucket_name} remaining balance."
+        )
+        if not bucket_exceeded:
+            running_used_by_bucket[bucket_key] = used_before + amount
+
+        item_decisions.append(_build_item_decision(
+            item,
+            decision,
+            reason,
+            coverage,
+            bucket_key=bucket_key,
+            bucket_name=bucket_name,
+            bucket_source=bucket_source,
+            requested_cost=amount,
+            bucket_limit=_number(limit_row.get("limit_value")) or expected_limit,
+            bucket_used_before=used_before,
+            bucket_remaining_before=remaining_before,
+            bucket_remaining_after=remaining_after,
+            bucket_exceeded=bucket_exceeded,
+            limit_definition_id=limit_row.get("limit_definition_id"),
+        ))
+
+    return _summarize_item_utilization(item_decisions)
+
+
+def _build_item_decision(
+    item: dict,
+    decision: str,
+    reason: str,
+    coverage: dict | None,
+    *,
+    bucket_key: str | None,
+    bucket_name: str,
+    bucket_source: str | None = None,
+    requested_cost: float | None = None,
+    bucket_limit=None,
+    bucket_used_before=None,
+    bucket_remaining_before=None,
+    bucket_remaining_after=None,
+    bucket_exceeded: bool | None = None,
+    limit_definition_id=None,
+) -> dict:
+    amount = _item_cost(item) if requested_cost is None else requested_cost
+    approved_cost = amount if decision == "APPROVE" else 0
+    return {
+        "claim_item_id": _item_id(item),
+        "facility_tariff_item_id": item.get("facility_tariff_item_id"),
+        "item_name": _item_name(item),
+        "category_id": item.get("category_id"),
+        "category_label": item.get("category_label"),
+        "quantity": item.get("quantity") or 1,
+        "unit_cost": item.get("unit_cost"),
+        "requested_cost": amount,
+        "recommended_approved_cost": approved_cost,
+        "source_item_status": _item_status(item),
+        "decision": decision,
+        "recommendation": "approve" if decision == "APPROVE" else "reject" if decision == "DENY" else "review",
+        "reason": reason,
+        "coverage_decision": _coverage_decision(coverage),
+        "coverage_reason": (coverage or {}).get("reason"),
+        "benefit_category": (coverage or {}).get("benefit_category"),
+        "bucket_key": bucket_key,
+        "bucket": bucket_name,
+        "bucket_source": bucket_source,
+        "limit_definition_id": limit_definition_id,
+        "bucket_limit": bucket_limit,
+        "bucket_used_before": bucket_used_before,
+        "bucket_remaining_before": bucket_remaining_before,
+        "bucket_remaining_after": bucket_remaining_after,
+        "bucket_exceeded": bucket_exceeded,
+    }
+
+
+def _summarize_item_utilization(item_decisions: list[dict], fallback_reason: str | None = None) -> dict:
+    approved = [item for item in item_decisions if item.get("decision") == "APPROVE"]
+    denied = [item for item in item_decisions if item.get("decision") == "DENY"]
+    escalated = [item for item in item_decisions if item.get("decision") == "ESCALATE"]
+    approved_amount = sum(_number(item.get("recommended_approved_cost")) or 0 for item in approved)
+    requested_amount = sum(_number(item.get("requested_cost")) or 0 for item in item_decisions)
+
+    if escalated:
+        passed = None
+        reason = fallback_reason or "One or more items require human review."
+    elif denied:
+        passed = False
+        reason = "One or more items failed coverage or utilization checks."
+    else:
+        passed = True
+        reason = "All items passed coverage and utilization checks."
+
+    return {
+        "pass": passed,
+        "reason": reason,
+        "mode": "item_level",
+        "item_decisions": item_decisions,
+        "approved_item_count": len(approved),
+        "denied_item_count": len(denied),
+        "escalated_item_count": len(escalated),
+        "total_item_count": len(item_decisions),
+        "requested_amount": requested_amount,
+        "approved_amount": approved_amount,
+        "denied_amount": sum(_number(item.get("requested_cost")) or 0 for item in denied),
+        "escalated_amount": sum(_number(item.get("requested_cost")) or 0 for item in escalated),
+    }
+
+
+def _global_item_decisions(pa: dict, decision: str, reason: str) -> dict:
+    item_decisions = [
+        _build_item_decision(
+            item,
+            decision,
+            reason,
+            {"decision": decision, "reason": reason},
+            bucket_key=None,
+            bucket_name="Not evaluated",
+            requested_cost=_item_cost(item),
+        )
+        for item in _items(pa)
+    ]
+    return _summarize_item_utilization(item_decisions, reason)
+
+
+def _build_final_decision_from_items(pa: dict, agent1: dict, agent2: dict, agent3: dict) -> dict:
+    item_decisions = agent3.get("item_decisions") or []
+    approved = [item for item in item_decisions if item.get("decision") == "APPROVE"]
+    denied = [item for item in item_decisions if item.get("decision") == "DENY"]
+    escalated = [item for item in item_decisions if item.get("decision") == "ESCALATE"]
+    approved_amount = sum(_number(item.get("recommended_approved_cost")) or 0 for item in approved)
+
+    if not agent1.get("pass"):
+        decision = "DENY"
+        confidence = "HIGH"
+        denial_reason = agent1.get("reason")
+        escalation_reason = None
+        reasoning = agent1.get("reason") or "Member failed eligibility checks."
+    elif escalated:
+        decision = "ESCALATE"
+        confidence = "MEDIUM"
+        denial_reason = None
+        escalation_reason = "One or more line items require human review."
+        reasoning = "Some line items require human review before a final PA recommendation can be trusted."
+    elif denied and approved:
+        decision = "ESCALATE"
+        confidence = "MEDIUM"
+        denial_reason = None
+        escalation_reason = "Mixed item-level recommendations."
+        reasoning = "The PA has mixed item-level results; approved and rejected lines should be reviewed per item."
+    elif denied:
+        decision = "DENY"
+        confidence = "HIGH"
+        denial_reason = "All requested line items failed coverage or utilization checks."
+        escalation_reason = None
+        reasoning = "All requested line items failed coverage or utilization checks."
+    else:
+        decision = "APPROVE"
+        confidence = "HIGH"
+        denial_reason = None
+        escalation_reason = None
+        reasoning = "All requested line items passed eligibility, coverage, and utilization checks."
+
+    return {
+        "decision": decision,
+        "pa_decision": "PARTIAL_APPROVE" if approved and (denied or escalated) else decision,
+        "confidence": confidence,
+        "amount_approved": approved_amount,
+        "denial_reason": denial_reason,
+        "escalation_reason": escalation_reason,
+        "reasoning": reasoning,
+        "flags": _item_decision_flags(item_decisions),
+        "no_preauth_required": bool(agent1.get("is_platinum_plus")),
+        "agent_summary": {
+            "agent1_pass": agent1.get("pass"),
+            "agent2_pass": agent2.get("pass"),
+            "agent3_pass": agent3.get("pass"),
+        },
+        "item_summary": {
+            "approved": len(approved),
+            "denied": len(denied),
+            "escalated": len(escalated),
+            "total": len(item_decisions),
+            "requested_amount": agent3.get("requested_amount"),
+            "approved_amount": approved_amount,
+            "denied_amount": agent3.get("denied_amount"),
+            "escalated_amount": agent3.get("escalated_amount"),
+        },
+    }
+
+
+def _item_decision_flags(item_decisions: list[dict]) -> list[str]:
+    flags = []
+    if any(item.get("decision") == "DENY" for item in item_decisions):
+        flags.append("One or more items rejected")
+    if any(item.get("decision") == "ESCALATE" for item in item_decisions):
+        flags.append("One or more items need review")
+    if any(item.get("bucket_exceeded") for item in item_decisions):
+        flags.append("Benefit limit exceeded")
+    if any(item.get("source_item_status") == "pending" for item in item_decisions):
+        flags.append("Pending source items present")
+    return flags
 
 
 # ---------------------------------------------------------------------------
@@ -454,28 +1054,31 @@ async def run(patient_id: str, request_id: str):
         await _log_agent(request_id, 1, "Eligibility", result_1)
 
         if not result_1.get("pass"):
-            await _save_decision(request_id, "DENY", {
+            result_3 = _global_item_decisions(pa, "DENY", result_1.get("reason") or "Failed eligibility check")
+            final_result = _build_final_decision_from_items(pa, result_1, {"pass": None}, result_3)
+            await _log_agent(request_id, 3, "Item Utilization & Limits", result_3)
+            await _log_agent(request_id, 4, "Final Decision", final_result)
+            await _save_decision(request_id, final_result.get("decision", "DENY"), {
                 "agent1": result_1, "agent2": None, "agent3": None, "agent4": None,
-                "decision": "DENY", "confidence": "HIGH", "amount_approved": None,
-                "denial_reason": result_1.get("reason"),
-                "reasoning": result_1.get("reason"),
-                "flags": ["Failed eligibility check"],
-                "no_preauth_required": False,
-                "agent_summary": {"agent1_pass": False, "agent2_pass": None, "agent3_pass": None}
+                **final_result,
+                "agent3": result_3,
+                "agent4": final_result,
+                "item_decisions": result_3.get("item_decisions", []),
             })
             return
 
         if result_1.get("is_platinum_plus"):
             logger.info(f"[Agent] Platinum Plus express — auto-approving request_id={request_id}")
+            result_3 = _global_item_decisions(pa, "APPROVE", "Platinum Plus express card — no pre-authorization required.")
+            final_result = _build_final_decision_from_items(pa, result_1, {"pass": True}, result_3)
+            final_result["flags"] = ["platinum_plus_express_card"]
+            final_result["no_preauth_required"] = True
+            await _log_agent(request_id, 3, "Item Utilization & Limits", result_3)
+            await _log_agent(request_id, 4, "Final Decision", final_result)
             await _save_decision(request_id, "APPROVE", {
-                "agent1": result_1, "agent2": None, "agent3": None, "agent4": None,
-                "decision": "APPROVE", "confidence": "HIGH",
-                "amount_approved": _get_estimated_cost(pa),
-                "denial_reason": None, "escalation_reason": None,
-                "reasoning": "Platinum Plus express card — no pre-authorization required.",
-                "flags": ["platinum_plus_express_card"],
-                "no_preauth_required": True,
-                "agent_summary": {"agent1_pass": True, "agent2_pass": None, "agent3_pass": None}
+                "agent1": result_1, "agent2": None, "agent3": result_3, "agent4": final_result,
+                **final_result,
+                "item_decisions": result_3.get("item_decisions", []),
             })
             return
 
@@ -487,74 +1090,26 @@ async def run(patient_id: str, request_id: str):
         result_2 = await agent_plan_coverage(pa)
         await _log_agent(request_id, 2, "Plan & Coverage", result_2)
 
-        if not result_2.get("pass"):
-            await _save_decision(request_id, "DENY", {
-                "agent1": result_1, "agent2": result_2, "agent3": None, "agent4": None,
-                "decision": "DENY", "confidence": "HIGH", "amount_approved": None,
-                "denial_reason": result_2.get("reason"),
-                "reasoning": result_2.get("reason"),
-                "flags": result_2.get("denied_items", []),
-                "no_preauth_required": False,
-                "agent_summary": {"agent1_pass": True, "agent2_pass": False, "agent3_pass": None}
-            })
-            return
-
         # ── Agent 3: Utilization & Limits ─────────────────────────────────
         await pg_execute(
             "UPDATE preauth_logs SET agent_step = 'utilization' WHERE request_id = $1",
             str(request_id)
         )
-        benefit_category = result_2.get("benefit_category", "unknown")
-
-        # If consumption / YTD usage is missing from the payload, we cannot
-        # honestly verify limits. Escalate for human review instead of
-        # silently assuming zero usage.
-        util_data = pa.get("utilization") if isinstance(pa.get("utilization"), dict) else {}
-        if util_data.get("utilization_data_missing"):
-            skip_result = {
-                "pass": None,
-                "reason": "Cannot verify limits — consumption data (enrollee_limits/policy_limits) is missing from the payload. Escalated for human review.",
-                "utilization_data_missing": True,
-                "benefit_category": benefit_category,
-            }
-            await _log_agent(request_id, 3, "Utilization & Limits", skip_result)
-            await _save_decision(request_id, "ESCALATE", {
-                "agent1": result_1, "agent2": result_2, "agent3": skip_result, "agent4": None,
-                "decision": "ESCALATE", "confidence": "MEDIUM", "amount_approved": None,
-                "escalation_reason": "Consumption data missing — cannot verify limits",
-                "reasoning": "Cannot verify limits because the inbound payload does not include enrollee or policy consumption snapshots. Escalated for human review.",
-                "flags": ["Consumption data missing"],
-                "no_preauth_required": False,
-                "agent_summary": {"agent1_pass": True, "agent2_pass": True, "agent3_pass": None},
-            })
-            return
-
-        result_3 = await agent_utilization(pa, benefit_category)
-        await _log_agent(request_id, 3, "Utilization & Limits", result_3)
-
-        if not result_3.get("pass"):
-            await _save_decision(request_id, "DENY", {
-                "agent1": result_1, "agent2": result_2, "agent3": result_3, "agent4": None,
-                "decision": "DENY", "confidence": "HIGH", "amount_approved": None,
-                "denial_reason": result_3.get("reason"),
-                "reasoning": result_3.get("reason"),
-                "flags": ["Benefit limit exceeded"],
-                "no_preauth_required": False,
-                "agent_summary": {"agent1_pass": True, "agent2_pass": True, "agent3_pass": False}
-            })
-            return
+        result_3 = agent_item_utilization(pa, result_2)
+        await _log_agent(request_id, 3, "Item Utilization & Limits", result_3)
 
         # ── Agent 4: Final Decision ───────────────────────────────────────
         await pg_execute(
             "UPDATE preauth_logs SET agent_step = 'decision' WHERE request_id = $1",
             str(request_id)
         )
-        result_4 = await agent_final_decision(pa, result_1, result_2, result_3)
+        result_4 = _build_final_decision_from_items(pa, result_1, result_2, result_3)
         await _log_agent(request_id, 4, "Final Decision", result_4)
 
         await _save_decision(request_id, result_4.get("decision", "ESCALATE"), {
             "agent1": result_1, "agent2": result_2, "agent3": result_3, "agent4": result_4,
-            **result_4
+            **result_4,
+            "item_decisions": result_3.get("item_decisions", []),
         })
 
     except Exception as e:
