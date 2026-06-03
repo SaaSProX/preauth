@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from datetime import date
 from anthropic import AsyncAnthropic
 from config.settings import settings
@@ -11,6 +12,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 TODAY = date.today().isoformat()
+
+
+class AgentJSONParseError(ValueError):
+    def __init__(self, message: str, raw_output: str):
+        super().__init__(message)
+        self.raw_output = raw_output
 
 # ---------------------------------------------------------------------------
 # KNOWLEDGE BASE — extracted from Aman HMO 2026 Retail Prices PDF
@@ -285,6 +292,44 @@ CATEGORY_BUCKET_OVERRIDES = {
 }
 
 
+def _strip_json_fences(raw: str) -> str:
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        parts = text.split("```")
+        if len(parts) >= 3:
+            text = parts[1].strip()
+            if text.lower().startswith("json"):
+                text = text[4:].strip()
+    return text
+
+
+def _extract_json_object(raw: str) -> str:
+    text = _strip_json_fences(raw)
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        return text[start:end + 1]
+    return text
+
+
+def _parse_agent_json(raw: str) -> dict:
+    text = _extract_json_object(raw)
+    candidates = [
+        text,
+        re.sub(r",\s*([}\]])", r"\1", text),
+    ]
+    last_error = None
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate.strip())
+            if isinstance(parsed, dict):
+                return parsed
+            raise AgentJSONParseError("Agent response JSON was not an object", raw)
+        except json.JSONDecodeError as exc:
+            last_error = exc
+    raise AgentJSONParseError(str(last_error), raw) from last_error
+
+
 async def _call_claude(system_prompt: str, user_message: str, *, max_tokens: int = 1000) -> dict:
     """Call Claude API and return parsed JSON response."""
     response = await client.messages.create(
@@ -294,11 +339,7 @@ async def _call_claude(system_prompt: str, user_message: str, *, max_tokens: int
         messages=[{"role": "user", "content": user_message}],
     )
     raw = response.content[0].text.strip()
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-    return json.loads(raw.strip())
+    return _parse_agent_json(raw)
 
 
 def _parse_json_field(value):
@@ -1087,7 +1128,43 @@ async def run(patient_id: str, request_id: str):
             "UPDATE preauth_logs SET agent_step = 'coverage' WHERE request_id = $1",
             str(request_id)
         )
-        result_2 = await agent_plan_coverage(pa)
+        try:
+            result_2 = await agent_plan_coverage(pa)
+        except AgentJSONParseError as e:
+            logger.warning(
+                "[Agent] Agent 2 JSON parse failed request_id=%s raw=%s",
+                request_id,
+                e.raw_output[:1000],
+            )
+            result_2 = {
+                "pass": None,
+                "reason": "Coverage agent returned malformed JSON; routing all items to human review.",
+                "benefit_category": "Coverage review required",
+                "covered_items": [],
+                "denied_items": [],
+                "item_results": [
+                    {
+                        "claim_item_id": _item_id(item),
+                        "item_name": _item_name(item),
+                        "decision": "ESCALATE",
+                        "benefit_category": "Coverage review required",
+                        "reason": "Coverage agent parse failed before this item could be evaluated.",
+                        "exclusion_triggered": False,
+                        "waiting_period_issue": False,
+                        "plan_restriction": False,
+                    }
+                    for item in _items(pa)
+                ],
+                "exclusion_triggered": False,
+                "exclusion_detail": None,
+                "waiting_period_issue": False,
+                "waiting_period_detail": None,
+                "plan_restriction": False,
+                "plan_restriction_detail": None,
+                "parse_failed": True,
+                "parse_error": str(e),
+                "raw_output_preview": e.raw_output[:2000],
+            }
         await _log_agent(request_id, 2, "Plan & Coverage", result_2)
 
         # ── Agent 3: Utilization & Limits ─────────────────────────────────
