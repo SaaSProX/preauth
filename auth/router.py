@@ -2484,10 +2484,11 @@ async def add_pa_comment(payload: AddPACommentPayload, claims: dict = Depends(ve
     }
 
 
-@router.get("/pa-comments/{request_id}")
-async def list_pa_comments(request_id: str, claims: dict = Depends(verify_session_token)):
-    """List all comments for a pre-auth request."""
+async def _list_pa_comments_response(request_id: str, claims: dict):
     org_id = _dashboard_org_id(claims)
+    request_id = request_id.strip()
+    if not request_id:
+        raise HTTPException(status_code=400, detail="request_id is required")
 
     rows = await pg_query_all(
         """
@@ -2514,3 +2515,15 @@ async def list_pa_comments(request_id: str, claims: dict = Depends(verify_sessio
         ],
         "count": len(rows),
     }
+
+
+@router.get("/pa-comments")
+async def list_pa_comments_by_query(request_id: str, claims: dict = Depends(verify_session_token)):
+    """List all comments for a pre-auth request."""
+    return await _list_pa_comments_response(request_id, claims)
+
+
+@router.get("/pa-comments/{request_id:path}")
+async def list_pa_comments(request_id: str, claims: dict = Depends(verify_session_token)):
+    """List all comments for a pre-auth request."""
+    return await _list_pa_comments_response(request_id, claims)
