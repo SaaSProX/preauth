@@ -6,7 +6,8 @@ Implements integration direction (ii): POST to Aman's
 record the outcome on preauth_logs.callback_*.
 
 Safe by design: never raises. Failures are logged and recorded.
-If AMAN_DECISIONS_URL or KPA_KEY are not configured, it logs and skips.
+If AMAN_CALLBACK_ENABLED is false, or AMAN_DECISIONS_URL/KPA_KEY are not
+configured, it logs and skips.
 """
 import json
 import logging
@@ -25,20 +26,24 @@ def _decision_to_recommendation(decision: str) -> str:
     d = (decision or "").upper()
     if d == "APPROVE":
         return "approve"
+    if d in {"PARTIAL", "PARTIAL_APPROVE"}:
+        return "partial_approve"
     if d == "DENY":
         return "reject"
     if d == "ESCALATE":
-        return "review"
-    return "review"
+        return "query"
+    return "query"
 
 
 def _item_decision_to_recommendation(decision: str) -> str:
     d = (decision or "").upper()
     if d == "APPROVE":
         return "approve"
+    if d in {"PARTIAL", "PARTIAL_APPROVE"}:
+        return "partial_approve"
     if d == "DENY":
         return "reject"
-    return "review"
+    return "query"
 
 
 def _coerce_dict(value):
@@ -52,58 +57,99 @@ def _coerce_dict(value):
     return {}
 
 
-def _line_decisions(raw_payload, decision, agent_result):
+def _confidence_number(agent_result: dict) -> float:
+    conf_map = {"HIGH": 0.9, "MEDIUM": 0.7, "LOW": 0.5}
+    return conf_map.get(str(agent_result.get("confidence") or "MEDIUM").upper(), 0.7)
+
+
+def _item_status(item: dict) -> str:
+    value = item.get("status", item.get("claim_item_status"))
+    if isinstance(value, str):
+        return value.strip().lower()
+    labels = {0: "pending", 1: "approved", 2: "queried", 3: "rejected"}
+    try:
+        return labels.get(int(value), "unknown")
+    except (TypeError, ValueError):
+        return "unknown"
+
+
+def _pending_claim_ids(raw_payload) -> set[str] | None:
     raw = _coerce_dict(raw_payload)
-    items = raw.get("pa_items") or []
+    items = raw.get("pa_items")
     if not isinstance(items, list):
-        return []
+        return None
+    return {
+        str(item.get("claim_item_id"))
+        for item in items
+        if (
+            isinstance(item, dict)
+            and item.get("claim_item_id") is not None
+            and _item_status(item) == "pending"
+        )
+    }
+
+
+def _line_decisions(raw_payload, agent_result):
     ar = _coerce_dict(agent_result)
+    pending_claim_ids = _pending_claim_ids(raw_payload)
     item_results = ar.get("item_decisions") if isinstance(ar.get("item_decisions"), list) else []
-    item_results_by_claim_id = {}
-    for item in item_results:
-        if not isinstance(item, dict):
-            continue
-        for key in (item.get("claim_item_id"), item.get("id"), item.get("facility_tariff_item_id")):
-            if key is not None:
-                item_results_by_claim_id[str(key)] = item
     rationale = (
         ar.get("reasoning")
         or ar.get("denial_reason")
         or ar.get("escalation_reason")
         or "AI advisory decision"
     )
-    conf_map = {"HIGH": 0.9, "MEDIUM": 0.7, "LOW": 0.5}
-    conf_num = conf_map.get(str(ar.get("confidence") or "MEDIUM").upper(), 0.7)
+    conf_num = _confidence_number(ar)
     out = []
-    for it in items:
-        if not isinstance(it, dict):
+    for item_result in item_results:
+        if not isinstance(item_result, dict):
             continue
-        item_result = item_results_by_claim_id.get(str(it.get("claim_item_id") or it.get("id") or it.get("facility_tariff_item_id")))
-        rec = _item_decision_to_recommendation(item_result.get("decision")) if item_result else _decision_to_recommendation(decision)
-        approved = None
-        item_rationale = rationale
-        if item_result:
-            item_rationale = item_result.get("reason") or item_result.get("coverage_reason") or rationale
-            approved = item_result.get("recommended_approved_cost")
-        if rec == "approve":
-            if approved is None:
-                requested = it.get("requested_cost")
-                try:
-                    if requested is not None:
-                        approved = float(requested)
-                    else:
-                        approved = float(it.get("unit_cost") or 0) * (float(it.get("quantity")) or 1)
-                except (TypeError, ValueError):
-                    approved = None
+
+        claim_item_id = item_result.get("claim_item_id") or item_result.get("id")
+        if claim_item_id is None:
+            continue
+
+        # AMAN's pa_items can include existing approved lines for the same
+        # check-in. Advisory responses should only cover current pending lines.
+        if pending_claim_ids is not None and str(claim_item_id) not in pending_claim_ids:
+            continue
+
+        rec = _item_decision_to_recommendation(item_result.get("decision"))
+        approved = item_result.get("recommended_approved_cost")
+        if rec == "approve" and approved is None:
+            approved = item_result.get("requested_cost")
+        elif rec == "reject" and approved is None:
+            approved = 0
+
         out.append({
-            "claim_item_id": it.get("claim_item_id") or it.get("id"),
+            "claim_item_id": claim_item_id,
             "recommendation": rec,
             "recommended_approved_cost": approved,
             "confidence": conf_num,
-            "rationale": item_rationale,
+            "rationale": item_result.get("reason") or item_result.get("coverage_reason") or rationale,
             "policy_citations": [],
         })
     return out
+
+
+def _overall_recommendation(line_decisions: list[dict], agent_result: dict, fallback_decision: str) -> str:
+    if not line_decisions:
+        return _decision_to_recommendation(fallback_decision)
+
+    recs = {str(item.get("recommendation") or "").lower() for item in line_decisions}
+    if recs == {"approve"}:
+        return "approve"
+    if recs == {"reject"}:
+        return "reject"
+    if recs == {"query"}:
+        return "query"
+    if "approve" in recs and ({"reject", "query", "partial_approve"} & recs):
+        return "partial_approve"
+
+    pa_decision = agent_result.get("pa_decision") or agent_result.get("overall_recommendation")
+    if pa_decision:
+        return _decision_to_recommendation(pa_decision)
+    return _decision_to_recommendation(fallback_decision)
 
 
 def _build_payload(row: dict) -> dict:
@@ -117,16 +163,18 @@ def _build_payload(row: dict) -> dict:
         or ar.get("escalation_reason")
         or ""
     )
+    line_decisions = _line_decisions(raw, ar)
     return {
         "event_type": "pa.decision.advisory",
         "event_id": str(uuid.uuid4()),
         "correlation_id": raw.get("correlation_id") or raw.get("event_id"),
         "checkin_id": enc.get("checkin_id") or raw.get("checkin_id"),
         "submission_revision": enc.get("submission_revision") or 0,
-        "decided_at": datetime.now(timezone.utc).isoformat(),
-        "overall_recommendation": _decision_to_recommendation(decision),
+        "decided_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        "overall_recommendation": _overall_recommendation(line_decisions, ar, decision),
         "overall_rationale": rationale,
-        "line_decisions": _line_decisions(raw, decision, ar),
+        "overall_confidence": _confidence_number(ar),
+        "line_decisions": line_decisions,
     }
 
 
@@ -150,7 +198,7 @@ async def _record_callback(request_id, *, status, http_status, error):
         logger.exception("[AmanCallback] failed to record status for %s", request_id)
 
 
-async def send_decision_to_aman(request_id: str) -> dict:
+async def send_decision_to_aman(request_id: str, *, force: bool = False) -> dict:
     """Read the stored decision and POST it back to Aman.
 
     Records the outcome on preauth_logs.callback_* and returns a short
@@ -158,6 +206,10 @@ async def send_decision_to_aman(request_id: str) -> dict:
     """
     url = settings.aman_decisions_url
     key = settings.kpa_key
+
+    if not force and not settings.aman_callback_enabled:
+        await _record_callback(request_id, status="skipped_disabled", http_status=None, error=None)
+        return {"status": "skipped_disabled"}
 
     if not url or not key:
         await _record_callback(request_id, status="skipped_no_config", http_status=None, error=None)
@@ -172,6 +224,16 @@ async def send_decision_to_aman(request_id: str) -> dict:
         return {"status": "skipped_no_row"}
 
     payload = _build_payload(dict(row))
+    if not payload.get("line_decisions"):
+        await _record_callback(
+            request_id,
+            status="skipped_no_line_decisions",
+            http_status=None,
+            error="No pending item-level advisory decisions were available to send.",
+        )
+        logger.info("[AmanCallback] skipped request_id=%s no line decisions", request_id)
+        return {"status": "skipped_no_line_decisions"}
+
     headers = {
         "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",

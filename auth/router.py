@@ -278,6 +278,10 @@ def _dashboard_request(row):
         "received_at": row["received_at"],
         "processed_at": row["processed_at"],
         "processing_seconds": processing_seconds,
+        "callback_status": (row["callback_status"] if "callback_status" in row.keys() else None),
+        "callback_http_status": (row["callback_http_status"] if "callback_http_status" in row.keys() else None),
+        "callback_sent_at": (row["callback_sent_at"] if "callback_sent_at" in row.keys() else None),
+        "callback_error": (row["callback_error"] if "callback_error" in row.keys() else None),
         "error_message": row["error_message"],
         "plan": source.get("plan") or _nested_value(raw_source, "policy", "plan_name") or _nested_value(raw_source, "policy", "insurance_package"),
         "item_type": item.get("type") or item.get("category_id"),
@@ -1174,6 +1178,21 @@ async def preauth_dashboard(
                     AND LOWER(COALESCE(p.decision, p.status, '')) IN ('escalate', 'escalated')
                 )
             )::int AS pa_review,
+            COUNT(*) FILTER (WHERE p.callback_status = 'delivered')::int AS callback_delivered,
+            COUNT(*) FILTER (
+                WHERE p.callback_status IN ('auth_failed', 'scope_missing', 'stale_revision', 'network_error')
+                   OR p.callback_status LIKE 'http_%'
+            )::int AS callback_failed,
+            COUNT(*) FILTER (WHERE p.callback_status = 'stale_revision')::int AS callback_stale_revision,
+            COUNT(*) FILTER (WHERE p.callback_status = 'skipped_disabled')::int AS callback_skipped_disabled,
+            COUNT(*) FILTER (WHERE p.callback_status = 'skipped_no_config')::int AS callback_skipped_no_config,
+            COUNT(*) FILTER (WHERE p.callback_status = 'skipped_no_line_decisions')::int AS callback_skipped_no_line_decisions,
+            COUNT(*) FILTER (
+                WHERE p.decision IS NOT NULL
+                  AND p.processed_at IS NOT NULL
+                  AND p.callback_status IS NULL
+            )::int AS callback_not_attempted,
+            MAX(p.callback_sent_at) AS callback_last_sent_at,
             AVG(
                 CASE
                     WHEN ar.first_log_at IS NOT NULL
@@ -1368,6 +1387,10 @@ async def preauth_dashboard(
             p.agent_result,
             p.error_message,
             p.processed_at,
+            p.callback_status,
+            p.callback_http_status,
+            p.callback_sent_at,
+            p.callback_error,
             COALESCE(ev.event_count, 0)::int AS event_count,
             ev.latest_event_sequence,
             ev.latest_event_id,
@@ -1456,6 +1479,10 @@ async def preauth_dashboard(
             p.agent_result,
             p.error_message,
             p.processed_at,
+            p.callback_status,
+            p.callback_http_status,
+            p.callback_sent_at,
+            p.callback_error,
             ev.event_count,
             ev.latest_event_sequence,
             ev.latest_event_id,
@@ -1607,6 +1634,14 @@ async def preauth_dashboard(
             "pa_partial_approved": summary["pa_partial_approved"] if summary else 0,
             "pa_rejected": summary["pa_rejected"] if summary else 0,
             "pa_review": summary["pa_review"] if summary else 0,
+            "callback_delivered": summary["callback_delivered"] if summary else 0,
+            "callback_failed": summary["callback_failed"] if summary else 0,
+            "callback_stale_revision": summary["callback_stale_revision"] if summary else 0,
+            "callback_skipped_disabled": summary["callback_skipped_disabled"] if summary else 0,
+            "callback_skipped_no_config": summary["callback_skipped_no_config"] if summary else 0,
+            "callback_skipped_no_line_decisions": summary["callback_skipped_no_line_decisions"] if summary else 0,
+            "callback_not_attempted": summary["callback_not_attempted"] if summary else 0,
+            "callback_last_sent_at": summary["callback_last_sent_at"] if summary and summary["callback_last_sent_at"] else None,
             "avg_processing_seconds": summary["avg_processing_seconds"] if summary else None,
             "event_count": event_summary["event_count"] if event_summary else 0,
             "unique_pa_count": event_summary["unique_pa_count"] if event_summary else 0,
@@ -1655,6 +1690,11 @@ class RetryPendingPreauthPayload(BaseModel):
     date_to: date | None = None
     q: str | None = None
     limit: int = 20
+
+
+class SendPreauthDecisionPayload(BaseModel):
+    request_id: str
+    org_id: int | None = None
 
 
 RETRYABLE_PREAUTH_STATUSES = {"pending", "processing", "received", "error"}
@@ -1763,6 +1803,49 @@ async def retry_pending_preauths(payload: RetryPendingPreauthPayload, background
         "queued_count": len(rows),
         "limit": safe_limit,
         "request_ids": [row["request_id"] for row in rows],
+    }
+
+
+@router.post("/preauth/send-decision")
+async def send_preauth_decision(payload: SendPreauthDecisionPayload, claims: dict = Depends(verify_session_token)):
+    org_id = await _resolve_mutation_org_id(claims, payload.org_id)
+    request_id = payload.request_id.strip()
+    if not request_id:
+        raise HTTPException(status_code=400, detail="request_id is required")
+
+    row = await pg_query_one(
+        """
+        SELECT id, request_id, decision, agent_result, processed_at
+        FROM preauth_logs
+        WHERE org_id = $1 AND request_id = $2
+        """,
+        org_id, request_id,
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Pre-auth request not found")
+    if not row["processed_at"] or not row["decision"] or not row["agent_result"]:
+        raise HTTPException(status_code=409, detail="No completed agent decision is available to send yet")
+
+    from services.aman_callback import send_decision_to_aman
+
+    result = await send_decision_to_aman(str(row["request_id"]), force=True)
+    updated = await pg_query_one(
+        """
+        SELECT callback_status, callback_http_status, callback_sent_at, callback_error
+        FROM preauth_logs
+        WHERE id = $1
+        """,
+        row["id"],
+    )
+    return {
+        "request_id": row["request_id"],
+        "result": result,
+        "callback": {
+            "status": updated["callback_status"] if updated else result.get("status"),
+            "http_status": updated["callback_http_status"] if updated else result.get("http_status"),
+            "sent_at": updated["callback_sent_at"] if updated else None,
+            "error": updated["callback_error"] if updated else result.get("error"),
+        },
     }
 
 
@@ -2178,6 +2261,10 @@ async def patient_history(
             p.agent_result,
             p.error_message,
             p.processed_at,
+            p.callback_status,
+            p.callback_http_status,
+            p.callback_sent_at,
+            p.callback_error,
             CASE
                 WHEN ar.first_log_at IS NOT NULL
                 THEN EXTRACT(EPOCH FROM (COALESCE(p.processed_at, ar.last_log_at) - ar.first_log_at))::float
@@ -2222,6 +2309,7 @@ async def patient_history(
         GROUP BY p.id, p.request_id, p.patient_id, p.status, p.received_at,
                  p.raw_payload, p.extracted_fields, p.agent_step, p.decision,
                  p.agent_result, p.error_message, p.processed_at,
+                 p.callback_status, p.callback_http_status, p.callback_sent_at, p.callback_error,
                  ar.first_log_at, ar.last_log_at
         ORDER BY p.received_at DESC
         """,

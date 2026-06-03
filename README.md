@@ -134,8 +134,9 @@ JWT_SECRET=<long random string>
 CORS_ORIGINS=https://dashboard.yourdomain.com,https://staging.yourdomain.com
 
 # Outbound: send agent decisions back to Aman
-AMAN_DECISIONS_URL=https://aman.example/api/preauth/decisions
-KPA_KEY=<bearer key Aman gave you>
+AMAN_CALLBACK_ENABLED=false
+AMAN_DECISIONS_URL=https://v1.amanhmo.com/v2/integrations/saaspro/pa-decisions
+KPA_KEY=<Aman key with pa.decisions.write or pa.* scope>
 
 # Dashboard
 DASHBOARD_BASE_URL=https://dashboard.yourdomain.com
@@ -145,7 +146,9 @@ RESEND_API_KEY=
 RESEND_FROM_EMAIL="Saaspro Lab <no-reply@saasprolabs.io>"
 ```
 
-`CORS_ORIGINS`, `AMAN_DECISIONS_URL`, and `KPA_KEY` are recent additions. The backend will start without them but: missing `CORS_ORIGINS` blocks the dashboard from calling the API, and missing `AMAN_DECISIONS_URL`/`KPA_KEY` makes the agent skip the decision callback (logged as `skipped_no_config`).
+`CORS_ORIGINS`, `AMAN_CALLBACK_ENABLED`, `AMAN_DECISIONS_URL`, and `KPA_KEY` are recent additions. The backend will start without them but: missing `CORS_ORIGINS` blocks the dashboard from calling the API, `AMAN_CALLBACK_ENABLED=false` makes the agent skip the decision callback (logged as `skipped_disabled`), and missing `AMAN_DECISIONS_URL`/`KPA_KEY` makes the agent skip the decision callback (logged as `skipped_no_config`).
+
+Admins can manually send the latest advisory decision for one completed PA through `POST /auth/preauth/send-decision`. Manual sends bypass `AMAN_CALLBACK_ENABLED` but still require `AMAN_DECISIONS_URL` and `KPA_KEY`.
 
 ### Running Locally
 

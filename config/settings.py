@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     dashboard_base_url: str = "https://dashboard.saasprolabs.io"
 
     # Aman outbound callback (agent decision → Aman)
+    aman_callback_enabled: bool = False
     aman_decisions_url: str = ""
     kpa_key: str = ""
 
