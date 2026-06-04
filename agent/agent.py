@@ -395,6 +395,19 @@ def _item_cost(item: dict) -> float:
     return float(unit_cost * quantity) if unit_cost is not None else 0.0
 
 
+def _item_approved_cost(item: dict) -> float:
+    amount = _number(item.get("approved_cost"))
+    if amount is not None and amount > 0:
+        return amount
+
+    unit_cost = _number(item.get("unit_approved_cost"))
+    quantity = _number(item.get("quantity")) or 1
+    if unit_cost is not None and unit_cost > 0:
+        return float(unit_cost * quantity)
+
+    return _item_cost(item)
+
+
 def _item_status(item: dict) -> str:
     value = item.get("item_status_label", item.get("status"))
     if isinstance(value, str):
@@ -695,6 +708,7 @@ def agent_item_utilization(pa: dict, agent2: dict) -> dict:
     plan = _plan_tier(pa)
     plan_limits = PLAN_LIMITS.get(plan or "")
     limits = _all_limits(pa)
+    utilization_data_missing = not bool(limits)
     coverage_map = _coverage_by_item(agent2, items)
 
     if not items:
@@ -719,20 +733,6 @@ def agent_item_utilization(pa: dict, agent2: dict) -> dict:
         ]
         return _summarize_item_utilization(item_decisions, "Unknown plan tier; cannot choose a benefit limit.")
 
-    if not limits:
-        item_decisions = [
-            _build_item_decision(
-                item,
-                "ESCALATE",
-                "Consumption data missing; cannot verify remaining limits.",
-                coverage_map.get(_coverage_key(_item_id(item))),
-                bucket_key=None,
-                bucket_name="Unknown Limit Bucket",
-            )
-            for item in items
-        ]
-        return _summarize_item_utilization(item_decisions, "Consumption data missing; cannot verify remaining limits.")
-
     running_used_by_bucket: dict[str, float] = {}
     item_decisions = []
     for item in items:
@@ -740,8 +740,10 @@ def agent_item_utilization(pa: dict, agent2: dict) -> dict:
         coverage_decision = _coverage_decision(coverage)
         bucket_key, bucket_name, bucket_source = _item_bucket(pa, item, coverage)
         expected_limit = plan_limits.get(bucket_key) if bucket_key else None
-        limit_row = _limit_row_by_value(limits, expected_limit)
+        limit_row = _limit_row_by_value(limits, expected_limit) if limits else None
         amount = _item_cost(item)
+        source_status = _item_status(item)
+        amount_to_count = _item_approved_cost(item) if source_status == "approved" else amount
 
         if coverage_decision == "DENY":
             item_decisions.append(_build_item_decision(
@@ -753,6 +755,7 @@ def agent_item_utilization(pa: dict, agent2: dict) -> dict:
                 bucket_name=bucket_name,
                 bucket_source=bucket_source,
                 requested_cost=amount,
+                utilization_data_missing=utilization_data_missing,
             ))
             continue
 
@@ -766,6 +769,7 @@ def agent_item_utilization(pa: dict, agent2: dict) -> dict:
                 bucket_name=bucket_name,
                 bucket_source=bucket_source,
                 requested_cost=amount,
+                utilization_data_missing=utilization_data_missing,
             ))
             continue
 
@@ -780,6 +784,7 @@ def agent_item_utilization(pa: dict, agent2: dict) -> dict:
                 bucket_source=bucket_source,
                 requested_cost=amount,
                 bucket_limit=expected_limit,
+                utilization_data_missing=utilization_data_missing,
             ))
             continue
 
@@ -793,10 +798,11 @@ def agent_item_utilization(pa: dict, agent2: dict) -> dict:
                 bucket_name=bucket_name,
                 bucket_source=bucket_source,
                 requested_cost=amount,
+                utilization_data_missing=utilization_data_missing,
             ))
             continue
 
-        if not limit_row:
+        if limits and not limit_row:
             item_decisions.append(_build_item_decision(
                 item,
                 "ESCALATE",
@@ -807,23 +813,32 @@ def agent_item_utilization(pa: dict, agent2: dict) -> dict:
                 bucket_source=bucket_source,
                 requested_cost=amount,
                 bucket_limit=expected_limit,
+                utilization_data_missing=utilization_data_missing,
             ))
             continue
 
-        base_used = _number(limit_row.get("consumed_value")) or 0.0
+        limit_value = (_number(limit_row.get("limit_value")) if limit_row else None) or expected_limit
+        base_used = (_number(limit_row.get("consumed_value")) if limit_row else None) or 0.0
         used_before = running_used_by_bucket.get(bucket_key, base_used)
-        remaining_before = (_number(limit_row.get("limit_value")) or expected_limit) - used_before
-        remaining_after = remaining_before - amount
+        remaining_before = limit_value - used_before
+        remaining_after = remaining_before - amount_to_count
         bucket_exceeded = remaining_after < -0.01
 
         decision = "DENY" if bucket_exceeded else "APPROVE"
-        reason = (
-            f"{bucket_name} remaining balance is insufficient for this item."
-            if bucket_exceeded
-            else f"Item fits within the {bucket_name} remaining balance."
-        )
+        if utilization_data_missing:
+            reason = (
+                f"Consumption limits were not configured in the payload; approving this item would exceed the {bucket_name} fallback balance from known {plan} plan rules and the current PA snapshot."
+                if bucket_exceeded
+                else f"Consumption limits were not configured in the payload; item fits within the {bucket_name} fallback balance from known {plan} plan rules and the current PA snapshot."
+            )
+        else:
+            reason = (
+                f"{bucket_name} remaining balance is insufficient for this item."
+                if bucket_exceeded
+                else f"Item fits within the {bucket_name} remaining balance."
+            )
         if not bucket_exceeded:
-            running_used_by_bucket[bucket_key] = used_before + amount
+            running_used_by_bucket[bucket_key] = used_before + amount_to_count
 
         item_decisions.append(_build_item_decision(
             item,
@@ -834,12 +849,14 @@ def agent_item_utilization(pa: dict, agent2: dict) -> dict:
             bucket_name=bucket_name,
             bucket_source=bucket_source,
             requested_cost=amount,
-            bucket_limit=_number(limit_row.get("limit_value")) or expected_limit,
+            bucket_limit=limit_value,
             bucket_used_before=used_before,
             bucket_remaining_before=remaining_before,
             bucket_remaining_after=remaining_after,
             bucket_exceeded=bucket_exceeded,
-            limit_definition_id=limit_row.get("limit_definition_id"),
+            limit_definition_id=limit_row.get("limit_definition_id") if limit_row else None,
+            utilization_data_missing=utilization_data_missing,
+            utilization_source="aman_consumption" if limit_row else "fallback_plan_rules_current_pa_snapshot",
         ))
 
     return _summarize_item_utilization(item_decisions)
@@ -861,6 +878,8 @@ def _build_item_decision(
     bucket_remaining_after=None,
     bucket_exceeded: bool | None = None,
     limit_definition_id=None,
+    utilization_data_missing: bool = False,
+    utilization_source: str | None = None,
 ) -> dict:
     amount = _item_cost(item) if requested_cost is None else requested_cost
     approved_cost = amount if decision == "APPROVE" else 0
@@ -885,6 +904,8 @@ def _build_item_decision(
         "bucket": bucket_name,
         "bucket_source": bucket_source,
         "limit_definition_id": limit_definition_id,
+        "utilization_data_missing": utilization_data_missing,
+        "utilization_source": utilization_source,
         "bucket_limit": bucket_limit,
         "bucket_used_before": bucket_used_before,
         "bucket_remaining_before": bucket_remaining_before,
@@ -923,6 +944,7 @@ def _summarize_item_utilization(item_decisions: list[dict], fallback_reason: str
         "approved_amount": approved_amount,
         "denied_amount": sum(_number(item.get("requested_cost")) or 0 for item in denied),
         "escalated_amount": sum(_number(item.get("requested_cost")) or 0 for item in escalated),
+        "utilization_data_missing": any(item.get("utilization_data_missing") for item in item_decisions),
     }
 
 
