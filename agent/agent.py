@@ -377,6 +377,13 @@ def _items(pa: dict) -> list[dict]:
     return [item for item in raw if isinstance(item, dict)]
 
 
+def _items_added(pa: dict) -> list[dict]:
+    raw = _parse_json_field(pa.get("items_added") or pa.get("submission_items_added") or [])
+    if not isinstance(raw, list):
+        return []
+    return [item for item in raw if isinstance(item, dict)]
+
+
 def _item_id(item: dict):
     return item.get("claim_item_id") or item.get("id") or item.get("facility_tariff_item_id")
 
@@ -417,6 +424,139 @@ def _item_status(item: dict) -> str:
         return labels.get(int(value), "unknown")
     except (TypeError, ValueError):
         return "unknown"
+
+
+def _close_amount(left, right, tolerance: float = 1.0) -> bool:
+    left_num = _number(left)
+    right_num = _number(right)
+    if left_num is None or right_num is None:
+        return False
+    return abs(left_num - right_num) <= tolerance
+
+
+def _same_quantity(left, right) -> bool:
+    left_num = _number(left)
+    right_num = _number(right)
+    if left_num is None or right_num is None:
+        return True
+    return abs(left_num - right_num) < 0.01
+
+
+def _current_submission_items(pa: dict) -> list[dict]:
+    """Return pending pa_items introduced by the current AMAN submission.
+
+    AMAN sends the whole check-in snapshot on every event. Older approved or
+    rejected lines are context; advisory decisions should be generated only for
+    the current submission's pending lines.
+    """
+    items = _items(pa)
+    pending = [item for item in items if _item_status(item) == "pending"]
+    added = _items_added(pa)
+    if not added:
+        return pending
+
+    matched: list[dict] = []
+    used_indexes: set[int] = set()
+
+    def add_match(index: int):
+        if index in used_indexes:
+            return
+        used_indexes.add(index)
+        matched.append(pending[index])
+
+    for added_item in added:
+        added_id = added_item.get("id")
+        added_ref = str(added_item.get("item_ref") or "").lower()
+        for index, item in enumerate(pending):
+            if index in used_indexes:
+                continue
+            if (
+                added_id is not None
+                and item.get("facility_tariff_item_id") is not None
+                and str(item.get("facility_tariff_item_id")) == str(added_id)
+            ):
+                add_match(index)
+                break
+            if (
+                added_id is not None
+                and "claim_item" in added_ref
+                and item.get("claim_item_id") is not None
+                and str(item.get("claim_item_id")) == str(added_id)
+            ):
+                add_match(index)
+                break
+
+    for added_item in added:
+        for index, item in enumerate(pending):
+            if index in used_indexes:
+                continue
+            if added_item.get("category_id") is not None and item.get("category_id") is not None:
+                if str(added_item.get("category_id")) != str(item.get("category_id")):
+                    continue
+            if not _same_quantity(added_item.get("quantity"), item.get("quantity")):
+                continue
+            if not _close_amount(added_item.get("requested_cost"), _item_cost(item)):
+                continue
+            add_match(index)
+            break
+
+    return matched or pending
+
+
+def _item_identity(item: dict) -> tuple:
+    return (
+        str(item.get("claim_item_id") or ""),
+        str(item.get("facility_tariff_item_id") or ""),
+        _item_name(item).lower(),
+        round(_item_cost(item), 2),
+        str(item.get("category_id") or ""),
+        str(item.get("quantity") or 1),
+    )
+
+
+def _historical_items(pa: dict, current_items: list[dict]) -> list[dict]:
+    current_identities = {_item_identity(item) for item in current_items}
+    return [item for item in _items(pa) if _item_identity(item) not in current_identities]
+
+
+def _pa_with_items(pa: dict, items: list[dict]) -> dict:
+    scoped = dict(pa)
+    scoped["items"] = items
+    scoped["requested_items"] = items
+    scoped["total_requested_cost"] = sum(_item_cost(item) for item in items)
+    return scoped
+
+
+def _aman_prior_context(pa: dict, current_items: list[dict] | None = None) -> dict:
+    historical = _historical_items(pa, current_items or _current_submission_items(pa))
+    approved_items = [item for item in historical if _item_status(item) == "approved"]
+    rejected_items = [item for item in historical if _item_status(item) == "rejected"]
+    approved_amount = sum(_item_approved_cost(item) for item in approved_items)
+    rejected_requested_amount = sum(_item_cost(item) for item in rejected_items)
+    return {
+        "approved_count": len(approved_items),
+        "approved_amount": approved_amount,
+        "rejected_count": len(rejected_items),
+        "rejected_requested_amount": rejected_requested_amount,
+        "approved_items": [
+            {
+                "claim_item_id": _item_id(item),
+                "item_name": _item_name(item),
+                "approved_cost": _item_approved_cost(item),
+                "requested_cost": _item_cost(item),
+            }
+            for item in approved_items
+        ],
+        "rejected_items": [
+            {
+                "claim_item_id": _item_id(item),
+                "item_name": _item_name(item),
+                "approved_cost": 0,
+                "requested_cost": _item_cost(item),
+            }
+            for item in rejected_items
+        ],
+    }
 
 
 def _all_limits(pa: dict) -> list[dict]:
@@ -704,20 +844,23 @@ Return ONLY this JSON:
 
 
 def agent_item_utilization(pa: dict, agent2: dict) -> dict:
-    items = _items(pa)
+    items = _current_submission_items(pa)
     plan = _plan_tier(pa)
     plan_limits = PLAN_LIMITS.get(plan or "")
     limits = _all_limits(pa)
     utilization_data_missing = not bool(limits)
     coverage_map = _coverage_by_item(agent2, items)
+    prior_context = _aman_prior_context(pa, items)
 
     if not items:
-        return {
+        result = {
             "pass": None,
-            "reason": "No requested items were available for item-level utilization.",
+            "reason": "No current pending submission items were available for item-level utilization.",
             "item_decisions": [],
             "utilization_data_missing": True,
         }
+        result["aman_prior_context"] = prior_context
+        return result
 
     if not plan or not plan_limits:
         item_decisions = [
@@ -731,9 +874,23 @@ def agent_item_utilization(pa: dict, agent2: dict) -> dict:
             )
             for item in items
         ]
-        return _summarize_item_utilization(item_decisions, "Unknown plan tier; cannot choose a benefit limit.")
+        result = _summarize_item_utilization(item_decisions, "Unknown plan tier; cannot choose a benefit limit.")
+        result["aman_prior_context"] = prior_context
+        return result
 
     running_used_by_bucket: dict[str, float] = {}
+    if utilization_data_missing:
+        for historical_item in _historical_items(pa, items):
+            if _item_status(historical_item) != "approved":
+                continue
+            bucket_key, _bucket_name, _bucket_source = _item_bucket(pa, historical_item)
+            if not bucket_key:
+                continue
+            running_used_by_bucket[bucket_key] = (
+                running_used_by_bucket.get(bucket_key, 0.0)
+                + _item_approved_cost(historical_item)
+            )
+
     item_decisions = []
     for item in items:
         coverage = coverage_map.get(_coverage_key(_item_id(item)))
@@ -859,7 +1016,9 @@ def agent_item_utilization(pa: dict, agent2: dict) -> dict:
             utilization_source="aman_consumption" if limit_row else "fallback_plan_rules_current_pa_snapshot",
         ))
 
-    return _summarize_item_utilization(item_decisions)
+    result = _summarize_item_utilization(item_decisions)
+    result["aman_prior_context"] = prior_context
+    return result
 
 
 def _build_item_decision(
@@ -949,6 +1108,7 @@ def _summarize_item_utilization(item_decisions: list[dict], fallback_reason: str
 
 
 def _global_item_decisions(pa: dict, decision: str, reason: str) -> dict:
+    current_items = _current_submission_items(pa)
     item_decisions = [
         _build_item_decision(
             item,
@@ -959,9 +1119,11 @@ def _global_item_decisions(pa: dict, decision: str, reason: str) -> dict:
             bucket_name="Not evaluated",
             requested_cost=_item_cost(item),
         )
-        for item in _items(pa)
+        for item in current_items
     ]
-    return _summarize_item_utilization(item_decisions, reason)
+    result = _summarize_item_utilization(item_decisions, reason)
+    result["aman_prior_context"] = _aman_prior_context(pa, current_items)
+    return result
 
 
 def _build_final_decision_from_items(pa: dict, agent1: dict, agent2: dict, agent3: dict) -> dict:
@@ -977,6 +1139,12 @@ def _build_final_decision_from_items(pa: dict, agent1: dict, agent2: dict, agent
         denial_reason = agent1.get("reason")
         escalation_reason = None
         reasoning = agent1.get("reason") or "Member failed eligibility checks."
+    elif not item_decisions:
+        decision = "ESCALATE"
+        confidence = "LOW"
+        denial_reason = None
+        escalation_reason = "No current pending submitted line items were available for advisory decisioning."
+        reasoning = "No current pending line items were available to advise on."
     elif escalated:
         decision = "ESCALATE"
         confidence = "MEDIUM"
@@ -1027,6 +1195,7 @@ def _build_final_decision_from_items(pa: dict, agent1: dict, agent2: dict, agent
             "denied_amount": agent3.get("denied_amount"),
             "escalated_amount": agent3.get("escalated_amount"),
         },
+        "aman_prior_context": agent3.get("aman_prior_context") or {},
     }
 
 
@@ -1106,6 +1275,7 @@ async def run(patient_id: str, request_id: str):
         return
 
     pa = _parse_json_field(row["extracted_fields"])
+    decision_pa = _pa_with_items(pa, _current_submission_items(pa))
 
     try:
         # ── Agent 1: Eligibility ──────────────────────────────────────────
@@ -1118,7 +1288,7 @@ async def run(patient_id: str, request_id: str):
 
         if not result_1.get("pass"):
             result_3 = _global_item_decisions(pa, "DENY", result_1.get("reason") or "Failed eligibility check")
-            final_result = _build_final_decision_from_items(pa, result_1, {"pass": None}, result_3)
+            final_result = _build_final_decision_from_items(decision_pa, result_1, {"pass": None}, result_3)
             await _log_agent(request_id, 3, "Item Utilization & Limits", result_3)
             await _log_agent(request_id, 4, "Final Decision", final_result)
             await _save_decision(request_id, final_result.get("decision", "DENY"), {
@@ -1133,7 +1303,7 @@ async def run(patient_id: str, request_id: str):
         if result_1.get("is_platinum_plus"):
             logger.info(f"[Agent] Platinum Plus express — auto-approving request_id={request_id}")
             result_3 = _global_item_decisions(pa, "APPROVE", "Platinum Plus express card — no pre-authorization required.")
-            final_result = _build_final_decision_from_items(pa, result_1, {"pass": True}, result_3)
+            final_result = _build_final_decision_from_items(decision_pa, result_1, {"pass": True}, result_3)
             final_result["flags"] = ["platinum_plus_express_card"]
             final_result["no_preauth_required"] = True
             await _log_agent(request_id, 3, "Item Utilization & Limits", result_3)
@@ -1151,7 +1321,7 @@ async def run(patient_id: str, request_id: str):
             str(request_id)
         )
         try:
-            result_2 = await agent_plan_coverage(pa)
+            result_2 = await agent_plan_coverage(decision_pa)
         except AgentJSONParseError as e:
             logger.warning(
                 "[Agent] Agent 2 JSON parse failed request_id=%s raw=%s",
@@ -1175,7 +1345,7 @@ async def run(patient_id: str, request_id: str):
                         "waiting_period_issue": False,
                         "plan_restriction": False,
                     }
-                    for item in _items(pa)
+                    for item in _items(decision_pa)
                 ],
                 "exclusion_triggered": False,
                 "exclusion_detail": None,
@@ -1202,7 +1372,7 @@ async def run(patient_id: str, request_id: str):
             "UPDATE preauth_logs SET agent_step = 'decision' WHERE request_id = $1",
             str(request_id)
         )
-        result_4 = _build_final_decision_from_items(pa, result_1, result_2, result_3)
+        result_4 = _build_final_decision_from_items(decision_pa, result_1, result_2, result_3)
         await _log_agent(request_id, 4, "Final Decision", result_4)
 
         await _save_decision(request_id, result_4.get("decision", "ESCALATE"), {

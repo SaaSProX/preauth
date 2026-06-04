@@ -371,6 +371,7 @@ def extract_preauth_fields(payload: dict):
         ]) or build_aman_utilization(payload),
         "items": items,
         "requested_items": items,
+        "items_added": get_nested(payload, "submission.items_added") or [],
         "total_requested_cost": total_requested_cost,
         "event_type": payload.get("event_type"),
         "event_id": payload.get("event_id"),

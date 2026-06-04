@@ -73,20 +73,101 @@ def _item_status(item: dict) -> str:
         return "unknown"
 
 
+def _number(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _item_cost(item: dict) -> float:
+    amount = _number(item.get("requested_cost")) or _number(item.get("estimated_cost")) or _number(item.get("cost")) or _number(item.get("amount"))
+    if amount is not None:
+        return amount
+    unit_cost = _number(item.get("unit_cost"))
+    quantity = _number(item.get("quantity")) or 1
+    return float(unit_cost * quantity) if unit_cost is not None else 0.0
+
+
+def _close_amount(left, right, tolerance: float = 1.0) -> bool:
+    left_num = _number(left)
+    right_num = _number(right)
+    if left_num is None or right_num is None:
+        return False
+    return abs(left_num - right_num) <= tolerance
+
+
+def _same_quantity(left, right) -> bool:
+    left_num = _number(left)
+    right_num = _number(right)
+    if left_num is None or right_num is None:
+        return True
+    return abs(left_num - right_num) < 0.01
+
+
 def _pending_claim_ids(raw_payload) -> set[str] | None:
     raw = _coerce_dict(raw_payload)
     items = raw.get("pa_items")
     if not isinstance(items, list):
         return None
-    return {
-        str(item.get("claim_item_id"))
+    pending = [
+        item
         for item in items
         if (
             isinstance(item, dict)
             and item.get("claim_item_id") is not None
             and _item_status(item) == "pending"
         )
-    }
+    ]
+    added = raw.get("submission", {}).get("items_added") if isinstance(raw.get("submission"), dict) else None
+    if not isinstance(added, list) or not added:
+        return {str(item.get("claim_item_id")) for item in pending}
+
+    matched = []
+    used_indexes: set[int] = set()
+
+    def add_match(index: int):
+        if index in used_indexes:
+            return
+        used_indexes.add(index)
+        matched.append(pending[index])
+
+    for added_item in [item for item in added if isinstance(item, dict)]:
+        added_id = added_item.get("id")
+        added_ref = str(added_item.get("item_ref") or "").lower()
+        for index, item in enumerate(pending):
+            if index in used_indexes:
+                continue
+            if (
+                added_id is not None
+                and item.get("facility_tariff_item_id") is not None
+                and str(item.get("facility_tariff_item_id")) == str(added_id)
+            ):
+                add_match(index)
+                break
+            if (
+                added_id is not None
+                and "claim_item" in added_ref
+                and str(item.get("claim_item_id")) == str(added_id)
+            ):
+                add_match(index)
+                break
+
+    for added_item in [item for item in added if isinstance(item, dict)]:
+        for index, item in enumerate(pending):
+            if index in used_indexes:
+                continue
+            if added_item.get("category_id") is not None and item.get("category_id") is not None:
+                if str(added_item.get("category_id")) != str(item.get("category_id")):
+                    continue
+            if not _same_quantity(added_item.get("quantity"), item.get("quantity")):
+                continue
+            if not _close_amount(added_item.get("requested_cost"), _item_cost(item)):
+                continue
+            add_match(index)
+            break
+
+    return {str(item.get("claim_item_id")) for item in (matched or pending)}
 
 
 def _line_decisions(raw_payload, agent_result):
