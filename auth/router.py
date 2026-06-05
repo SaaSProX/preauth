@@ -3169,12 +3169,13 @@ async def me(claims: dict = Depends(verify_session_token)):
 class AddPACommentPayload(BaseModel):
     request_id: str
     comment_text: str
+    org_id: int | None = None
 
 
 @router.post("/pa-comments")
 async def add_pa_comment(payload: AddPACommentPayload, claims: dict = Depends(verify_session_token)):
     """Add a comment/feedback to a pre-auth request."""
-    org_id = _dashboard_org_id(claims)
+    org_id = await _resolve_read_org_id(claims, payload.org_id)
     request_id = payload.request_id.strip()
     comment_text = payload.comment_text.strip()
 
@@ -3215,6 +3216,7 @@ async def add_pa_comment(payload: AddPACommentPayload, claims: dict = Depends(ve
 
     return {
         "id": row["id"],
+        "org_id": org_id,
         "request_id": request_id,
         "user_name": user["name"] if user else None,
         "user_email": user["email"] if user else claims.get("email"),
@@ -3223,8 +3225,8 @@ async def add_pa_comment(payload: AddPACommentPayload, claims: dict = Depends(ve
     }
 
 
-async def _list_pa_comments_response(request_id: str, claims: dict):
-    org_id = _dashboard_org_id(claims)
+async def _list_pa_comments_response(request_id: str, claims: dict, org_id: int | None = None):
+    org_id = await _resolve_read_org_id(claims, org_id)
     request_id = request_id.strip()
     if not request_id:
         raise HTTPException(status_code=400, detail="request_id is required")
@@ -3257,12 +3259,20 @@ async def _list_pa_comments_response(request_id: str, claims: dict):
 
 
 @router.get("/pa-comments")
-async def list_pa_comments_by_query(request_id: str, claims: dict = Depends(verify_session_token)):
+async def list_pa_comments_by_query(
+    request_id: str,
+    org_id: int | None = None,
+    claims: dict = Depends(verify_session_token),
+):
     """List all comments for a pre-auth request."""
-    return await _list_pa_comments_response(request_id, claims)
+    return await _list_pa_comments_response(request_id, claims, org_id)
 
 
 @router.get("/pa-comments/{request_id:path}")
-async def list_pa_comments(request_id: str, claims: dict = Depends(verify_session_token)):
+async def list_pa_comments(
+    request_id: str,
+    org_id: int | None = None,
+    claims: dict = Depends(verify_session_token),
+):
     """List all comments for a pre-auth request."""
-    return await _list_pa_comments_response(request_id, claims)
+    return await _list_pa_comments_response(request_id, claims, org_id)
