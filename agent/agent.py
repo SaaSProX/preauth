@@ -487,7 +487,11 @@ def _current_submission_items(pa: dict) -> list[dict]:
                 break
 
     for added_item in added:
-        for index, item in enumerate(pending):
+        # AMAN appends newly-added pa_items after existing lines in the
+        # snapshot. If direct IDs are missing and two pending lines look
+        # identical, prefer the latest matching line.
+        for index in reversed(range(len(pending))):
+            item = pending[index]
             if index in used_indexes:
                 continue
             if added_item.get("category_id") is not None and item.get("category_id") is not None:

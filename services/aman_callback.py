@@ -154,7 +154,11 @@ def _pending_claim_ids(raw_payload) -> set[str] | None:
                 break
 
     for added_item in [item for item in added if isinstance(item, dict)]:
-        for index, item in enumerate(pending):
+        # AMAN appends new pa_items after earlier lines. When direct IDs are
+        # unavailable, duplicate drugs can share category/quantity/amount; the
+        # newest matching pending line is the current submission.
+        for index in reversed(range(len(pending))):
+            item = pending[index]
             if index in used_indexes:
                 continue
             if added_item.get("category_id") is not None and item.get("category_id") is not None:
