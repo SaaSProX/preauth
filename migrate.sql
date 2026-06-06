@@ -70,6 +70,16 @@ ALTER TABLE preauth_logs ADD COLUMN IF NOT EXISTS callback_status TEXT;
 ALTER TABLE preauth_logs ADD COLUMN IF NOT EXISTS callback_http_status INT;
 ALTER TABLE preauth_logs ADD COLUMN IF NOT EXISTS callback_sent_at TIMESTAMPTZ;
 ALTER TABLE preauth_logs ADD COLUMN IF NOT EXISTS callback_error TEXT;
+-- Mode the agent was operating in when we wrote back to AMAN. Optional cache
+-- for the Accuracy Dashboard mode toggle (All / Advisory / Applied). Falls
+-- back to 'advisory' when NULL, matching the live default.
+ALTER TABLE preauth_logs ADD COLUMN IF NOT EXISTS callback_mode TEXT;
+-- NOTE: AMAN's per-item decisions are NOT stored as columns here. They live
+-- in preauth_events.raw_payload.pa_items[].status (0=pending, 1=approved,
+-- 2=queried, 3=rejected), confirmed by Sakeenah (AMAN) on 2026-06-01. The
+-- Accuracy Dashboard reads them directly via the latest event per checkin
+-- (see /auth/qa/accuracy in auth/router.py). No ingestion endpoint is
+-- needed — the data already arrives on every pa.submitted webhook.
 -- Standardize received_at to a timezone-aware type so latency math is honest
 -- (matches processed_at and agent_logs.logged_at, both TIMESTAMPTZ). The
 -- AT TIME ZONE clause interprets existing naive values as UTC; operators
@@ -283,6 +293,12 @@ CREATE INDEX IF NOT EXISTS idx_preauth_logs_status ON preauth_logs(status);
 CREATE INDEX IF NOT EXISTS idx_preauth_logs_org_id ON preauth_logs(org_id);
 CREATE INDEX IF NOT EXISTS idx_preauth_logs_received_at ON preauth_logs(received_at DESC);
 CREATE INDEX IF NOT EXISTS idx_preauth_logs_processed_at ON preauth_logs(processed_at DESC);
+-- Indices on the AMAN-final columns so the Accuracy Dashboard's per-mode
+-- aggregates (matched / mismatched / pending / scored) stay snappy as the
+-- table grows.
+CREATE INDEX IF NOT EXISTS idx_preauth_logs_aman_decision ON preauth_logs(aman_decision);
+CREATE INDEX IF NOT EXISTS idx_preauth_logs_aman_finalized_at ON preauth_logs(aman_finalized_at DESC);
+CREATE INDEX IF NOT EXISTS idx_preauth_logs_callback_mode ON preauth_logs(callback_mode);
 CREATE INDEX IF NOT EXISTS idx_preauth_events_org_id ON preauth_events(org_id);
 CREATE INDEX IF NOT EXISTS idx_preauth_events_preauth_log_id ON preauth_events(preauth_log_id);
 CREATE INDEX IF NOT EXISTS idx_preauth_events_event_id ON preauth_events(event_id);

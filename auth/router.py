@@ -1728,6 +1728,471 @@ async def _enqueue_preauth_retry(background: BackgroundTasks, row) -> None:
     background.add_task(agent.run, str(row["patient_id"]), str(row["request_id"]))
 
 
+def _qa_norm_dec(value: str | None) -> str | None:
+    """APPROVE / DENY / None — normalise messy AMAN/agent decision strings.
+
+    ESCALATE counts as "no firm verdict" → None, which classifies as
+    agent_skipped per the SAA-52 spec.
+    """
+    if not value:
+        return None
+    v = str(value).strip().upper()
+    if v in ("APPROVE", "APPROVED"):
+        return "APPROVE"
+    if v in ("DENY", "DENIED", "REJECT", "REJECTED"):
+        return "DENY"
+    return None
+
+
+def _qa_aman_from_items(pa_items: list[dict]) -> tuple[str | None, float, dict]:
+    """Derive AMAN's final decision + amount from a pa_items[] snapshot.
+
+    Returns (decision, approved_amount, counts) where counts breaks down
+    pending/approved/queried/rejected so the UI can show partials honestly.
+
+    Decision rule (mirrors how AMAN's reviewers actually finalize a PA):
+      * Any item still 'pending' AND no approved/rejected acted on yet
+            → None (still under AMAN review)
+      * Any item approved (and the rest are non-pending)
+            → APPROVE — even if some lines were rejected, AMAN paid SOMETHING.
+              We keep the partials visible in `counts` so the drawer renders
+              them per-line; the value flow uses approved_amount only.
+      * All non-pending items rejected
+            → DENY
+    """
+    # Lazy import to avoid a circular dep at module load time.
+    from agent.agent import _item_status, _item_approved_cost
+
+    counts = {"pending": 0, "approved": 0, "queried": 0, "rejected": 0, "unknown": 0}
+    approved_amount = 0.0
+    for item in (pa_items or []):
+        s = _item_status(item)
+        counts[s] = counts.get(s, 0) + 1
+        if s == "approved":
+            approved_amount += _item_approved_cost(item) or 0
+
+    total_acted = counts["approved"] + counts["rejected"]
+    if counts["pending"] > 0 and total_acted == 0:
+        return (None, 0.0, counts)
+    if counts["approved"] > 0:
+        return ("APPROVE", float(approved_amount), counts)
+    if counts["rejected"] > 0 and counts["approved"] == 0:
+        return ("DENY", 0.0, counts)
+    # All queried, or no items at all — treat as pending (AMAN hasn't acted).
+    return (None, 0.0, counts)
+
+
+def _qa_aman_per_item(pa_items: list[dict]) -> list[dict]:
+    """Per-line shape for the drawer comparison panel."""
+    from agent.agent import _item_status, _item_approved_cost, _item_cost
+
+    out = []
+    for item in (pa_items or []):
+        name = (
+            item.get("item_name")
+            or item.get("name")
+            or item.get("description")
+            or "(unnamed item)"
+        )
+        out.append({
+            "claim_item_id": item.get("claim_item_id") or item.get("id"),
+            "name": str(name),
+            "quantity": item.get("quantity"),
+            "status": _item_status(item),            # pending / approved / queried / rejected
+            "requested_cost": float(_item_cost(item) or 0),
+            "approved_cost": float(_item_approved_cost(item) or 0) if _item_status(item) == "approved" else 0.0,
+        })
+    return out
+
+
+def _qa_classify(agent: str | None, aman: str | None,
+                 agent_amount: float, aman_amount: float,
+                 tol: float, require_amount: bool,
+                 aman_counts: dict | None = None) -> tuple[str, str | None]:
+    """Bucket + (if mismatched) category.
+
+    See the SAA-52 handoff for the exact rule. ESCALATE / None on either side
+    routes to agent_skipped / pending_aman.
+    """
+    if agent is None:
+        return ("agent_skipped", None)
+    if aman is None:
+        return ("pending_aman", None)
+    if agent != aman:
+        # Direction tells us who overruled whom; this is more useful than a
+        # generic "coverage" label when we don't know AMAN's reason.
+        if agent == "DENY" and aman == "APPROVE":
+            return ("mismatched", "aman_over")
+        if agent == "APPROVE" and aman == "DENY":
+            return ("mismatched", "agent_over")
+        return ("mismatched", "coverage")
+    # Same decision. For APPROVE pairs, also check amount agreement —
+    # this surfaces partial approvals (AMAN approved only some line items) as
+    # amount mismatches.
+    if agent == "APPROVE" and require_amount:
+        base = float(agent_amount or 0)
+        amt = float(aman_amount or 0)
+        if base > 0:
+            delta = abs(amt - base) / base
+            if delta > tol:
+                # If AMAN rejected SOME lines but kept others, the right label
+                # is "limits" (they capped utilization), not raw "amount".
+                if aman_counts and aman_counts.get("rejected", 0) > 0:
+                    return ("mismatched", "limits")
+                return ("mismatched", "amount")
+        elif amt > 0:
+            return ("mismatched", "amount")
+    return ("matched", None)
+
+
+def _qa_percentile(values: list[float], p: int) -> float | None:
+    if not values:
+        return None
+    s = sorted(values)
+    k = max(0, min(len(s) - 1, int(round((p / 100.0) * (len(s) - 1)))))
+    return float(s[k])
+
+
+@router.get("/qa/accuracy")
+async def qa_accuracy(
+    date_from: date | None = None,
+    date_to: date | None = None,
+    org_id: int | None = None,
+    tolerance: float = 0.05,
+    require_amount_match: bool = True,
+    record_limit: int = 200,
+    claims: dict = Depends(verify_session_token),
+):
+    """Agent-vs-AMAN accuracy dashboard (SAA-52).
+
+    Single read-only endpoint. Returns:
+      - window (from/to/label)
+      - params (tolerance, require_amount_match)
+      - aggregates per mode (all / advisory / applied):
+          total, scored, matched, mismatched, pending_aman, agent_skipped,
+          decision_match, amount_match, value{}, latency{}, categories[]
+      - records (enriched PA list, mismatches first then most-recent)
+
+    Where AMAN's finals come from:
+        AMAN sends the full check-in snapshot on every webhook event. Each
+        line in `pa_items[]` carries a status — 0=pending, 1=approved,
+        2=queried, 3=rejected — confirmed by Sakeenah (AMAN) on 2026-06-01.
+        We join each preauth_log to its LATEST preauth_event for the same
+        request_id and derive AMAN's verdict from those statuses. No new
+        columns required, no separate ingestion endpoint.
+
+    Multi-tenant via JWT org_id. Platform admins can pass ?org_id= to drill
+    into a client org (same convention as /preauth-dashboard).
+    """
+    if org_id is not None:
+        if not await is_platform_admin(claims):
+            raise HTTPException(status_code=403, detail="Only platform admins (SaaSPro org) can view another org's data")
+    else:
+        org_id = _dashboard_org_id(claims)
+
+    # Default to last 7 days when no window is given.
+    today = datetime.now(timezone.utc).date()
+    if date_to is None:
+        date_to = today
+    if date_from is None:
+        date_from = date_to - timedelta(days=6)
+    if date_from > date_to:
+        raise HTTPException(status_code=400, detail="Start date cannot be after end date")
+
+    tol = max(0.0, min(1.0, float(tolerance)))
+    date_from_start = datetime.combine(date_from, time.min)
+    date_to_end = datetime.combine(date_to + timedelta(days=1), time.min)
+    record_limit = min(max(int(record_limit), 1), 500)
+
+    # One row per PA, joined to its latest preauth_event so we have AMAN's
+    # current pa_items snapshot in `aman_items`. `aman_event_at` is when AMAN
+    # last touched this checkin — used as the upper bound on AMAN review time.
+    rows = await pg_query_all(
+        """
+        SELECT
+            p.request_id,
+            p.patient_id,
+            p.status,
+            p.received_at,
+            p.processed_at,
+            p.callback_mode,
+            p.callback_status,
+            p.callback_sent_at,
+            p.decision           AS decision_raw,
+            COALESCE(p.extracted_fields->>'plan',
+                     p.raw_payload->'policy'->>'plan_name',
+                     p.raw_payload->'policy'->>'insurance_package') AS plan,
+            COALESCE(p.extracted_fields->>'patient_name',
+                     p.raw_payload->'patient'->>'name')             AS patient_name,
+            COALESCE(p.extracted_fields->>'insurance_no',
+                     p.raw_payload->'policy'->>'insurance_no')      AS insurance_no,
+            COALESCE(p.extracted_fields->>'facility_name',
+                     p.raw_payload->'facility'->>'name')            AS facility,
+            COALESCE(p.extracted_fields->>'diagnosis',
+                     p.raw_payload->>'diagnosis')                   AS diagnosis,
+            p.extracted_fields->'items'                             AS agent_items,
+            p.agent_result                                          AS agent_result,
+            (CASE
+                WHEN (p.extracted_fields->>'total_requested_cost') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                THEN (p.extracted_fields->>'total_requested_cost')::numeric
+                ELSE NULL
+             END)                                                   AS requested_amount,
+            (CASE
+                WHEN (p.agent_result->>'amount_approved') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                THEN (p.agent_result->>'amount_approved')::numeric
+                ELSE 0
+             END)                                                   AS agent_amount,
+            EXTRACT(EPOCH FROM (p.processed_at - p.received_at))::float AS agent_latency_s,
+            ev.raw_payload->'pa_items'                              AS aman_items,
+            COALESCE(ev.occurred_at, ev.last_seen_at, ev.created_at) AS aman_event_at
+        FROM preauth_logs p
+        LEFT JOIN LATERAL (
+            SELECT raw_payload, occurred_at, last_seen_at, created_at
+            FROM preauth_events e
+            WHERE e.request_id = p.request_id
+              AND e.org_id = p.org_id
+            ORDER BY COALESCE(e.occurred_at, e.last_seen_at, e.created_at) DESC,
+                     e.event_sequence DESC
+            LIMIT 1
+        ) ev ON TRUE
+        WHERE p.org_id = $1
+          AND p.received_at >= $2::timestamp
+          AND p.received_at < $3::timestamp
+        ORDER BY p.received_at DESC
+        """,
+        org_id, date_from_start, date_to_end,
+    )
+
+    def _maybe_load(value):
+        """JSONB columns come back from asyncpg as strings — coerce to py types.
+        Already-list / already-dict / None pass through untouched.
+        """
+        if value is None or isinstance(value, (list, dict)):
+            return value
+        if isinstance(value, (bytes, bytearray)):
+            value = value.decode("utf-8")
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except ValueError:
+                return None
+        return value
+
+    enriched: list[dict] = []
+    for r in rows:
+        agent = _qa_norm_dec(r.get("decision_raw"))
+        agent_amount = float(r.get("agent_amount") or 0)
+        agent_lat_s = r.get("agent_latency_s")
+
+        aman_items_raw = _maybe_load(r.get("aman_items")) or []
+        aman_items_list = aman_items_raw if isinstance(aman_items_raw, list) else []
+        aman, aman_amount, aman_counts = _qa_aman_from_items(aman_items_list)
+
+        # AMAN review window = our callback to AMAN's most-recent event on this PA.
+        # If we never sent a callback (advisory mode never wrote, applied was off),
+        # fall back to received_at → AMAN's event so we don't lose the signal.
+        aman_event_at = r.get("aman_event_at")
+        callback_sent_at = r.get("callback_sent_at")
+        aman_review_min = None
+        if aman is not None and aman_event_at is not None:
+            anchor = callback_sent_at or r.get("received_at")
+            if anchor and aman_event_at > anchor:
+                aman_review_min = (aman_event_at - anchor).total_seconds() / 60.0
+
+        bucket, category = _qa_classify(
+            agent, aman, agent_amount, aman_amount,
+            tol, bool(require_amount_match), aman_counts,
+        )
+
+        total_end_to_end_min = (
+            (aman_review_min + (agent_lat_s or 0) / 60.0)
+            if aman_review_min is not None else None
+        )
+
+        # Per-item comparison: agent's verdict per line (covered/denied) paired
+        # with AMAN's status on the same line. We match by claim_item_id where
+        # possible, by index as a fallback.
+        agent_items_raw = _maybe_load(r.get("agent_items")) or []
+        if not isinstance(agent_items_raw, list):
+            agent_items_raw = []
+        agent_result_obj = _maybe_load(r.get("agent_result")) or {}
+        if not isinstance(agent_result_obj, dict):
+            agent_result_obj = {}
+        agent_item_decisions = agent_result_obj.get("item_decisions") if isinstance(agent_result_obj.get("item_decisions"), list) else []
+
+        aman_items = _qa_aman_per_item(aman_items_list)
+
+        # Build the per-line compare: union of agent_item_decisions + AMAN items.
+        # We match by claim_item_id (the stable ID on both sides). When an item
+        # exists on one side only, we still render it — the missing column just
+        # reads "—" in the drawer.
+        agent_by_id: dict[str, dict] = {}
+        for d in agent_item_decisions:
+            cid = d.get("claim_item_id") or d.get("id")
+            if cid is not None:
+                agent_by_id[str(cid)] = d
+        aman_by_id: dict[str, dict] = {}
+        for d in aman_items:
+            cid = d.get("claim_item_id")
+            if cid is not None:
+                aman_by_id[str(cid)] = d
+
+        # Preserve insertion order: agent decisions first, then AMAN-only items.
+        ordered_ids: list[str] = []
+        for d in agent_item_decisions:
+            cid = str(d.get("claim_item_id") or d.get("id") or "")
+            if cid and cid not in ordered_ids:
+                ordered_ids.append(cid)
+        for d in aman_items:
+            cid = str(d.get("claim_item_id") or "")
+            if cid and cid not in ordered_ids:
+                ordered_ids.append(cid)
+
+        item_compare = []
+        for cid in ordered_ids:
+            ag = agent_by_id.get(cid) or {}
+            am = aman_by_id.get(cid) or {}
+            item_compare.append({
+                "claim_item_id": ag.get("claim_item_id") or ag.get("id") or am.get("claim_item_id"),
+                "name": ag.get("name") or ag.get("item_name") or am.get("name") or "(unnamed item)",
+                "quantity": ag.get("quantity") or am.get("quantity"),
+                "agent_decision": _qa_norm_dec(ag.get("decision")) if ag else None,
+                "agent_requested_cost": float(ag.get("requested_cost") or am.get("requested_cost") or 0),
+                "agent_recommended_cost": float(ag.get("recommended_approved_cost") or 0),
+                "agent_reason": ag.get("reason"),
+                "aman_status": am.get("status"),                    # pending/approved/queried/rejected/None
+                "aman_approved_cost": float(am.get("approved_cost") or 0),
+            })
+
+        items_for_card = agent_items_raw or aman_items_list
+        enriched.append({
+            "request_id": r["request_id"],
+            "display_request_id": r["request_id"],
+            "patient_id": r["patient_id"],
+            "patient_name": r.get("patient_name"),
+            "insurance_no": r.get("insurance_no"),
+            "plan": r.get("plan"),
+            "item_description": (items_for_card[0] or {}).get("name") or (items_for_card[0] or {}).get("item_name") if items_for_card else None,
+            "line_item_count": len(items_for_card) if items_for_card else 0,
+            "diagnosis": r.get("diagnosis"),
+            "facility": r.get("facility"),
+            "requested_amount": float(r["requested_amount"] or 0) if r.get("requested_amount") is not None else None,
+            "received_at": r["received_at"].isoformat() if r.get("received_at") else None,
+            "callback_mode": (r.get("callback_mode") or "advisory"),
+            "callback_status": r.get("callback_status"),
+            "callback_sent_at": callback_sent_at.isoformat() if callback_sent_at else None,
+            "agent_decision": agent,
+            "agent_amount": agent_amount,
+            "agent_reason": (r.get("agent_result") or {}).get("reason") if isinstance(r.get("agent_result"), dict) else None,
+            "agent_latency_s": float(agent_lat_s) if agent_lat_s is not None else None,
+            "aman_decision": aman,
+            "aman_amount": float(aman_amount),
+            "aman_review_min": float(aman_review_min) if aman_review_min is not None else None,
+            "aman_finalized_at": aman_event_at.isoformat() if aman is not None and aman_event_at is not None else None,
+            "aman_item_counts": aman_counts,
+            "bucket": bucket,
+            "mismatch_category": category,
+            "total_end_to_end_min": total_end_to_end_min,
+            "items_compare": item_compare,
+            "aman_items": aman_items,
+        })
+
+    def _aggregate(subset: list[dict], label: str) -> dict:
+        total = len(subset)
+        scored_rows = [r for r in subset if r["bucket"] in ("matched", "mismatched")]
+        scored = len(scored_rows)
+        matched = sum(1 for r in subset if r["bucket"] == "matched")
+        mismatched = sum(1 for r in subset if r["bucket"] == "mismatched")
+        pending = sum(1 for r in subset if r["bucket"] == "pending_aman")
+        skipped = sum(1 for r in subset if r["bucket"] == "agent_skipped")
+        decision_match = sum(
+            1 for r in subset
+            if r["agent_decision"] and r["aman_decision"] and r["agent_decision"] == r["aman_decision"]
+        )
+        amount_match = matched
+
+        requested = sum(r["requested_amount"] or 0 for r in scored_rows)
+        agent_approved = sum(r["agent_amount"] or 0 for r in scored_rows if r["agent_decision"] == "APPROVE")
+        aman_approved = sum(r["aman_amount"] or 0 for r in scored_rows if r["aman_decision"] == "APPROVE")
+        rejected = sum(r["requested_amount"] or 0 for r in scored_rows if r["aman_decision"] == "DENY")
+        overturned = sum(
+            r["aman_amount"] or 0 for r in scored_rows
+            if r["agent_decision"] == "DENY" and r["aman_decision"] == "APPROVE"
+        )
+
+        agent_latencies = [r["agent_latency_s"] for r in subset if r["agent_latency_s"] is not None]
+        aman_latencies = [r["aman_review_min"] for r in subset if r["aman_review_min"] is not None]
+        latency = {
+            "agent_s": (sum(agent_latencies) / len(agent_latencies)) if agent_latencies else None,
+            "agent_p50": _qa_percentile(agent_latencies, 50),
+            "agent_p95": _qa_percentile(agent_latencies, 95),
+            "aman_min": (sum(aman_latencies) / len(aman_latencies)) if aman_latencies else None,
+            "aman_p50": _qa_percentile(aman_latencies, 50),
+            "aman_p95": _qa_percentile(aman_latencies, 95),
+        }
+
+        category_keys = ["coverage", "amount", "aman_over", "limits", "agent_over", "eligibility"]
+        counts = {k: 0 for k in category_keys}
+        for r in subset:
+            if r["bucket"] == "mismatched":
+                k = r["mismatch_category"] or "coverage"
+                counts[k] = counts.get(k, 0) + 1
+        categories = [{"key": k, "v": counts.get(k, 0)} for k in category_keys]
+
+        return {
+            "label": label,
+            "total": total, "scored": scored,
+            "matched": matched, "mismatched": mismatched,
+            "pending_aman": pending, "agent_skipped": skipped,
+            "decision_match": decision_match,
+            "amount_match": amount_match,
+            "value": {
+                "requested": float(requested),
+                "agent_approved": float(agent_approved),
+                "aman_approved": float(aman_approved),
+                "rejected": float(rejected),
+                "overturned_denials": float(overturned),
+            },
+            "latency": latency,
+            "categories": categories,
+        }
+
+    advisory_rows = [r for r in enriched if (r.get("callback_mode") or "advisory") == "advisory"]
+    applied_rows = [r for r in enriched if r.get("callback_mode") == "applied"]
+    aggregates = {
+        "all": _aggregate(enriched, "All modes"),
+        "advisory": _aggregate(advisory_rows, "Advisory mode"),
+        "applied": _aggregate(applied_rows, "Applied mode"),
+    }
+
+    # Records sample: mismatches first (so the drilldown's "Only mismatches"
+    # view is full), then pending, then everything else by recency. Capped at
+    # record_limit so the payload stays bounded.
+    def _rank(b: str) -> int:
+        return 0 if b == "mismatched" else 1 if b == "pending_aman" else 2
+
+    def _ts(iso: str | None) -> int:
+        if not iso:
+            return 0
+        digits = "".join(ch for ch in iso if ch.isdigit())[:14]
+        return int(digits) if digits else 0
+
+    enriched_sorted = sorted(enriched, key=lambda r: (_rank(r["bucket"]), -_ts(r["received_at"])))[:record_limit]
+
+    label_from = date_from.strftime("%b %-d") if hasattr(date_from, "strftime") else str(date_from)
+    label_to = date_to.strftime("%b %-d, %Y") if hasattr(date_to, "strftime") else str(date_to)
+    return {
+        "window": {
+            "from": date_from.isoformat(),
+            "to": date_to.isoformat(),
+            "label": f"{label_from} – {label_to}",
+        },
+        "params": {"tolerance": tol, "require_amount_match": bool(require_amount_match)},
+        "aggregates": aggregates,
+        "records": enriched_sorted,
+    }
+
+
 @router.post("/preauth/retry")
 async def retry_preauth(payload: RetryPreauthPayload, background: BackgroundTasks, claims: dict = Depends(verify_session_token)):
     org_id = await _resolve_mutation_org_id(claims, payload.org_id)
