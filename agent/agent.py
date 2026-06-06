@@ -275,20 +275,61 @@ PLAN_LIMITS = {
     },
 }
 
+# ---------------------------------------------------------------------------
+# AMAN FIELD MAPPINGS — Confirmed by AMAN (Sakeenah) on 2026-06-01
+# ---------------------------------------------------------------------------
+# enrollee.status / policy.policy_status: 1 = active, 0 = inactive
+# pa_items.status: 0 = pending, 1 = approved, 2 = queried, 3 = rejected
+# Empty consumption limits: treat as "limit not configured"
+
+# encounter.care_type mappings (confirmed by AMAN 2026-06-01)
 CARE_TYPE_BUCKETS = {
     1: ("inpatient", "Inpatient Limit"),
     2: ("outpatient", "Outpatient Limit"),
     3: ("maternity", "Antenatal/Maternity"),
     4: ("dental", "Dental Care Limit"),
     5: ("optical_total", "Optical Total Limit"),
-    6: ("outpatient", "Outpatient Limit"),
+    6: ("outpatient", "Telemedicine (Outpatient)"),
     7: ("wellness", "Wellness"),
 }
 
+# pa_items.category_id mappings (confirmed by AMAN 2026-06-01)
+# 1 = Drugs and consumables
+# 2 = Services and procedures
+# 3 = Laboratory investigations
+# 4 = Radiological investigations
+# 5 = Dental care
+# 6 = Optical care
+# 7 = Immunization and vaccine
+# 8 = Wellness
 CATEGORY_BUCKET_OVERRIDES = {
     5: ("dental", "Dental Care Limit"),
     6: ("optical_total", "Optical Total Limit"),
+    7: ("immunization", "Immunization"),
     8: ("wellness", "Wellness"),
+}
+
+# Category labels for display/logging
+CATEGORY_LABELS = {
+    1: "Drugs and consumables",
+    2: "Services and procedures",
+    3: "Laboratory investigations",
+    4: "Radiological investigations",
+    5: "Dental care",
+    6: "Optical care",
+    7: "Immunization and vaccine",
+    8: "Wellness",
+}
+
+# Care type labels for display/logging
+CARE_TYPE_LABELS = {
+    1: "Inpatient",
+    2: "Outpatient",
+    3: "Antenatal",
+    4: "Dental Care",
+    5: "Optical care",
+    6: "Telemedicine",
+    7: "Wellness",
 }
 
 
