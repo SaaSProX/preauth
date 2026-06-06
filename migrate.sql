@@ -293,11 +293,10 @@ CREATE INDEX IF NOT EXISTS idx_preauth_logs_status ON preauth_logs(status);
 CREATE INDEX IF NOT EXISTS idx_preauth_logs_org_id ON preauth_logs(org_id);
 CREATE INDEX IF NOT EXISTS idx_preauth_logs_received_at ON preauth_logs(received_at DESC);
 CREATE INDEX IF NOT EXISTS idx_preauth_logs_processed_at ON preauth_logs(processed_at DESC);
--- Indices on the AMAN-final columns so the Accuracy Dashboard's per-mode
--- aggregates (matched / mismatched / pending / scored) stay snappy as the
--- table grows.
-CREATE INDEX IF NOT EXISTS idx_preauth_logs_aman_decision ON preauth_logs(aman_decision);
-CREATE INDEX IF NOT EXISTS idx_preauth_logs_aman_finalized_at ON preauth_logs(aman_finalized_at DESC);
+-- Index on callback_mode so the Accuracy Dashboard's per-mode aggregates
+-- (all / advisory / applied) stay snappy as preauth_logs grows. AMAN's
+-- finals are read from preauth_events.raw_payload.pa_items[].status, not
+-- from preauth_logs, so no dedicated AMAN index is needed here.
 CREATE INDEX IF NOT EXISTS idx_preauth_logs_callback_mode ON preauth_logs(callback_mode);
 CREATE INDEX IF NOT EXISTS idx_preauth_events_org_id ON preauth_events(org_id);
 CREATE INDEX IF NOT EXISTS idx_preauth_events_preauth_log_id ON preauth_events(preauth_log_id);
