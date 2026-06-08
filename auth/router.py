@@ -1796,6 +1796,7 @@ def _qa_aman_per_item(pa_items: list[dict]) -> list[dict]:
         )
         out.append({
             "claim_item_id": item.get("claim_item_id") or item.get("id"),
+            "facility_tariff_item_id": item.get("facility_tariff_item_id"),
             "name": str(name),
             "quantity": item.get("quantity"),
             "status": _item_status(item),            # pending / approved / queried / rejected
@@ -1943,6 +1944,7 @@ async def qa_accuracy(
                 ELSE 0
              END)                                                   AS agent_amount,
             EXTRACT(EPOCH FROM (p.processed_at - p.received_at))::float AS agent_latency_s,
+            ev.raw_payload                                         AS aman_payload,
             ev.raw_payload->'pa_items'                              AS aman_items,
             COALESCE(ev.occurred_at, ev.last_seen_at, ev.created_at) AS aman_event_at
         FROM preauth_logs p
@@ -1986,7 +1988,48 @@ async def qa_accuracy(
 
         aman_items_raw = _maybe_load(r.get("aman_items")) or []
         aman_items_list = aman_items_raw if isinstance(aman_items_raw, list) else []
-        aman, aman_amount, aman_counts = _qa_aman_from_items(aman_items_list)
+        aman_payload = _maybe_load(r.get("aman_payload")) or {}
+        if not isinstance(aman_payload, dict):
+            aman_payload = {}
+        aman_enrollee = aman_payload.get("enrollee") if isinstance(aman_payload.get("enrollee"), dict) else {}
+        aman_encounter = aman_payload.get("encounter") if isinstance(aman_payload.get("encounter"), dict) else {}
+        aman_policy = aman_payload.get("policy") if isinstance(aman_payload.get("policy"), dict) else {}
+        aman_consumption = aman_payload.get("consumption") if isinstance(aman_payload.get("consumption"), dict) else None
+
+        agent_items_raw = _maybe_load(r.get("agent_items")) or []
+        if not isinstance(agent_items_raw, list):
+            agent_items_raw = []
+        agent_result_obj = _maybe_load(r.get("agent_result")) or {}
+        if not isinstance(agent_result_obj, dict):
+            agent_result_obj = {}
+        agent_item_decisions = agent_result_obj.get("item_decisions") if isinstance(agent_result_obj.get("item_decisions"), list) else []
+
+        agent_claim_ids = {
+            str(d.get("claim_item_id") or d.get("id"))
+            for d in agent_item_decisions
+            if d.get("claim_item_id") is not None or d.get("id") is not None
+        }
+        submission_obj = aman_payload.get("submission") if isinstance(aman_payload.get("submission"), dict) else {}
+        added_facility_ids = {
+            str(item.get("id"))
+            for item in (submission_obj.get("items_added") or [])
+            if isinstance(item, dict) and item.get("id") is not None
+        }
+        if agent_claim_ids:
+            scoped_aman_items_list = [
+                item for item in aman_items_list
+                if str(item.get("claim_item_id") or item.get("id")) in agent_claim_ids
+            ]
+        elif added_facility_ids:
+            scoped_aman_items_list = [
+                item for item in aman_items_list
+                if item.get("facility_tariff_item_id") is not None
+                and str(item.get("facility_tariff_item_id")) in added_facility_ids
+            ]
+        else:
+            scoped_aman_items_list = aman_items_list
+
+        aman, aman_amount, aman_counts = _qa_aman_from_items(scoped_aman_items_list)
 
         # AMAN review window = our callback to AMAN's most-recent event on this PA.
         # If we never sent a callback (advisory mode never wrote, applied was off),
@@ -2009,18 +2052,11 @@ async def qa_accuracy(
             if aman_review_min is not None else None
         )
 
-        # Per-item comparison: agent's verdict per line (covered/denied) paired
-        # with AMAN's status on the same line. We match by claim_item_id where
-        # possible, by index as a fallback.
-        agent_items_raw = _maybe_load(r.get("agent_items")) or []
-        if not isinstance(agent_items_raw, list):
-            agent_items_raw = []
-        agent_result_obj = _maybe_load(r.get("agent_result")) or {}
-        if not isinstance(agent_result_obj, dict):
-            agent_result_obj = {}
-        agent_item_decisions = agent_result_obj.get("item_decisions") if isinstance(agent_result_obj.get("item_decisions"), list) else []
-
-        aman_items = _qa_aman_per_item(aman_items_list)
+        # Per-item comparison is scoped to the lines this agent run handled.
+        # AMAN sends full PA snapshots, so including every pa_items[] row can
+        # drag older approved lines into a newer submission and create fake
+        # amount mismatches.
+        aman_items = _qa_aman_per_item(scoped_aman_items_list)
 
         # Build the per-line compare: union of agent_item_decisions + AMAN items.
         # We match by claim_item_id (the stable ID on both sides). When an item
@@ -2037,7 +2073,7 @@ async def qa_accuracy(
             if cid is not None:
                 aman_by_id[str(cid)] = d
 
-        # Preserve insertion order: agent decisions first, then AMAN-only items.
+        # Preserve insertion order: agent decisions first, then scoped AMAN-only items.
         ordered_ids: list[str] = []
         for d in agent_item_decisions:
             cid = str(d.get("claim_item_id") or d.get("id") or "")
@@ -2064,19 +2100,30 @@ async def qa_accuracy(
                 "aman_approved_cost": float(am.get("approved_cost") or 0),
             })
 
-        items_for_card = agent_items_raw or aman_items_list
+        items_for_card = item_compare or agent_item_decisions or scoped_aman_items_list or agent_items_raw
+        aman_patient_name = " ".join(
+            str(part).strip()
+            for part in (aman_enrollee.get("first_name"), aman_enrollee.get("surname"))
+            if str(part or "").strip()
+        ) or None
+        diagnosis_value = r.get("diagnosis") or aman_encounter.get("diagnosis")
+        if isinstance(diagnosis_value, (list, dict)):
+            diagnosis_value = json.dumps(diagnosis_value)
+        requested_amount = float(r["requested_amount"] or 0) if r.get("requested_amount") is not None else None
+        if requested_amount is None and aman_items_list:
+            requested_amount = float(sum(float(item.get("requested_cost") or 0) for item in aman_items_list if isinstance(item, dict)))
         enriched.append({
             "request_id": r["request_id"],
             "display_request_id": r["request_id"],
             "patient_id": r["patient_id"],
-            "patient_name": r.get("patient_name"),
-            "insurance_no": r.get("insurance_no"),
-            "plan": r.get("plan"),
+            "patient_name": r.get("patient_name") or aman_patient_name,
+            "insurance_no": r.get("insurance_no") or aman_enrollee.get("insurance_no"),
+            "plan": r.get("plan") or aman_policy.get("plan_name") or aman_policy.get("insurance_package"),
             "item_description": (items_for_card[0] or {}).get("name") or (items_for_card[0] or {}).get("item_name") if items_for_card else None,
             "line_item_count": len(items_for_card) if items_for_card else 0,
-            "diagnosis": r.get("diagnosis"),
-            "facility": r.get("facility"),
-            "requested_amount": float(r["requested_amount"] or 0) if r.get("requested_amount") is not None else None,
+            "diagnosis": diagnosis_value,
+            "facility": r.get("facility") or aman_encounter.get("facility_name"),
+            "requested_amount": requested_amount,
             "received_at": r["received_at"].isoformat() if r.get("received_at") else None,
             "callback_mode": (r.get("callback_mode") or "advisory"),
             "callback_status": r.get("callback_status"),
@@ -2095,6 +2142,7 @@ async def qa_accuracy(
             "total_end_to_end_min": total_end_to_end_min,
             "items_compare": item_compare,
             "aman_items": aman_items,
+            "consumption": aman_consumption,
         })
 
     def _aggregate(subset: list[dict], label: str) -> dict:

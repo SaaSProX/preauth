@@ -528,6 +528,7 @@ def _pa_with_items(pa: dict, items: list[dict]) -> dict:
     scoped["items"] = items
     scoped["requested_items"] = items
     scoped["total_requested_cost"] = sum(_item_cost(item) for item in items)
+    scoped["aman_prior_context"] = _aman_prior_context(pa, items)
     return scoped
 
 
@@ -561,6 +562,79 @@ def _aman_prior_context(pa: dict, current_items: list[dict] | None = None) -> di
             for item in rejected_items
         ],
     }
+
+
+def _item_concepts(item_or_name) -> set[str]:
+    name = _item_name(item_or_name) if isinstance(item_or_name, dict) else str(item_or_name or "")
+    text = name.lower()
+    concepts: set[str] = set()
+    if re.search(r"\b(hcv|hbsag|hepatitis|hep\s*[abc])\b", text):
+        concepts.add("hepatitis")
+    if re.search(r"\b(vit(?:amin)?\s*c|ascorbic)\b", text):
+        concepts.add("vitamin_c")
+    if re.search(r"\b(malaria|plasmodium|artemether|lumefantrine)\b", text):
+        concepts.add("malaria")
+    if re.search(r"\b(pregnan|delivery|antenatal|postnatal|obstetric|caesarean|cesarean)\b", text):
+        concepts.add("maternity")
+    if re.search(r"\b(cancer|chemo|radiotherapy|oncology)\b", text):
+        concepts.add("cancer")
+    if re.search(r"\b(dialysis|kidney|renal)\b", text):
+        concepts.add("renal")
+    if re.search(r"\b(hiv|aids|retroviral)\b", text):
+        concepts.add("hiv")
+    return concepts
+
+
+def _item_tokens(item_or_name) -> set[str]:
+    name = _item_name(item_or_name) if isinstance(item_or_name, dict) else str(item_or_name or "")
+    stop = {
+        "general", "initial", "consultation", "visit", "tablet", "capsule",
+        "injection", "oral", "cream", "solution", "screening", "surface",
+        "antigen", "human", "test", "per", "and", "with", "for", "the",
+    }
+    return {
+        token
+        for token in re.findall(r"[a-z0-9]+", name.lower())
+        if len(token) > 2 and token not in stop
+    }
+
+
+def _items_related(left, right) -> bool:
+    left_concepts = _item_concepts(left)
+    right_concepts = _item_concepts(right)
+    if left_concepts and right_concepts and left_concepts.intersection(right_concepts):
+        return True
+
+    left_tokens = _item_tokens(left)
+    right_tokens = _item_tokens(right)
+    overlap = left_tokens.intersection(right_tokens)
+    return len(overlap) >= 2
+
+
+def _related_aman_context(item: dict, prior_context: dict) -> dict:
+    approved = [
+        prior for prior in prior_context.get("approved_items") or []
+        if _items_related(item, prior.get("item_name"))
+    ]
+    rejected = [
+        prior for prior in prior_context.get("rejected_items") or []
+        if _items_related(item, prior.get("item_name"))
+    ]
+    return {
+        "approved_items": approved,
+        "rejected_items": rejected,
+        "approved_count": len(approved),
+        "rejected_count": len(rejected),
+    }
+
+
+def _context_names(items: list[dict], limit: int = 3) -> str:
+    names = [str(item.get("item_name") or item.get("name") or "").strip() for item in items if str(item.get("item_name") or item.get("name") or "").strip()]
+    if not names:
+        return "related item(s)"
+    extra = len(names) - limit
+    shown = ", ".join(names[:limit])
+    return f"{shown} (+{extra} more)" if extra > 0 else shown
 
 
 def _all_limits(pa: dict) -> list[dict]:
@@ -764,6 +838,8 @@ Production payload guidance:
 - If proposed_impact.status is "allowed" and proposed_impact.violations is empty, do not deny solely because the exact tariff item name is not listed in the knowledge base.
 - For basic outpatient consultation, routine laboratory tests, and routine medication on tariff, pass coverage unless there is a clear exclusion, waiting-period issue, or explicit violation.
 - If coverage is uncertain, prefer pass with a note or escalate in the final decision rather than deterministic denial.
+- If PA REQUEST.aman_prior_context shows AMAN already approved related care in the same check-in snapshot, use that as context. Do not blindly approve the new item, but if a broad exclusion conflicts with prior AMAN-approved related care, return ESCALATE for that item rather than a hard DENY.
+- Distinguish investigations/screening from treatment. Example: approved hepatitis screening does not automatically cover hepatitis treatment/immunoglobulin, but it should raise context and may require human review.
 
 Return ONLY this JSON:
 {{
@@ -905,8 +981,30 @@ def agent_item_utilization(pa: dict, agent2: dict) -> dict:
         amount = _item_cost(item)
         source_status = _item_status(item)
         amount_to_count = _item_approved_cost(item) if source_status == "approved" else amount
+        related_context = _related_aman_context(item, prior_context)
 
         if coverage_decision == "DENY":
+            if related_context.get("approved_count"):
+                context_label = _context_names(related_context.get("approved_items") or [])
+                item_decisions.append(_build_item_decision(
+                    item,
+                    "ESCALATE",
+                    (
+                        f"Coverage rule suggests denial, but AMAN previously approved related care in this PA snapshot "
+                        f"({context_label}); escalate for medical review instead of hard rejection."
+                    ),
+                    coverage,
+                    bucket_key=bucket_key,
+                    bucket_name=bucket_name,
+                    bucket_source=bucket_source,
+                    requested_cost=amount,
+                    utilization_data_missing=utilization_data_missing,
+                    utilization_source="aman_prior_context_conflict",
+                    context_evidence=related_context,
+                    context_override=True,
+                ))
+                continue
+
             item_decisions.append(_build_item_decision(
                 item,
                 "DENY",
@@ -917,6 +1015,7 @@ def agent_item_utilization(pa: dict, agent2: dict) -> dict:
                 bucket_source=bucket_source,
                 requested_cost=amount,
                 utilization_data_missing=utilization_data_missing,
+                context_evidence=related_context if related_context.get("rejected_count") else None,
             ))
             continue
 
@@ -1043,6 +1142,8 @@ def _build_item_decision(
     limit_definition_id=None,
     utilization_data_missing: bool = False,
     utilization_source: str | None = None,
+    context_evidence: dict | None = None,
+    context_override: bool = False,
 ) -> dict:
     amount = _item_cost(item) if requested_cost is None else requested_cost
     approved_cost = amount if decision == "APPROVE" else 0
@@ -1069,6 +1170,8 @@ def _build_item_decision(
         "limit_definition_id": limit_definition_id,
         "utilization_data_missing": utilization_data_missing,
         "utilization_source": utilization_source,
+        "context_evidence": context_evidence,
+        "context_override": context_override,
         "bucket_limit": bucket_limit,
         "bucket_used_before": bucket_used_before,
         "bucket_remaining_before": bucket_remaining_before,
@@ -1213,6 +1316,8 @@ def _item_decision_flags(item_decisions: list[dict]) -> list[str]:
         flags.append("Benefit limit exceeded")
     if any(item.get("source_item_status") == "pending" for item in item_decisions):
         flags.append("Pending source items present")
+    if any(item.get("context_override") for item in item_decisions):
+        flags.append("Prior AMAN context changed item recommendation")
     return flags
 
 

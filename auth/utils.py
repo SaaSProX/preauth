@@ -39,7 +39,6 @@ def verify_session_token(request: Request) -> dict:
         raise HTTPException(status_code=401, detail="Missing token")
 
     token = auth_header.split(" ")[1]
-
     try:
         payload = jwt.decode(token, settings.jwt_secret, algorithms=["HS256"])
         return payload
