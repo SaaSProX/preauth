@@ -1990,8 +1990,9 @@ async def qa_accuracy(
         raise HTTPException(status_code=400, detail="Start date cannot be after end date")
 
     tol = max(0.0, min(1.0, float(tolerance)))
-    date_from_start = datetime.combine(date_from, time.min)
-    date_to_end = datetime.combine(date_to + timedelta(days=1), time.min)
+    lagos_tz = ZoneInfo("Africa/Lagos")
+    date_from_start = datetime.combine(date_from, time.min, tzinfo=lagos_tz)
+    date_to_end = datetime.combine(date_to + timedelta(days=1), time.min, tzinfo=lagos_tz)
     record_limit = min(max(int(record_limit), 1), 500)
 
     # One row per PA, joined to its latest explicit AMAN outcome event. The
@@ -2100,8 +2101,8 @@ async def qa_accuracy(
             LIMIT 1
         ) submitted ON TRUE
         WHERE p.org_id = $1
-          AND COALESCE(submitted.occurred_at, submitted.submitted_at, submitted.last_seen_at, submitted.created_at, p.received_at) >= $2::timestamp
-          AND COALESCE(submitted.occurred_at, submitted.submitted_at, submitted.last_seen_at, submitted.created_at, p.received_at) < $3::timestamp
+          AND COALESCE(submitted.occurred_at, submitted.submitted_at, submitted.last_seen_at, submitted.created_at, p.received_at) >= $2::timestamptz
+          AND COALESCE(submitted.occurred_at, submitted.submitted_at, submitted.last_seen_at, submitted.created_at, p.received_at) < $3::timestamptz
         ORDER BY COALESCE(submitted.occurred_at, submitted.submitted_at, submitted.last_seen_at, submitted.created_at, p.received_at) DESC
         """,
         org_id, date_from_start, date_to_end,
@@ -2155,8 +2156,8 @@ async def qa_accuracy(
         ) agent3 ON TRUE
         WHERE e.org_id = $1
           AND LOWER(COALESCE(e.event_type, '')) = 'pa.submitted'
-          AND COALESCE(e.occurred_at, e.submitted_at, e.last_seen_at, e.created_at) >= $2::timestamp
-          AND COALESCE(e.occurred_at, e.submitted_at, e.last_seen_at, e.created_at) < $3::timestamp
+          AND COALESCE(e.occurred_at, e.submitted_at, e.last_seen_at, e.created_at) >= $2::timestamptz
+          AND COALESCE(e.occurred_at, e.submitted_at, e.last_seen_at, e.created_at) < $3::timestamptz
           AND EXISTS (
             SELECT 1
             FROM preauth_events prior_outcome
@@ -2179,6 +2180,168 @@ async def qa_accuracy(
               )
           )
         ORDER BY e.created_at DESC, e.event_sequence DESC
+        """,
+        org_id, date_from_start, date_to_end,
+    )
+
+    value_rows = await pg_query_all(
+        """
+        WITH submitted AS (
+            SELECT
+                e.id AS submitted_event_db_id,
+                e.event_id AS submitted_event_id,
+                e.correlation_id AS submitted_correlation_id,
+                e.checkin_id,
+                e.request_id AS event_request_id,
+                e.event_sequence,
+                e.created_at,
+                COALESCE(NULLIF(p.callback_mode, ''), 'advisory') AS mode,
+                COALESCE(p.request_id, e.request_id, e.checkin_id) AS log_request_id,
+                COALESCE(e.items_added_total, e.total_requested_cost, 0)::float AS submitted_value,
+                COALESCE(e.items_added_count, e.item_count, 0)::int AS submitted_line_items
+            FROM preauth_events e
+            LEFT JOIN preauth_logs p ON p.id = e.preauth_log_id
+            WHERE e.org_id = $1
+              AND LOWER(COALESCE(e.event_type, '')) = 'pa.submitted'
+              AND e.created_at >= $2::timestamptz
+              AND e.created_at < $3::timestamptz
+        ),
+        event_agent AS (
+            SELECT
+                s.*,
+                al.result AS agent_result
+            FROM submitted s
+            LEFT JOIN LATERAL (
+                SELECT MIN(e2.created_at) AS next_submitted_at
+                FROM preauth_events e2
+                WHERE e2.org_id = $1
+                  AND e2.checkin_id = s.checkin_id
+                  AND LOWER(COALESCE(e2.event_type, '')) = 'pa.submitted'
+                  AND e2.event_sequence > s.event_sequence
+            ) next_sub ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT al.result, al.logged_at
+                FROM agent_logs al
+                WHERE al.request_id = s.log_request_id
+                  AND al.agent_num = 3
+                  AND al.logged_at >= s.created_at
+                  AND (
+                    next_sub.next_submitted_at IS NULL
+                    OR al.logged_at < next_sub.next_submitted_at
+                  )
+                ORDER BY al.logged_at DESC
+                LIMIT 1
+            ) al ON TRUE
+        ),
+        event_values AS (
+            SELECT
+                ea.mode,
+                COUNT(*)::int AS submitted_events,
+                COUNT(DISTINCT COALESCE(ea.checkin_id, ea.event_request_id))::int AS unique_pas,
+                COALESCE(SUM(ea.submitted_line_items), 0)::int AS submitted_line_items,
+                COALESCE(SUM(ea.submitted_value), 0)::float AS requested,
+                COALESCE(SUM(agent_stats.agent_approved), 0)::float AS agent_approved
+            FROM event_agent ea
+            LEFT JOIN LATERAL (
+                SELECT
+                    COALESCE(
+                        SUM(
+                            CASE
+                                WHEN LOWER(COALESCE(item.value->>'decision', '')) IN ('approve', 'approved')
+                                THEN COALESCE(
+                                    CASE
+                                        WHEN (item.value->>'recommended_approved_cost') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                                        THEN (item.value->>'recommended_approved_cost')::numeric
+                                        ELSE NULL
+                                    END,
+                                    CASE
+                                        WHEN (item.value->>'requested_cost') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                                        THEN (item.value->>'requested_cost')::numeric
+                                        ELSE 0
+                                    END
+                                )
+                                ELSE 0
+                            END
+                        ),
+                        0
+                    )::float AS agent_approved
+                FROM jsonb_array_elements(
+                    CASE
+                        WHEN jsonb_typeof(ea.agent_result->'item_decisions') = 'array'
+                        THEN ea.agent_result->'item_decisions'
+                        ELSE '[]'::jsonb
+                    END
+                ) AS item(value)
+            ) agent_stats ON TRUE
+            GROUP BY ea.mode
+        ),
+        outcome_values AS (
+            SELECT
+                s.mode,
+                COALESCE(SUM(outcome_stats.aman_approved), 0)::float AS aman_approved,
+                COALESCE(SUM(outcome_stats.rejected), 0)::float AS rejected
+            FROM submitted s
+            LEFT JOIN LATERAL (
+                SELECT oe.raw_payload
+                FROM preauth_events oe
+                WHERE oe.org_id = $1
+                  AND LOWER(COALESCE(oe.event_type, '')) IN ('pa.approved', 'pa.rejected', 'pa.finalized', 'pa.updated')
+                  AND oe.raw_payload ? 'line_outcomes'
+                  AND (
+                    oe.correlation_id = s.submitted_correlation_id
+                    OR oe.correlation_id = s.submitted_event_id
+                    OR oe.raw_payload->>'correlation_id' = s.submitted_correlation_id
+                    OR oe.raw_payload->>'correlation_id' = s.submitted_event_id
+                  )
+                ORDER BY COALESCE(oe.occurred_at, oe.last_seen_at, oe.created_at) DESC,
+                         oe.event_sequence DESC
+                LIMIT 1
+            ) outcome ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT
+                    COALESCE(
+                        SUM(
+                            CASE
+                                WHEN LOWER(COALESCE(line.value->'aman_decision'->>'status', '')) IN ('approve', 'approved')
+                                     AND (line.value->'aman_decision'->>'approved_cost') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                                THEN (line.value->'aman_decision'->>'approved_cost')::numeric
+                                ELSE 0
+                            END
+                        ),
+                        0
+                    )::float AS aman_approved,
+                    COALESCE(
+                        SUM(
+                            CASE
+                                WHEN LOWER(COALESCE(line.value->'aman_decision'->>'status', '')) IN ('deny', 'denied', 'reject', 'rejected')
+                                     AND (line.value->>'requested_cost') ~ '^-?[0-9]+(\\.[0-9]+)?$'
+                                THEN (line.value->>'requested_cost')::numeric
+                                ELSE 0
+                            END
+                        ),
+                        0
+                    )::float AS rejected
+                FROM jsonb_array_elements(
+                    CASE
+                        WHEN jsonb_typeof(outcome.raw_payload->'line_outcomes') = 'array'
+                        THEN outcome.raw_payload->'line_outcomes'
+                        ELSE '[]'::jsonb
+                    END
+                ) AS line(value)
+            ) outcome_stats ON TRUE
+            GROUP BY s.mode
+        )
+        SELECT
+            ev.mode,
+            ev.submitted_events,
+            ev.unique_pas,
+            ev.submitted_line_items,
+            ev.requested,
+            ev.agent_approved,
+            COALESCE(ov.aman_approved, 0)::float AS aman_approved,
+            COALESCE(ov.rejected, 0)::float AS rejected
+        FROM event_values ev
+        LEFT JOIN outcome_values ov ON ov.mode = ev.mode
         """,
         org_id, date_from_start, date_to_end,
     )
@@ -2601,7 +2764,41 @@ async def qa_accuracy(
             "consumption": consumption,
         })
 
-    def _aggregate(subset: list[dict], label: str) -> dict:
+    def _blank_value_totals() -> dict:
+        return {
+            "requested": 0.0,
+            "agent_approved": 0.0,
+            "aman_approved": 0.0,
+            "rejected": 0.0,
+            "submitted_events": 0,
+            "unique_pas": 0,
+            "submitted_line_items": 0,
+        }
+
+    value_totals_by_mode: dict[str, dict] = {}
+    for row in value_rows:
+        mode_key = (row.get("mode") or "advisory").lower()
+        value_totals_by_mode[mode_key] = {
+            "requested": float(row.get("requested") or 0),
+            "agent_approved": float(row.get("agent_approved") or 0),
+            "aman_approved": float(row.get("aman_approved") or 0),
+            "rejected": float(row.get("rejected") or 0),
+            "submitted_events": int(row.get("submitted_events") or 0),
+            "unique_pas": int(row.get("unique_pas") or 0),
+            "submitted_line_items": int(row.get("submitted_line_items") or 0),
+        }
+    all_value_totals = _blank_value_totals()
+    for totals in value_totals_by_mode.values():
+        for key in all_value_totals:
+            all_value_totals[key] += totals.get(key, 0)
+    value_totals_by_mode["all"] = all_value_totals
+
+    def _value_totals(mode: str) -> dict:
+        base = _blank_value_totals()
+        base.update(value_totals_by_mode.get(mode, {}))
+        return base
+
+    def _aggregate(subset: list[dict], label: str, value_totals: dict | None = None) -> dict:
         total = len(subset)
         scored_rows = [r for r in subset if r["bucket"] in ("matched", "mismatched")]
         scored = len(scored_rows)
@@ -2615,10 +2812,7 @@ async def qa_accuracy(
         )
         amount_match = matched
 
-        requested = sum(r["requested_amount"] or 0 for r in scored_rows)
-        agent_approved = sum(r["agent_amount"] or 0 for r in scored_rows if r["agent_decision"] == "APPROVE")
-        aman_approved = sum(r["aman_amount"] or 0 for r in scored_rows if r["aman_decision"] == "APPROVE")
-        rejected = sum(r["requested_amount"] or 0 for r in scored_rows if r["aman_decision"] == "DENY")
+        value_totals = value_totals or _blank_value_totals()
         overturned = sum(
             r["aman_amount"] or 0 for r in scored_rows
             if r["agent_decision"] == "DENY" and r["aman_decision"] == "APPROVE"
@@ -2651,11 +2845,14 @@ async def qa_accuracy(
             "decision_match": decision_match,
             "amount_match": amount_match,
             "value": {
-                "requested": float(requested),
-                "agent_approved": float(agent_approved),
-                "aman_approved": float(aman_approved),
-                "rejected": float(rejected),
+                "requested": float(value_totals.get("requested") or 0),
+                "agent_approved": float(value_totals.get("agent_approved") or 0),
+                "aman_approved": float(value_totals.get("aman_approved") or 0),
+                "rejected": float(value_totals.get("rejected") or 0),
                 "overturned_denials": float(overturned),
+                "submitted_events": int(value_totals.get("submitted_events") or 0),
+                "unique_pas": int(value_totals.get("unique_pas") or 0),
+                "submitted_line_items": int(value_totals.get("submitted_line_items") or 0),
             },
             "latency": latency,
             "categories": categories,
@@ -2664,9 +2861,9 @@ async def qa_accuracy(
     advisory_rows = [r for r in enriched if (r.get("callback_mode") or "advisory") == "advisory"]
     applied_rows = [r for r in enriched if r.get("callback_mode") == "applied"]
     aggregates = {
-        "all": _aggregate(enriched, "All modes"),
-        "advisory": _aggregate(advisory_rows, "Advisory mode"),
-        "applied": _aggregate(applied_rows, "Applied mode"),
+        "all": _aggregate(enriched, "All modes", _value_totals("all")),
+        "advisory": _aggregate(advisory_rows, "Advisory mode", _value_totals("advisory")),
+        "applied": _aggregate(applied_rows, "Applied mode", _value_totals("applied")),
     }
 
     # Records sample: mismatches first (so the drilldown's "Only mismatches"
