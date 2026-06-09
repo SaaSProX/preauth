@@ -13,6 +13,7 @@ from pydantic import BaseModel
 from agent import agent
 from config.settings import settings
 from services.db import pg_execute, pg_query_all, pg_query_one
+from services.json_utils import parse_json_field
 from services.gmail import (
     GmailIntegrationError,
     create_notification_log,
@@ -62,15 +63,6 @@ class TeamInvitePayload(BaseModel):
 class CreateOrgPayload(BaseModel):
     org_name: str
     admin_email: str
-
-
-def parse_json_field(value):
-    if isinstance(value, str):
-        try:
-            return json.loads(value)
-        except json.JSONDecodeError:
-            return value
-    return value
 
 
 def _first_item(fields):
@@ -1305,6 +1297,7 @@ async def preauth_dashboard(
             COALESCE(SUM(COALESCE(items_added_count, item_count, 0)), 0)::int AS added_line_items
         FROM preauth_events
         WHERE org_id = $1
+          AND event_type = 'pa.submitted'
           AND ($2::timestamptz IS NULL OR created_at >= $2::timestamptz)
           AND ($3::timestamptz IS NULL OR created_at < $3::timestamptz)
         """,
@@ -1320,6 +1313,7 @@ async def preauth_dashboard(
             COALESCE(SUM(COALESCE(items_added_count, item_count, 0)), 0)::int AS added_line_items
         FROM preauth_events
         WHERE org_id = $1
+          AND event_type = 'pa.submitted'
         """,
         org_id
     )
@@ -1333,6 +1327,7 @@ async def preauth_dashboard(
             COALESCE(SUM(COALESCE(items_added_count, item_count, 0)), 0)::int AS added_line_items
         FROM preauth_events
         WHERE org_id = $1
+          AND event_type = 'pa.submitted'
           AND created_at >= $2::timestamptz
           AND created_at < $3::timestamptz
         """,
@@ -1424,13 +1419,19 @@ async def preauth_dashboard(
         FROM preauth_logs p
         LEFT JOIN LATERAL (
             SELECT
-                COUNT(*)::int AS event_count,
-                MAX(e.event_sequence)::int AS latest_event_sequence,
-                (ARRAY_AGG(e.event_id ORDER BY e.event_sequence DESC, e.created_at DESC))[1] AS latest_event_id,
-                (ARRAY_AGG(e.items_added_count ORDER BY e.event_sequence DESC, e.created_at DESC))[1] AS latest_items_added_count,
-                (ARRAY_AGG(e.items_added_total ORDER BY e.event_sequence DESC, e.created_at DESC))[1] AS latest_items_added_total,
+                (COUNT(*) FILTER (WHERE e.event_type = 'pa.submitted'))::int AS event_count,
+                (MAX(e.event_sequence) FILTER (WHERE e.event_type = 'pa.submitted'))::int AS latest_event_sequence,
+                (ARRAY_AGG(e.event_id ORDER BY e.event_sequence DESC, e.created_at DESC) FILTER (WHERE e.event_type = 'pa.submitted'))[1] AS latest_event_id,
+                (ARRAY_AGG(e.items_added_count ORDER BY e.event_sequence DESC, e.created_at DESC) FILTER (WHERE e.event_type = 'pa.submitted'))[1] AS latest_items_added_count,
+                (ARRAY_AGG(e.items_added_total ORDER BY e.event_sequence DESC, e.created_at DESC) FILTER (WHERE e.event_type = 'pa.submitted'))[1] AS latest_items_added_total,
                 COALESCE(SUM(e.duplicate_count), 0)::int AS duplicate_event_attempts,
-                COALESCE(SUM(COALESCE(e.items_added_total, e.total_requested_cost, 0)), 0)::float AS total_intake_value
+                COALESCE(SUM(
+                    CASE
+                        WHEN e.event_type = 'pa.submitted'
+                        THEN COALESCE(e.items_added_total, e.total_requested_cost, 0)
+                        ELSE 0
+                    END
+                ), 0)::float AS total_intake_value
             FROM preauth_events e
             WHERE e.org_id = p.org_id
               AND e.checkin_id = COALESCE(
@@ -1806,6 +1807,96 @@ def _qa_aman_per_item(pa_items: list[dict]) -> list[dict]:
     return out
 
 
+def _qa_line_status(value) -> str:
+    if value is None:
+        return "unknown"
+    v = str(value).strip().lower()
+    if v in ("approve", "approved", "1"):
+        return "approved"
+    if v in ("deny", "denied", "reject", "rejected", "3"):
+        return "rejected"
+    if v in ("query", "queried", "escalate", "escalated", "2"):
+        return "queried"
+    if v in ("pending", "0"):
+        return "pending"
+    return "unknown"
+
+
+def _qa_partner_recommendation_to_decision(value) -> str | None:
+    if value is None:
+        return None
+    v = str(value).strip().lower()
+    if v in ("partial_approve", "partial-approved", "partial approved", "partial"):
+        return "APPROVE"
+    return _qa_norm_dec(v)
+
+
+def _qa_aman_from_line_outcomes(line_outcomes: list[dict]) -> tuple[str | None, float, dict]:
+    """Derive AMAN's final decision from explicit AMAN outcome events.
+
+    `pa.approved` / future final events carry `line_outcomes[]`; those are the
+    source of truth for the accuracy dashboard. Submitted payload snapshots are
+    only request context.
+    """
+    counts = {"pending": 0, "approved": 0, "queried": 0, "rejected": 0, "unknown": 0}
+    approved_amount = 0.0
+    for line in (line_outcomes or []):
+        if not isinstance(line, dict):
+            continue
+        decision = line.get("aman_decision") if isinstance(line.get("aman_decision"), dict) else {}
+        status = _qa_line_status(decision.get("status"))
+        counts[status] = counts.get(status, 0) + 1
+        if status == "approved":
+            approved_amount += _number(decision.get("approved_cost")) or 0
+
+    total_acted = counts["approved"] + counts["rejected"] + counts["queried"]
+    if counts["approved"] > 0:
+        return ("APPROVE", float(approved_amount), counts)
+    if counts["rejected"] > 0 and counts["approved"] == 0:
+        return ("DENY", 0.0, counts)
+    if counts["pending"] > 0 and total_acted == 0:
+        return (None, 0.0, counts)
+    return (None, 0.0, counts)
+
+
+def _qa_partner_from_line_outcomes(line_outcomes: list[dict]) -> tuple[str | None, float, dict]:
+    """Reconstruct the SaaSPro advisory AMAN actually received."""
+    counts = {"pending": 0, "approved": 0, "queried": 0, "rejected": 0, "unknown": 0}
+    approved_amount = 0.0
+    for line in (line_outcomes or []):
+        if not isinstance(line, dict):
+            continue
+        advisory = line.get("partner_advisory") if isinstance(line.get("partner_advisory"), dict) else {}
+        decision = _qa_partner_recommendation_to_decision(advisory.get("recommendation"))
+        if decision == "APPROVE":
+            counts["approved"] += 1
+            approved_amount += _number(advisory.get("recommended_approved_cost")) or 0
+        elif decision == "DENY":
+            counts["rejected"] += 1
+        elif advisory:
+            counts["queried"] += 1
+        else:
+            counts["unknown"] += 1
+
+    if counts["approved"] > 0:
+        return ("APPROVE", float(approved_amount), counts)
+    if counts["rejected"] > 0 and counts["approved"] == 0:
+        return ("DENY", 0.0, counts)
+    return (None, 0.0, counts)
+
+
+def _qa_parse_dt(value) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None) if value.tzinfo else value
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+
+
 def _qa_classify(agent: str | None, aman: str | None,
                  agent_amount: float, aman_amount: float,
                  tol: float, require_amount: bool,
@@ -1875,12 +1966,10 @@ async def qa_accuracy(
       - records (enriched PA list, mismatches first then most-recent)
 
     Where AMAN's finals come from:
-        AMAN sends the full check-in snapshot on every webhook event. Each
-        line in `pa_items[]` carries a status — 0=pending, 1=approved,
-        2=queried, 3=rejected — confirmed by Sakeenah (AMAN) on 2026-06-01.
-        We join each preauth_log to its LATEST preauth_event for the same
-        request_id and derive AMAN's verdict from those statuses. No new
-        columns required, no separate ingestion endpoint.
+        Submitted payloads remain the request/intake context. AMAN's final
+        truth comes from explicit outcome events such as `pa.approved` carrying
+        `line_outcomes[]`, where each line has the SaaSPro partner advisory and
+        AMAN's final decision side by side.
 
     Multi-tenant via JWT org_id. Platform admins can pass ?org_id= to drill
     into a client org (same convention as /preauth-dashboard).
@@ -1905,9 +1994,9 @@ async def qa_accuracy(
     date_to_end = datetime.combine(date_to + timedelta(days=1), time.min)
     record_limit = min(max(int(record_limit), 1), 500)
 
-    # One row per PA, joined to its latest preauth_event so we have AMAN's
-    # current pa_items snapshot in `aman_items`. `aman_event_at` is when AMAN
-    # last touched this checkin — used as the upper bound on AMAN review time.
+    # One row per PA, joined to its latest explicit AMAN outcome event. The
+    # submitted row remains the intake context; `line_outcomes[]` is the AMAN
+    # final source of truth for scoring.
     rows = await pg_query_all(
         """
         SELECT
@@ -1920,16 +2009,24 @@ async def qa_accuracy(
             p.callback_status,
             p.callback_sent_at,
             p.decision           AS decision_raw,
+            p.raw_payload        AS intake_payload,
             COALESCE(p.extracted_fields->>'plan',
                      p.raw_payload->'policy'->>'plan_name',
                      p.raw_payload->'policy'->>'insurance_package') AS plan,
             COALESCE(p.extracted_fields->>'patient_name',
+                     NULLIF(TRIM(CONCAT_WS(' ',
+                         p.raw_payload->'enrollee'->>'first_name',
+                         p.raw_payload->'enrollee'->>'surname'
+                     )), ''),
                      p.raw_payload->'patient'->>'name')             AS patient_name,
             COALESCE(p.extracted_fields->>'insurance_no',
+                     p.raw_payload->'enrollee'->>'insurance_no',
                      p.raw_payload->'policy'->>'insurance_no')      AS insurance_no,
             COALESCE(p.extracted_fields->>'facility_name',
+                     p.raw_payload->'encounter'->>'facility_name',
                      p.raw_payload->'facility'->>'name')            AS facility,
             COALESCE(p.extracted_fields->>'diagnosis',
+                     p.raw_payload->'encounter'->>'diagnosis',
                      p.raw_payload->>'diagnosis')                   AS diagnosis,
             p.extracted_fields->'items'                             AS agent_items,
             p.agent_result                                          AS agent_result,
@@ -1944,19 +2041,30 @@ async def qa_accuracy(
                 ELSE 0
              END)                                                   AS agent_amount,
             EXTRACT(EPOCH FROM (p.processed_at - p.received_at))::float AS agent_latency_s,
-            ev.raw_payload                                         AS aman_payload,
-            ev.raw_payload->'pa_items'                              AS aman_items,
-            COALESCE(ev.occurred_at, ev.last_seen_at, ev.created_at) AS aman_event_at
+            outcome.raw_payload                                     AS aman_payload,
+            outcome.event_type                                      AS aman_event_type,
+            COALESCE(outcome.occurred_at, outcome.last_seen_at, outcome.created_at) AS aman_event_at
         FROM preauth_logs p
         LEFT JOIN LATERAL (
-            SELECT raw_payload, occurred_at, last_seen_at, created_at
+            SELECT raw_payload, event_type, occurred_at, last_seen_at, created_at, event_sequence
             FROM preauth_events e
-            WHERE e.request_id = p.request_id
-              AND e.org_id = p.org_id
+            WHERE e.org_id = p.org_id
+              AND LOWER(COALESCE(e.event_type, '')) IN ('pa.approved', 'pa.rejected', 'pa.finalized', 'pa.updated')
+              AND e.raw_payload ? 'line_outcomes'
+              AND (
+                e.preauth_log_id = p.id
+                OR e.request_id = p.request_id
+                OR e.checkin_id = COALESCE(
+                    p.raw_payload->'encounter'->>'checkin_id',
+                    p.raw_payload->>'checkin_id',
+                    p.extracted_fields->>'checkin_id',
+                    p.request_id
+                )
+              )
             ORDER BY COALESCE(e.occurred_at, e.last_seen_at, e.created_at) DESC,
                      e.event_sequence DESC
             LIMIT 1
-        ) ev ON TRUE
+        ) outcome ON TRUE
         WHERE p.org_id = $1
           AND p.received_at >= $2::timestamp
           AND p.received_at < $3::timestamp
@@ -1965,36 +2073,146 @@ async def qa_accuracy(
         org_id, date_from_start, date_to_end,
     )
 
+    pending_followup_rows = await pg_query_all(
+        """
+        SELECT
+            p.request_id,
+            p.patient_id,
+            p.callback_mode,
+            p.callback_status,
+            p.callback_sent_at,
+            p.raw_payload AS latest_intake_payload,
+            p.extracted_fields AS latest_extracted_fields,
+            e.id AS submitted_event_db_id,
+            e.event_id AS submitted_event_id,
+            e.correlation_id AS submitted_correlation_id,
+            e.event_sequence AS submitted_event_sequence,
+            e.raw_payload AS submitted_payload,
+            e.extracted_fields AS submitted_extracted_fields,
+            e.items_added_total AS submitted_items_added_total,
+            e.total_requested_cost AS submitted_total_requested_cost,
+            COALESCE(e.occurred_at, e.last_seen_at, e.created_at) AS submitted_event_at,
+            EXTRACT(EPOCH FROM (agent3.logged_at - e.created_at))::float AS agent_latency_s,
+            agent3.result AS agent3_result,
+            agent3.logged_at AS agent3_logged_at
+        FROM preauth_events e
+        JOIN preauth_logs p ON p.id = e.preauth_log_id
+        LEFT JOIN LATERAL (
+            SELECT MIN(e2.created_at) AS next_submitted_at
+            FROM preauth_events e2
+            WHERE e2.org_id = e.org_id
+              AND e2.checkin_id = e.checkin_id
+              AND LOWER(COALESCE(e2.event_type, '')) = 'pa.submitted'
+              AND e2.event_sequence > e.event_sequence
+        ) next_sub ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT al.result, al.logged_at
+            FROM agent_logs al
+            WHERE al.request_id = p.request_id
+              AND al.agent_num = 3
+              AND al.logged_at >= e.created_at
+              AND (
+                next_sub.next_submitted_at IS NULL
+                OR al.logged_at < next_sub.next_submitted_at
+              )
+            ORDER BY al.logged_at DESC
+            LIMIT 1
+        ) agent3 ON TRUE
+        WHERE e.org_id = $1
+          AND LOWER(COALESCE(e.event_type, '')) = 'pa.submitted'
+          AND e.created_at >= $2::timestamp
+          AND e.created_at < $3::timestamp
+          AND EXISTS (
+            SELECT 1
+            FROM preauth_events prior_outcome
+            WHERE prior_outcome.org_id = e.org_id
+              AND prior_outcome.checkin_id = e.checkin_id
+              AND LOWER(COALESCE(prior_outcome.event_type, '')) IN ('pa.approved', 'pa.rejected', 'pa.finalized', 'pa.updated')
+              AND prior_outcome.raw_payload ? 'line_outcomes'
+              AND prior_outcome.event_sequence < e.event_sequence
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM preauth_events outcome
+            WHERE outcome.org_id = e.org_id
+              AND outcome.checkin_id = e.checkin_id
+              AND LOWER(COALESCE(outcome.event_type, '')) IN ('pa.approved', 'pa.rejected', 'pa.finalized', 'pa.updated')
+              AND outcome.raw_payload ? 'line_outcomes'
+              AND (
+                outcome.correlation_id = e.correlation_id
+                OR outcome.raw_payload->>'correlation_id' = e.correlation_id
+              )
+          )
+        ORDER BY e.created_at DESC, e.event_sequence DESC
+        """,
+        org_id, date_from_start, date_to_end,
+    )
+
     def _maybe_load(value):
         """JSONB columns come back from asyncpg as strings — coerce to py types.
         Already-list / already-dict / None pass through untouched.
         """
-        if value is None or isinstance(value, (list, dict)):
-            return value
         if isinstance(value, (bytes, bytearray)):
             value = value.decode("utf-8")
-        if isinstance(value, str):
-            try:
-                return json.loads(value)
-            except ValueError:
-                return None
-        return value
+        loaded = parse_json_field(value)
+        return loaded if isinstance(loaded, (list, dict)) else None
+
+    def _dict(value) -> dict:
+        return value if isinstance(value, dict) else {}
+
+    def _list_of_dicts(value) -> list[dict]:
+        loaded = _maybe_load(value)
+        if not isinstance(loaded, list):
+            return []
+        return [item for item in loaded if isinstance(item, dict)]
+
+    def _merge_context(base: dict, override: dict) -> dict:
+        merged = {k: v for k, v in (base or {}).items() if v not in (None, "")}
+        merged.update({k: v for k, v in (override or {}).items() if v not in (None, "")})
+        return merged
+
+    def _agent_from_item_decisions(decisions: list[dict]) -> tuple[str | None, float]:
+        approved_amount = 0.0
+        approved = 0
+        denied = 0
+        firm = 0
+        for decision in decisions or []:
+            dec = _qa_norm_dec(decision.get("decision"))
+            if dec == "APPROVE":
+                approved += 1
+                firm += 1
+                approved_amount += _number(decision.get("recommended_approved_cost")) or _number(decision.get("requested_cost")) or 0
+            elif dec == "DENY":
+                denied += 1
+                firm += 1
+        if approved > 0:
+            return ("APPROVE", float(approved_amount))
+        if denied > 0 and firm == denied:
+            return ("DENY", 0.0)
+        return (None, 0.0)
 
     enriched: list[dict] = []
     for r in rows:
-        agent = _qa_norm_dec(r.get("decision_raw"))
-        agent_amount = float(r.get("agent_amount") or 0)
         agent_lat_s = r.get("agent_latency_s")
 
-        aman_items_raw = _maybe_load(r.get("aman_items")) or []
-        aman_items_list = aman_items_raw if isinstance(aman_items_raw, list) else []
-        aman_payload = _maybe_load(r.get("aman_payload")) or {}
-        if not isinstance(aman_payload, dict):
-            aman_payload = {}
-        aman_enrollee = aman_payload.get("enrollee") if isinstance(aman_payload.get("enrollee"), dict) else {}
-        aman_encounter = aman_payload.get("encounter") if isinstance(aman_payload.get("encounter"), dict) else {}
-        aman_policy = aman_payload.get("policy") if isinstance(aman_payload.get("policy"), dict) else {}
-        aman_consumption = aman_payload.get("consumption") if isinstance(aman_payload.get("consumption"), dict) else None
+        intake_payload = _maybe_load(r.get("intake_payload")) or {}
+        if not isinstance(intake_payload, dict):
+            intake_payload = {}
+        outcome_payload = _maybe_load(r.get("aman_payload")) or {}
+        if not isinstance(outcome_payload, dict):
+            outcome_payload = {}
+        line_outcomes = _list_of_dicts(outcome_payload.get("line_outcomes"))
+
+        intake_enrollee = _dict(intake_payload.get("enrollee"))
+        outcome_enrollee = _dict(outcome_payload.get("enrollee"))
+        aman_enrollee = _merge_context(intake_enrollee, outcome_enrollee)
+        intake_encounter = _dict(intake_payload.get("encounter"))
+        outcome_encounter = _dict(outcome_payload.get("encounter"))
+        aman_encounter = _merge_context(intake_encounter, outcome_encounter)
+        intake_policy = _dict(intake_payload.get("policy"))
+        outcome_policy = _dict(outcome_payload.get("policy"))
+        aman_policy = _merge_context(intake_policy, outcome_policy)
+        aman_consumption = intake_payload.get("consumption") if isinstance(intake_payload.get("consumption"), dict) else None
 
         agent_items_raw = _maybe_load(r.get("agent_items")) or []
         if not isinstance(agent_items_raw, list):
@@ -2003,44 +2221,37 @@ async def qa_accuracy(
         if not isinstance(agent_result_obj, dict):
             agent_result_obj = {}
         agent_item_decisions = agent_result_obj.get("item_decisions") if isinstance(agent_result_obj.get("item_decisions"), list) else []
+        intake_items_list = _list_of_dicts(intake_payload.get("pa_items"))
 
-        agent_claim_ids = {
-            str(d.get("claim_item_id") or d.get("id"))
-            for d in agent_item_decisions
-            if d.get("claim_item_id") is not None or d.get("id") is not None
-        }
-        submission_obj = aman_payload.get("submission") if isinstance(aman_payload.get("submission"), dict) else {}
-        added_facility_ids = {
-            str(item.get("id"))
-            for item in (submission_obj.get("items_added") or [])
-            if isinstance(item, dict) and item.get("id") is not None
-        }
-        if agent_claim_ids:
-            scoped_aman_items_list = [
-                item for item in aman_items_list
-                if str(item.get("claim_item_id") or item.get("id")) in agent_claim_ids
-            ]
-        elif added_facility_ids:
-            scoped_aman_items_list = [
-                item for item in aman_items_list
-                if item.get("facility_tariff_item_id") is not None
-                and str(item.get("facility_tariff_item_id")) in added_facility_ids
-            ]
-        else:
-            scoped_aman_items_list = aman_items_list
+        outcome_agent, outcome_agent_amount, _partner_counts = _qa_partner_from_line_outcomes(line_outcomes)
+        agent = outcome_agent or _qa_norm_dec(r.get("decision_raw"))
+        agent_amount = float(outcome_agent_amount if outcome_agent is not None else (r.get("agent_amount") or 0))
 
-        aman, aman_amount, aman_counts = _qa_aman_from_items(scoped_aman_items_list)
+        aman, aman_amount, aman_counts = _qa_aman_from_line_outcomes(line_outcomes)
 
-        # AMAN review window = our callback to AMAN's most-recent event on this PA.
-        # If we never sent a callback (advisory mode never wrote, applied was off),
-        # fall back to received_at → AMAN's event so we don't lose the signal.
+        # AMAN review window = when AMAN received/held our advisory to AMAN's
+        # explicit final outcome timestamp.
         aman_event_at = r.get("aman_event_at")
+        aman_event_dt = _qa_parse_dt(aman_event_at)
         callback_sent_at = r.get("callback_sent_at")
+        partner_anchor_candidates: list[datetime] = []
+        for line in line_outcomes:
+            advisory = line.get("partner_advisory") if isinstance(line.get("partner_advisory"), dict) else {}
+            for key in ("received_at", "decided_at"):
+                parsed = _qa_parse_dt(advisory.get(key))
+                if parsed is not None:
+                    partner_anchor_candidates.append(parsed)
+        partner_anchor = min(partner_anchor_candidates) if partner_anchor_candidates else None
         aman_review_min = None
-        if aman is not None and aman_event_at is not None:
-            anchor = callback_sent_at or r.get("received_at")
-            if anchor and aman_event_at > anchor:
-                aman_review_min = (aman_event_at - anchor).total_seconds() / 60.0
+        if aman is not None and aman_event_dt is not None:
+            anchor = (
+                partner_anchor
+                or _qa_parse_dt(callback_sent_at)
+                or _qa_parse_dt(r.get("processed_at"))
+                or _qa_parse_dt(r.get("received_at"))
+            )
+            if anchor and aman_event_dt > anchor:
+                aman_review_min = (aman_event_dt - anchor).total_seconds() / 60.0
 
         bucket, category = _qa_classify(
             agent, aman, agent_amount, aman_amount,
@@ -2052,55 +2263,98 @@ async def qa_accuracy(
             if aman_review_min is not None else None
         )
 
-        # Per-item comparison is scoped to the lines this agent run handled.
-        # AMAN sends full PA snapshots, so including every pa_items[] row can
-        # drag older approved lines into a newer submission and create fake
-        # amount mismatches.
-        aman_items = _qa_aman_per_item(scoped_aman_items_list)
-
-        # Build the per-line compare: union of agent_item_decisions + AMAN items.
-        # We match by claim_item_id (the stable ID on both sides). When an item
-        # exists on one side only, we still render it — the missing column just
-        # reads "—" in the drawer.
         agent_by_id: dict[str, dict] = {}
         for d in agent_item_decisions:
             cid = d.get("claim_item_id") or d.get("id")
             if cid is not None:
                 agent_by_id[str(cid)] = d
-        aman_by_id: dict[str, dict] = {}
-        for d in aman_items:
-            cid = d.get("claim_item_id")
+        intake_by_id: dict[str, dict] = {}
+        for d in intake_items_list:
+            cid = d.get("claim_item_id") or d.get("id")
             if cid is not None:
-                aman_by_id[str(cid)] = d
-
-        # Preserve insertion order: agent decisions first, then scoped AMAN-only items.
-        ordered_ids: list[str] = []
-        for d in agent_item_decisions:
-            cid = str(d.get("claim_item_id") or d.get("id") or "")
-            if cid and cid not in ordered_ids:
-                ordered_ids.append(cid)
-        for d in aman_items:
-            cid = str(d.get("claim_item_id") or "")
-            if cid and cid not in ordered_ids:
-                ordered_ids.append(cid)
+                intake_by_id[str(cid)] = d
 
         item_compare = []
-        for cid in ordered_ids:
+        for line in line_outcomes:
+            cid_raw = line.get("claim_item_id") or line.get("id")
+            cid = str(cid_raw) if cid_raw is not None else ""
             ag = agent_by_id.get(cid) or {}
-            am = aman_by_id.get(cid) or {}
+            intake_item = intake_by_id.get(cid) or {}
+            advisory = line.get("partner_advisory") if isinstance(line.get("partner_advisory"), dict) else {}
+            aman_decision = line.get("aman_decision") if isinstance(line.get("aman_decision"), dict) else {}
+            requested_cost = (
+                _number(line.get("requested_cost"))
+                or _number(intake_item.get("requested_cost"))
+                or _number(ag.get("requested_cost"))
+                or 0
+            )
+            recommended_cost = (
+                _number(advisory.get("recommended_approved_cost"))
+                or _number(ag.get("recommended_approved_cost"))
+                or 0
+            )
+            approved_cost = _number(aman_decision.get("approved_cost")) or 0
             item_compare.append({
-                "claim_item_id": ag.get("claim_item_id") or ag.get("id") or am.get("claim_item_id"),
-                "name": ag.get("name") or ag.get("item_name") or am.get("name") or "(unnamed item)",
-                "quantity": ag.get("quantity") or am.get("quantity"),
-                "agent_decision": _qa_norm_dec(ag.get("decision")) if ag else None,
-                "agent_requested_cost": float(ag.get("requested_cost") or am.get("requested_cost") or 0),
-                "agent_recommended_cost": float(ag.get("recommended_approved_cost") or 0),
-                "agent_reason": ag.get("reason"),
-                "aman_status": am.get("status"),                    # pending/approved/queried/rejected/None
-                "aman_approved_cost": float(am.get("approved_cost") or 0),
+                "claim_item_id": cid_raw,
+                "name": (
+                    line.get("item_name")
+                    or intake_item.get("item_name")
+                    or intake_item.get("name")
+                    or ag.get("name")
+                    or ag.get("item_name")
+                    or "(unnamed item)"
+                ),
+                "quantity": line.get("quantity") or intake_item.get("quantity") or ag.get("quantity"),
+                "agent_decision": _qa_partner_recommendation_to_decision(advisory.get("recommendation")) or (_qa_norm_dec(ag.get("decision")) if ag else None),
+                "agent_requested_cost": float(requested_cost),
+                "agent_recommended_cost": float(recommended_cost),
+                "agent_reason": advisory.get("rationale") or ag.get("reason"),
+                "aman_status": _qa_line_status(aman_decision.get("status")),
+                "aman_approved_cost": float(approved_cost),
             })
 
-        items_for_card = item_compare or agent_item_decisions or scoped_aman_items_list or agent_items_raw
+        if not item_compare and agent_item_decisions:
+            for ag in agent_item_decisions:
+                item_compare.append({
+                    "claim_item_id": ag.get("claim_item_id") or ag.get("id"),
+                    "name": ag.get("name") or ag.get("item_name") or "(unnamed item)",
+                    "quantity": ag.get("quantity"),
+                    "agent_decision": _qa_norm_dec(ag.get("decision")),
+                    "agent_requested_cost": float(ag.get("requested_cost") or 0),
+                    "agent_recommended_cost": float(ag.get("recommended_approved_cost") or 0),
+                    "agent_reason": ag.get("reason"),
+                    "aman_status": None,
+                    "aman_approved_cost": 0.0,
+                })
+
+        if not item_compare:
+            for item in (agent_items_raw or intake_items_list):
+                item_compare.append({
+                    "claim_item_id": item.get("claim_item_id") or item.get("id"),
+                    "name": item.get("item_name") or item.get("name") or "(unnamed item)",
+                    "quantity": item.get("quantity"),
+                    "agent_decision": agent,
+                    "agent_requested_cost": float(_number(item.get("requested_cost")) or _number(item.get("amount")) or 0),
+                    "agent_recommended_cost": 0.0,
+                    "agent_reason": None,
+                    "aman_status": None,
+                    "aman_approved_cost": 0.0,
+                })
+
+        aman_items = [
+            {
+                "claim_item_id": item.get("claim_item_id"),
+                "name": item.get("name"),
+                "quantity": item.get("quantity"),
+                "status": item.get("aman_status"),
+                "requested_cost": item.get("agent_requested_cost"),
+                "approved_cost": item.get("aman_approved_cost"),
+            }
+            for item in item_compare
+        ]
+
+        items_for_card = item_compare or agent_item_decisions or intake_items_list or agent_items_raw
+        first_item_for_card = items_for_card[0] if items_for_card and isinstance(items_for_card[0], dict) else {}
         aman_patient_name = " ".join(
             str(part).strip()
             for part in (aman_enrollee.get("first_name"), aman_enrollee.get("surname"))
@@ -2109,9 +2363,20 @@ async def qa_accuracy(
         diagnosis_value = r.get("diagnosis") or aman_encounter.get("diagnosis")
         if isinstance(diagnosis_value, (list, dict)):
             diagnosis_value = json.dumps(diagnosis_value)
-        requested_amount = float(r["requested_amount"] or 0) if r.get("requested_amount") is not None else None
-        if requested_amount is None and aman_items_list:
-            requested_amount = float(sum(float(item.get("requested_cost") or 0) for item in aman_items_list if isinstance(item, dict)))
+        requested_amount = None
+        if line_outcomes:
+            requested_amount = float(sum(float(_number(item.get("requested_cost")) or 0) for item in line_outcomes))
+        if requested_amount is None and r.get("requested_amount") is not None:
+            requested_amount = float(r["requested_amount"] or 0)
+        if requested_amount is None and item_compare:
+            requested_amount = float(sum(float(item.get("agent_requested_cost") or 0) for item in item_compare))
+        agent_reason = agent_result_obj.get("reason")
+        if not agent_reason:
+            for item in item_compare:
+                if item.get("agent_reason"):
+                    agent_reason = item.get("agent_reason")
+                    break
+        record_received_at = partner_anchor or _qa_parse_dt(r.get("received_at"))
         enriched.append({
             "request_id": r["request_id"],
             "display_request_id": r["request_id"],
@@ -2119,23 +2384,24 @@ async def qa_accuracy(
             "patient_name": r.get("patient_name") or aman_patient_name,
             "insurance_no": r.get("insurance_no") or aman_enrollee.get("insurance_no"),
             "plan": r.get("plan") or aman_policy.get("plan_name") or aman_policy.get("insurance_package"),
-            "item_description": (items_for_card[0] or {}).get("name") or (items_for_card[0] or {}).get("item_name") if items_for_card else None,
+            "item_description": first_item_for_card.get("name") or first_item_for_card.get("item_name"),
             "line_item_count": len(items_for_card) if items_for_card else 0,
             "diagnosis": diagnosis_value,
             "facility": r.get("facility") or aman_encounter.get("facility_name"),
             "requested_amount": requested_amount,
-            "received_at": r["received_at"].isoformat() if r.get("received_at") else None,
+            "received_at": record_received_at.isoformat() if record_received_at else None,
             "callback_mode": (r.get("callback_mode") or "advisory"),
             "callback_status": r.get("callback_status"),
             "callback_sent_at": callback_sent_at.isoformat() if callback_sent_at else None,
             "agent_decision": agent,
             "agent_amount": agent_amount,
-            "agent_reason": (r.get("agent_result") or {}).get("reason") if isinstance(r.get("agent_result"), dict) else None,
+            "agent_reason": agent_reason,
             "agent_latency_s": float(agent_lat_s) if agent_lat_s is not None else None,
             "aman_decision": aman,
             "aman_amount": float(aman_amount),
             "aman_review_min": float(aman_review_min) if aman_review_min is not None else None,
-            "aman_finalized_at": aman_event_at.isoformat() if aman is not None and aman_event_at is not None else None,
+            "aman_finalized_at": aman_event_dt.isoformat() if aman is not None and aman_event_dt is not None else None,
+            "aman_event_type": r.get("aman_event_type"),
             "aman_item_counts": aman_counts,
             "bucket": bucket,
             "mismatch_category": category,
@@ -2143,6 +2409,127 @@ async def qa_accuracy(
             "items_compare": item_compare,
             "aman_items": aman_items,
             "consumption": aman_consumption,
+        })
+
+    for r in pending_followup_rows:
+        submitted_payload = _maybe_load(r.get("submitted_payload")) or {}
+        if not isinstance(submitted_payload, dict):
+            submitted_payload = {}
+        submitted_fields = _maybe_load(r.get("submitted_extracted_fields")) or {}
+        if not isinstance(submitted_fields, dict):
+            submitted_fields = {}
+        latest_payload = _maybe_load(r.get("latest_intake_payload")) or {}
+        if not isinstance(latest_payload, dict):
+            latest_payload = {}
+        agent3_result = _maybe_load(r.get("agent3_result")) or {}
+        if not isinstance(agent3_result, dict):
+            agent3_result = {}
+
+        submitted_enrollee = _dict(submitted_payload.get("enrollee"))
+        latest_enrollee = _dict(latest_payload.get("enrollee"))
+        enrollee = _merge_context(latest_enrollee, submitted_enrollee)
+        submitted_encounter = _dict(submitted_payload.get("encounter"))
+        latest_encounter = _dict(latest_payload.get("encounter"))
+        encounter = _merge_context(latest_encounter, submitted_encounter)
+        submitted_policy = _dict(submitted_payload.get("policy"))
+        latest_policy = _dict(latest_payload.get("policy"))
+        policy = _merge_context(latest_policy, submitted_policy)
+        consumption = submitted_payload.get("consumption") if isinstance(submitted_payload.get("consumption"), dict) else None
+
+        item_decisions = agent3_result.get("item_decisions") if isinstance(agent3_result.get("item_decisions"), list) else []
+        agent, agent_amount = _agent_from_item_decisions(item_decisions)
+        item_compare = []
+        for item in item_decisions:
+            requested_cost = _number(item.get("requested_cost")) or 0
+            item_compare.append({
+                "claim_item_id": item.get("claim_item_id") or item.get("id"),
+                "name": item.get("name") or item.get("item_name") or "(unnamed item)",
+                "quantity": item.get("quantity"),
+                "agent_decision": _qa_norm_dec(item.get("decision")),
+                "agent_requested_cost": float(requested_cost),
+                "agent_recommended_cost": float(_number(item.get("recommended_approved_cost")) or 0),
+                "agent_reason": item.get("reason"),
+                "aman_status": None,
+                "aman_approved_cost": 0.0,
+            })
+
+        if not item_compare:
+            added_ids = {
+                str(item.get("id"))
+                for item in (_dict(submitted_payload.get("submission")).get("items_added") or [])
+                if isinstance(item, dict) and item.get("id") is not None
+            }
+            pa_items = _list_of_dicts(submitted_payload.get("pa_items"))
+            for item in pa_items:
+                facility_id = item.get("facility_tariff_item_id")
+                if added_ids and (facility_id is None or str(facility_id) not in added_ids):
+                    continue
+                requested_cost = _number(item.get("requested_cost")) or 0
+                item_compare.append({
+                    "claim_item_id": item.get("claim_item_id") or item.get("id"),
+                    "name": item.get("item_name") or item.get("name") or "(unnamed item)",
+                    "quantity": item.get("quantity"),
+                    "agent_decision": agent,
+                    "agent_requested_cost": float(requested_cost),
+                    "agent_recommended_cost": float(agent_amount if agent == "APPROVE" else 0),
+                    "agent_reason": None,
+                    "aman_status": None,
+                    "aman_approved_cost": 0.0,
+                })
+
+        patient_name = " ".join(
+            str(part).strip()
+            for part in (enrollee.get("first_name"), enrollee.get("surname"))
+            if str(part or "").strip()
+        ) or None
+        diagnosis_value = submitted_fields.get("diagnosis") or encounter.get("diagnosis")
+        if isinstance(diagnosis_value, (list, dict)):
+            diagnosis_value = json.dumps(diagnosis_value)
+        requested_amount = (
+            _number(r.get("submitted_items_added_total"))
+            or sum(float(item.get("agent_requested_cost") or 0) for item in item_compare)
+            or _number(r.get("submitted_total_requested_cost"))
+            or 0
+        )
+        aman_counts = {"pending": len(item_compare), "approved": 0, "queried": 0, "rejected": 0, "unknown": 0}
+        bucket, category = _qa_classify(
+            agent, None, float(agent_amount or 0), 0.0,
+            tol, bool(require_amount_match), aman_counts,
+        )
+        first_item_for_card = item_compare[0] if item_compare else {}
+        submitted_at = _qa_parse_dt(r.get("submitted_event_at")) or _qa_parse_dt(r.get("agent3_logged_at"))
+        enriched.append({
+            "request_id": f"{r['request_id']}#event-{r['submitted_event_sequence']}",
+            "display_request_id": r["request_id"],
+            "patient_id": r["patient_id"],
+            "patient_name": submitted_fields.get("patient_name") or patient_name,
+            "insurance_no": submitted_fields.get("insurance_no") or enrollee.get("insurance_no"),
+            "plan": submitted_fields.get("plan") or policy.get("plan_name") or policy.get("insurance_package"),
+            "item_description": first_item_for_card.get("name") or first_item_for_card.get("item_name"),
+            "line_item_count": len(item_compare),
+            "diagnosis": diagnosis_value,
+            "facility": submitted_fields.get("facility_name") or encounter.get("facility_name"),
+            "requested_amount": float(requested_amount or 0),
+            "received_at": submitted_at.isoformat() if submitted_at else None,
+            "callback_mode": (r.get("callback_mode") or "advisory"),
+            "callback_status": r.get("callback_status"),
+            "callback_sent_at": r["callback_sent_at"].isoformat() if r.get("callback_sent_at") else None,
+            "agent_decision": agent,
+            "agent_amount": float(agent_amount or 0),
+            "agent_reason": agent3_result.get("reason"),
+            "agent_latency_s": float(r["agent_latency_s"]) if r.get("agent_latency_s") is not None else None,
+            "aman_decision": None,
+            "aman_amount": 0.0,
+            "aman_review_min": None,
+            "aman_finalized_at": None,
+            "aman_event_type": None,
+            "aman_item_counts": aman_counts,
+            "bucket": bucket,
+            "mismatch_category": category,
+            "total_end_to_end_min": None,
+            "items_compare": item_compare,
+            "aman_items": [],
+            "consumption": consumption,
         })
 
     def _aggregate(subset: list[dict], label: str) -> dict:
@@ -3235,6 +3622,7 @@ async def preauth_events(
     checkin_id: str | None = None,
     request_id: str | None = None,
     include_payload: bool = False,
+    include_outcomes: bool = False,
     limit: int = 50,
     org_id: int | None = None,
     claims: dict = Depends(verify_session_token)
@@ -3306,6 +3694,7 @@ async def preauth_events(
         WHERE ($1::boolean = TRUE OR e.org_id = $2)
           AND ($3::text IS NULL OR e.event_id = $3::text)
           AND ($4::text IS NULL OR e.checkin_id = $4::text)
+          AND ($7::boolean = TRUE OR LOWER(COALESCE(e.event_type, '')) = 'pa.submitted')
           AND (
               $5::text IS NULL
               OR e.request_id = $5::text
@@ -3320,6 +3709,7 @@ async def preauth_events(
         checkin_id,
         request_id,
         safe_limit,
+        include_outcomes,
     )
 
     return {
@@ -3328,6 +3718,7 @@ async def preauth_events(
             "checkin_id": checkin_id,
             "request_id": request_id,
             "include_payload": include_payload,
+            "include_outcomes": include_outcomes,
             "limit": safe_limit,
         },
         "events": [

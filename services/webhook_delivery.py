@@ -1,8 +1,8 @@
-import json
 import logging
 import uuid
 
 from services.db import pg_execute
+from services.json_utils import json_param
 
 
 logger = logging.getLogger(__name__)
@@ -42,12 +42,6 @@ def mask_api_key(api_key: str | None) -> str | None:
     if len(api_key) <= 12:
         return "****"
     return f"{api_key[:8]}...{api_key[-4:]}"
-
-
-def json_param(value):
-    if value is None:
-        return None
-    return json.dumps(value)
 
 
 async def create_webhook_delivery_log(

@@ -89,10 +89,10 @@ def summarize_payload(payload: dict):
         "event_id": payload.get("event_id"),
         "event_type": payload.get("event_type"),
         "correlation_id": payload.get("correlation_id"),
-        "checkin_id": get_nested(payload, "encounter.checkin_id"),
+        "checkin_id": get_nested(payload, "encounter.checkin_id") or payload.get("checkin_id"),
         "facility_name": get_nested(payload, "encounter.facility_name"),
         "insurance_no": get_nested(payload, "enrollee.insurance_no"),
-        "policy_no": get_nested(payload, "policy.policy_no"),
+        "policy_no": get_nested(payload, "policy.policy_no") or get_nested(payload, "enrollee.policy_no"),
         "plan_name": get_nested(payload, "policy.plan_name"),
         "item_count": len(pa_items) if isinstance(pa_items, list) else None,
     }
@@ -341,6 +341,7 @@ def extract_preauth_fields(payload: dict):
             "id",
             "reference",
             "reference_id",
+            "checkin_id",
             "encounter.checkin_id",
             "event_id",
         ]),
@@ -376,7 +377,7 @@ def extract_preauth_fields(payload: dict):
         "event_type": payload.get("event_type"),
         "event_id": payload.get("event_id"),
         "occurred_at": payload.get("occurred_at"),
-        "checkin_id": get_nested(payload, "encounter.checkin_id"),
+        "checkin_id": get_nested(payload, "encounter.checkin_id") or payload.get("checkin_id"),
         "checkin_date": get_nested(payload, "encounter.checkin_date"),
         "checkin_type": get_nested(payload, "encounter.checkin_type"),
         "facility_id": get_nested(payload, "encounter.facility_id"),
@@ -497,6 +498,8 @@ async def receive_preauth(
         )
 
         extracted_fields = extract_preauth_fields(payload)
+        event_type = str(payload.get("event_type") or "").strip().lower()
+        should_run_agent = event_type == "pa.submitted"
         request_id = extracted_fields["request_id"] or f"intake-{uuid.uuid4().hex}"
         patient_id = extracted_fields["patient_id"] or "unknown"
         missing_recommended_fields = [
@@ -533,7 +536,11 @@ async def receive_preauth(
         db_insert_status = (
             "duplicate_event_seen"
             if duplicate_event
-            else "event_saved_latest_state_updated"
+            else (
+                "event_saved_latest_state_updated"
+                if persisted["latest_state_updated"]
+                else "event_saved_no_latest_state_update"
+            )
         )
 
         await update_webhook_delivery_log(
@@ -549,9 +556,21 @@ async def receive_preauth(
 
         # Kick off agent in background (if enabled)
         agent_triggered = False
-        if settings.agent_enabled:
+        if should_run_agent and not duplicate_event and settings.agent_enabled:
             background.add_task(agent.run, str(patient_id), str(request_id))
             agent_triggered = True
+        elif not should_run_agent:
+            logger.info(
+                "Webhook event_type=%s is an update/final-decision event. Saved without running agent for request_id=%s",
+                payload.get("event_type"),
+                request_id,
+            )
+        elif duplicate_event:
+            logger.info(
+                "Duplicate webhook event_id=%s. Saved duplicate attempt without running agent for request_id=%s",
+                payload.get("event_id"),
+                request_id,
+            )
         else:
             logger.info(
                 "Agent is paused (AGENT_ENABLED=false). Skipping auto-decision for request_id=%s",

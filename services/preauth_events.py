@@ -1,12 +1,8 @@
-import json
 import uuid
 from datetime import datetime
 
 from services.db import get_pg_conn
-
-
-def _json_param(value):
-    return json.dumps(value)
+from services.json_utils import json_param as _json_param
 
 
 def _nested(payload: dict, *keys):
@@ -71,6 +67,8 @@ async def persist_preauth_intake_event(
 ):
     event_id = payload.get("event_id") or f"generated-{uuid.uuid4().hex}"
     checkin_id = payload_summary.get("checkin_id") or request_id
+    event_type = str(payload.get("event_type") or "").strip().lower()
+    updates_latest_state = event_type == "pa.submitted"
     items = extracted_fields.get("items")
     items_added = _items_added(payload)
 
@@ -111,37 +109,55 @@ async def persist_preauth_intake_event(
                     "latest_state_updated": False,
                 }
 
-            preauth_row = await conn.fetchrow(
-                """
-                INSERT INTO preauth_logs (
+            if updates_latest_state:
+                preauth_row = await conn.fetchrow(
+                    """
+                    INSERT INTO preauth_logs (
+                        org_id,
+                        request_id,
+                        patient_id,
+                        raw_payload,
+                        extracted_fields,
+                        status
+                    )
+                    VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, 'pending')
+                    ON CONFLICT (request_id) DO UPDATE SET
+                        org_id = EXCLUDED.org_id,
+                        patient_id = EXCLUDED.patient_id,
+                        raw_payload = EXCLUDED.raw_payload,
+                        extracted_fields = EXCLUDED.extracted_fields,
+                        received_at = NOW(),
+                        status = 'pending',
+                        agent_step = NULL,
+                        decision = NULL,
+                        agent_result = NULL,
+                        error_message = NULL,
+                        processed_at = NULL
+                    RETURNING id, request_id
+                    """,
                     org_id,
-                    request_id,
-                    patient_id,
-                    raw_payload,
-                    extracted_fields,
-                    status
+                    str(request_id),
+                    str(patient_id),
+                    _json_param(payload),
+                    _json_param(extracted_fields),
                 )
-                VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, 'pending')
-                ON CONFLICT (request_id) DO UPDATE SET
-                    org_id = EXCLUDED.org_id,
-                    patient_id = EXCLUDED.patient_id,
-                    raw_payload = EXCLUDED.raw_payload,
-                    extracted_fields = EXCLUDED.extracted_fields,
-                    received_at = NOW(),
-                    status = 'pending',
-                    agent_step = NULL,
-                    decision = NULL,
-                    agent_result = NULL,
-                    error_message = NULL,
-                    processed_at = NULL
-                RETURNING id, request_id
-                """,
-                org_id,
-                str(request_id),
-                str(patient_id),
-                _json_param(payload),
-                _json_param(extracted_fields),
-            )
+            else:
+                preauth_row = await conn.fetchrow(
+                    """
+                    SELECT id, request_id
+                    FROM preauth_logs
+                    WHERE org_id = $1
+                      AND (
+                        request_id = $2
+                        OR raw_payload->'encounter'->>'checkin_id' = $2
+                        OR extracted_fields->>'checkin_id' = $2
+                      )
+                    ORDER BY received_at DESC NULLS LAST, id DESC
+                    LIMIT 1
+                    """,
+                    org_id,
+                    str(checkin_id),
+                )
 
             event_sequence = await conn.fetchval(
                 """
@@ -187,7 +203,7 @@ async def persist_preauth_intake_event(
                 RETURNING *
                 """,
                 org_id,
-                preauth_row["id"],
+                preauth_row["id"] if preauth_row else None,
                 str(event_id),
                 payload.get("event_type"),
                 payload.get("correlation_id"),
@@ -214,7 +230,7 @@ async def persist_preauth_intake_event(
                 "preauth_row": preauth_row,
                 "event_row": event_row,
                 "duplicate_event": False,
-                "latest_state_updated": True,
+                "latest_state_updated": updates_latest_state,
             }
     finally:
         await conn.close()
