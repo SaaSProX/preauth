@@ -2043,7 +2043,11 @@ async def qa_accuracy(
             EXTRACT(EPOCH FROM (p.processed_at - p.received_at))::float AS agent_latency_s,
             outcome.raw_payload                                     AS aman_payload,
             outcome.event_type                                      AS aman_event_type,
-            COALESCE(outcome.occurred_at, outcome.last_seen_at, outcome.created_at) AS aman_event_at
+            COALESCE(outcome.occurred_at, outcome.last_seen_at, outcome.created_at) AS aman_event_at,
+            submitted.raw_payload                                   AS submitted_payload,
+            submitted.extracted_fields                              AS submitted_extracted_fields,
+            COALESCE(submitted.occurred_at, submitted.submitted_at, submitted.last_seen_at, submitted.created_at) AS submitted_event_at,
+            submitted.created_at                                     AS submitted_webhook_received_at
         FROM preauth_logs p
         LEFT JOIN LATERAL (
             SELECT raw_payload, event_type, occurred_at, last_seen_at, created_at, event_sequence
@@ -2065,10 +2069,40 @@ async def qa_accuracy(
                      e.event_sequence DESC
             LIMIT 1
         ) outcome ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT raw_payload, extracted_fields, occurred_at, submitted_at, last_seen_at, created_at, event_sequence
+            FROM preauth_events e
+            WHERE e.org_id = p.org_id
+              AND LOWER(COALESCE(e.event_type, '')) = 'pa.submitted'
+              AND (
+                e.preauth_log_id = p.id
+                OR e.request_id = p.request_id
+                OR e.checkin_id = COALESCE(
+                    p.raw_payload->'encounter'->>'checkin_id',
+                    p.raw_payload->>'checkin_id',
+                    p.extracted_fields->>'checkin_id',
+                    p.request_id
+                )
+              )
+            ORDER BY
+              CASE
+                WHEN outcome.raw_payload IS NOT NULL
+                 AND (
+                   e.event_id = outcome.raw_payload->>'correlation_id'
+                   OR e.correlation_id = outcome.raw_payload->>'correlation_id'
+                   OR e.correlation_id = outcome.raw_payload->>'event_id'
+                 )
+                THEN 0
+                ELSE 1
+              END,
+              COALESCE(e.occurred_at, e.submitted_at, e.last_seen_at, e.created_at) DESC,
+              e.event_sequence DESC
+            LIMIT 1
+        ) submitted ON TRUE
         WHERE p.org_id = $1
-          AND p.received_at >= $2::timestamp
-          AND p.received_at < $3::timestamp
-        ORDER BY p.received_at DESC
+          AND COALESCE(submitted.occurred_at, submitted.submitted_at, submitted.last_seen_at, submitted.created_at, p.received_at) >= $2::timestamp
+          AND COALESCE(submitted.occurred_at, submitted.submitted_at, submitted.last_seen_at, submitted.created_at, p.received_at) < $3::timestamp
+        ORDER BY COALESCE(submitted.occurred_at, submitted.submitted_at, submitted.last_seen_at, submitted.created_at, p.received_at) DESC
         """,
         org_id, date_from_start, date_to_end,
     )
@@ -2091,7 +2125,8 @@ async def qa_accuracy(
             e.extracted_fields AS submitted_extracted_fields,
             e.items_added_total AS submitted_items_added_total,
             e.total_requested_cost AS submitted_total_requested_cost,
-            COALESCE(e.occurred_at, e.last_seen_at, e.created_at) AS submitted_event_at,
+            COALESCE(e.occurred_at, e.submitted_at, e.last_seen_at, e.created_at) AS submitted_event_at,
+            e.created_at AS submitted_webhook_received_at,
             EXTRACT(EPOCH FROM (agent3.logged_at - e.created_at))::float AS agent_latency_s,
             agent3.result AS agent3_result,
             agent3.logged_at AS agent3_logged_at
@@ -2120,8 +2155,8 @@ async def qa_accuracy(
         ) agent3 ON TRUE
         WHERE e.org_id = $1
           AND LOWER(COALESCE(e.event_type, '')) = 'pa.submitted'
-          AND e.created_at >= $2::timestamp
-          AND e.created_at < $3::timestamp
+          AND COALESCE(e.occurred_at, e.submitted_at, e.last_seen_at, e.created_at) >= $2::timestamp
+          AND COALESCE(e.occurred_at, e.submitted_at, e.last_seen_at, e.created_at) < $3::timestamp
           AND EXISTS (
             SELECT 1
             FROM preauth_events prior_outcome
@@ -2195,9 +2230,16 @@ async def qa_accuracy(
     for r in rows:
         agent_lat_s = r.get("agent_latency_s")
 
-        intake_payload = _maybe_load(r.get("intake_payload")) or {}
-        if not isinstance(intake_payload, dict):
-            intake_payload = {}
+        stored_intake_payload = _maybe_load(r.get("intake_payload")) or {}
+        if not isinstance(stored_intake_payload, dict):
+            stored_intake_payload = {}
+        submitted_payload = _maybe_load(r.get("submitted_payload")) or {}
+        if not isinstance(submitted_payload, dict):
+            submitted_payload = {}
+        submitted_fields = _maybe_load(r.get("submitted_extracted_fields")) or {}
+        if not isinstance(submitted_fields, dict):
+            submitted_fields = {}
+        intake_payload = submitted_payload or stored_intake_payload
         outcome_payload = _maybe_load(r.get("aman_payload")) or {}
         if not isinstance(outcome_payload, dict):
             outcome_payload = {}
@@ -2385,20 +2427,29 @@ async def qa_accuracy(
                 if item.get("agent_reason"):
                     agent_reason = item.get("agent_reason")
                     break
-        record_received_at = partner_anchor or _qa_parse_dt(r.get("received_at"))
+        submitted_dt = (
+            _qa_parse_dt(r.get("submitted_event_at"))
+            or _qa_parse_dt(_nested_value(intake_payload, "submission", "submitted_at"))
+            or _qa_parse_dt(intake_payload.get("occurred_at"))
+            or _qa_parse_dt(r.get("received_at"))
+        )
+        webhook_received_dt = _qa_parse_dt(r.get("submitted_webhook_received_at")) or _qa_parse_dt(r.get("received_at"))
         enriched.append({
             "request_id": r["request_id"],
             "display_request_id": r["request_id"],
             "patient_id": r["patient_id"],
-            "patient_name": r.get("patient_name") or aman_patient_name,
-            "insurance_no": r.get("insurance_no") or aman_enrollee.get("insurance_no"),
-            "plan": r.get("plan") or aman_policy.get("plan_name") or aman_policy.get("insurance_package"),
+            "patient_name": submitted_fields.get("patient_name") or r.get("patient_name") or aman_patient_name,
+            "insurance_no": submitted_fields.get("insurance_no") or r.get("insurance_no") or aman_enrollee.get("insurance_no"),
+            "plan": submitted_fields.get("plan") or r.get("plan") or aman_policy.get("plan_name") or aman_policy.get("insurance_package"),
             "item_description": first_item_for_card.get("name") or first_item_for_card.get("item_name"),
             "line_item_count": len(items_for_card) if items_for_card else 0,
             "diagnosis": diagnosis_value,
-            "facility": r.get("facility") or aman_encounter.get("facility_name"),
+            "facility": submitted_fields.get("facility_name") or r.get("facility") or aman_encounter.get("facility_name"),
             "requested_amount": requested_amount,
-            "received_at": record_received_at.isoformat() if record_received_at else None,
+            "submitted_at": submitted_dt.isoformat() if submitted_dt else None,
+            "received_at": submitted_dt.isoformat() if submitted_dt else None,
+            "webhook_received_at": webhook_received_dt.isoformat() if webhook_received_dt else None,
+            "advisory_received_at": partner_anchor.isoformat() if partner_anchor else None,
             "callback_mode": (r.get("callback_mode") or "advisory"),
             "callback_status": r.get("callback_status"),
             "callback_sent_at": callback_sent_at.isoformat() if callback_sent_at else None,
@@ -2513,6 +2564,7 @@ async def qa_accuracy(
         )
         first_item_for_card = item_compare[0] if item_compare else {}
         submitted_at = _qa_parse_dt(r.get("submitted_event_at")) or _qa_parse_dt(r.get("agent3_logged_at"))
+        webhook_received_at = _qa_parse_dt(r.get("submitted_webhook_received_at"))
         enriched.append({
             "request_id": f"{r['request_id']}#event-{r['submitted_event_sequence']}",
             "display_request_id": r["request_id"],
@@ -2525,7 +2577,9 @@ async def qa_accuracy(
             "diagnosis": diagnosis_value,
             "facility": submitted_fields.get("facility_name") or encounter.get("facility_name"),
             "requested_amount": float(requested_amount or 0),
+            "submitted_at": submitted_at.isoformat() if submitted_at else None,
             "received_at": submitted_at.isoformat() if submitted_at else None,
+            "webhook_received_at": webhook_received_at.isoformat() if webhook_received_at else None,
             "callback_mode": (r.get("callback_mode") or "advisory"),
             "callback_status": r.get("callback_status"),
             "callback_sent_at": r["callback_sent_at"].isoformat() if r.get("callback_sent_at") else None,
@@ -2627,7 +2681,7 @@ async def qa_accuracy(
         digits = "".join(ch for ch in iso if ch.isdigit())[:14]
         return int(digits) if digits else 0
 
-    enriched_sorted = sorted(enriched, key=lambda r: (_rank(r["bucket"]), -_ts(r["received_at"])))[:record_limit]
+    enriched_sorted = sorted(enriched, key=lambda r: (_rank(r["bucket"]), -_ts(r.get("submitted_at") or r.get("received_at"))))[:record_limit]
 
     label_from = date_from.strftime("%b %-d") if hasattr(date_from, "strftime") else str(date_from)
     label_to = date_to.strftime("%b %-d, %Y") if hasattr(date_to, "strftime") else str(date_to)
