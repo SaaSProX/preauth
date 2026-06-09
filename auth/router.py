@@ -1889,12 +1889,12 @@ def _qa_parse_dt(value) -> datetime | None:
     if value is None:
         return None
     if isinstance(value, datetime):
-        return value.replace(tzinfo=None) if value.tzinfo else value
+        return value.astimezone(timezone.utc) if value.tzinfo else value.replace(tzinfo=timezone.utc)
     try:
         parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         return None
-    return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+    return parsed.astimezone(timezone.utc) if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 def _qa_classify(agent: str | None, aman: str | None,
