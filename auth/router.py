@@ -2311,6 +2311,9 @@ async def qa_accuracy(
                 "agent_reason": advisory.get("rationale") or ag.get("reason"),
                 "aman_status": _qa_line_status(aman_decision.get("status")),
                 "aman_approved_cost": float(approved_cost),
+                "aman_comment": aman_decision.get("comment"),
+                "aman_auth_code": aman_decision.get("auth_code"),
+                "aman_decided_at": aman_decision.get("decided_at"),
             })
 
         if not item_compare and agent_item_decisions:
@@ -2325,6 +2328,9 @@ async def qa_accuracy(
                     "agent_reason": ag.get("reason"),
                     "aman_status": None,
                     "aman_approved_cost": 0.0,
+                    "aman_comment": None,
+                    "aman_auth_code": None,
+                    "aman_decided_at": None,
                 })
 
         if not item_compare:
@@ -2339,6 +2345,9 @@ async def qa_accuracy(
                     "agent_reason": None,
                     "aman_status": None,
                     "aman_approved_cost": 0.0,
+                    "aman_comment": None,
+                    "aman_auth_code": None,
+                    "aman_decided_at": None,
                 })
 
         aman_items = [
@@ -2451,6 +2460,9 @@ async def qa_accuracy(
                 "agent_reason": item.get("reason"),
                 "aman_status": None,
                 "aman_approved_cost": 0.0,
+                "aman_comment": None,
+                "aman_auth_code": None,
+                "aman_decided_at": None,
             })
 
         if not item_compare:
@@ -2475,6 +2487,9 @@ async def qa_accuracy(
                     "agent_reason": None,
                     "aman_status": None,
                     "aman_approved_cost": 0.0,
+                    "aman_comment": None,
+                    "aman_auth_code": None,
+                    "aman_decided_at": None,
                 })
 
         patient_name = " ".join(
