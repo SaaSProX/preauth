@@ -1937,6 +1937,47 @@ def _qa_classify(agent: str | None, aman: str | None,
     return ("matched", None)
 
 
+def _qa_line_aman_decision(status: str | None) -> str | None:
+    s = _qa_line_status(status)
+    if s == "approved":
+        return "APPROVE"
+    if s == "rejected":
+        return "DENY"
+    if s == "queried":
+        return "ESCALATE"
+    return None
+
+
+def _qa_classify_line_item(item: dict, tol: float, require_amount: bool) -> tuple[str, str | None]:
+    """Classify one AMAN line outcome against the agent's line advisory.
+
+    AMAN final events are PA-level approved, but line_outcomes[].aman_decision
+    is the actual source of truth for approve/reject. The dashboard headline
+    cards therefore need to count line items, not whole PAs.
+    """
+    agent = _qa_norm_dec(item.get("agent_decision"))
+    aman = _qa_line_aman_decision(item.get("aman_status"))
+    if agent is None and aman is None:
+        return ("pending_aman", None)
+    if agent is None:
+        return ("agent_skipped", None)
+    if aman is None:
+        return ("pending_aman", None)
+    if agent != aman:
+        if agent == "DENY" and aman == "APPROVE":
+            return ("mismatched", "aman_over")
+        if agent == "APPROVE" and aman == "DENY":
+            return ("mismatched", "agent_over")
+        return ("mismatched", "coverage")
+    if agent == "APPROVE" and require_amount:
+        agent_amount = float(_number(item.get("agent_recommended_cost")) or 0)
+        aman_amount = float(_number(item.get("aman_approved_cost")) or 0)
+        base = max(abs(agent_amount), abs(aman_amount), 1)
+        if abs(agent_amount - aman_amount) / base > tol:
+            return ("mismatched", "amount")
+    return ("matched", None)
+
+
 def _qa_percentile(values: list[float], p: int) -> float | None:
     if not values:
         return None
@@ -1980,17 +2021,17 @@ async def qa_accuracy(
     else:
         org_id = _dashboard_org_id(claims)
 
-    # Default to last 7 days when no window is given.
-    today = datetime.now(timezone.utc).date()
+    lagos_tz = ZoneInfo("Africa/Lagos")
+    # Default to today when no window is given.
+    today = datetime.now(lagos_tz).date()
     if date_to is None:
         date_to = today
     if date_from is None:
-        date_from = date_to - timedelta(days=6)
+        date_from = date_to
     if date_from > date_to:
         raise HTTPException(status_code=400, detail="Start date cannot be after end date")
 
     tol = max(0.0, min(1.0, float(tolerance)))
-    lagos_tz = ZoneInfo("Africa/Lagos")
     date_from_start = datetime.combine(date_from, time.min, tzinfo=lagos_tz)
     date_to_end = datetime.combine(date_to + timedelta(days=1), time.min, tzinfo=lagos_tz)
     record_limit = min(max(int(record_limit), 1), 500)
@@ -2048,7 +2089,8 @@ async def qa_accuracy(
             submitted.raw_payload                                   AS submitted_payload,
             submitted.extracted_fields                              AS submitted_extracted_fields,
             COALESCE(submitted.occurred_at, submitted.submitted_at, submitted.last_seen_at, submitted.created_at) AS submitted_event_at,
-            submitted.created_at                                     AS submitted_webhook_received_at
+            submitted.created_at                                     AS submitted_webhook_received_at,
+            agentlog.agent_logs                                      AS agent_logs
         FROM preauth_logs p
         LEFT JOIN LATERAL (
             SELECT raw_payload, event_type, occurred_at, last_seen_at, created_at, event_sequence
@@ -2100,6 +2142,31 @@ async def qa_accuracy(
               e.event_sequence DESC
             LIMIT 1
         ) submitted ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT COALESCE(
+                jsonb_agg(
+                    jsonb_build_object(
+                        'agent_num', al.agent_num,
+                        'agent_name', al.agent_name,
+                        'status', al.status,
+                        'result', al.result,
+                        'logged_at', al.logged_at
+                    )
+                    ORDER BY al.logged_at, al.agent_num
+                ) FILTER (WHERE al.id IS NOT NULL),
+                '[]'::jsonb
+            ) AS agent_logs
+            FROM agent_logs al
+            WHERE al.request_id = p.request_id
+              AND (
+                submitted.created_at IS NULL
+                OR al.logged_at >= submitted.created_at - INTERVAL '3 minutes'
+              )
+              AND (
+                outcome.raw_payload IS NULL
+                OR al.logged_at <= COALESCE(outcome.occurred_at, outcome.last_seen_at, outcome.created_at) + INTERVAL '5 seconds'
+              )
+        ) agentlog ON TRUE
         WHERE p.org_id = $1
           AND COALESCE(submitted.occurred_at, submitted.submitted_at, submitted.last_seen_at, submitted.created_at, p.received_at) >= $2::timestamptz
           AND COALESCE(submitted.occurred_at, submitted.submitted_at, submitted.last_seen_at, submitted.created_at, p.received_at) < $3::timestamptz
@@ -2130,7 +2197,8 @@ async def qa_accuracy(
             e.created_at AS submitted_webhook_received_at,
             EXTRACT(EPOCH FROM (agent3.logged_at - e.created_at))::float AS agent_latency_s,
             agent3.result AS agent3_result,
-            agent3.logged_at AS agent3_logged_at
+            agent3.logged_at AS agent3_logged_at,
+            agent_run.agent_logs AS agent_logs
         FROM preauth_events e
         JOIN preauth_logs p ON p.id = e.preauth_log_id
         LEFT JOIN LATERAL (
@@ -2154,6 +2222,28 @@ async def qa_accuracy(
             ORDER BY al.logged_at DESC
             LIMIT 1
         ) agent3 ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT COALESCE(
+                jsonb_agg(
+                    jsonb_build_object(
+                        'agent_num', al.agent_num,
+                        'agent_name', al.agent_name,
+                        'status', al.status,
+                        'result', al.result,
+                        'logged_at', al.logged_at
+                    )
+                    ORDER BY al.logged_at, al.agent_num
+                ) FILTER (WHERE al.id IS NOT NULL),
+                '[]'::jsonb
+            ) AS agent_logs
+            FROM agent_logs al
+            WHERE al.request_id = p.request_id
+              AND al.logged_at >= e.created_at - INTERVAL '3 minutes'
+              AND (
+                next_sub.next_submitted_at IS NULL
+                OR al.logged_at < next_sub.next_submitted_at
+              )
+        ) agent_run ON TRUE
         WHERE e.org_id = $1
           AND LOWER(COALESCE(e.event_type, '')) = 'pa.submitted'
           AND COALESCE(e.occurred_at, e.submitted_at, e.last_seen_at, e.created_at) >= $2::timestamptz
@@ -2425,6 +2515,9 @@ async def qa_accuracy(
         agent_result_obj = _maybe_load(r.get("agent_result")) or {}
         if not isinstance(agent_result_obj, dict):
             agent_result_obj = {}
+        agent_logs = _maybe_load(r.get("agent_logs")) or []
+        if not isinstance(agent_logs, list):
+            agent_logs = []
         agent_item_decisions = agent_result_obj.get("item_decisions") if isinstance(agent_result_obj.get("item_decisions"), list) else []
         intake_items_list = _list_of_dicts(intake_payload.get("pa_items"))
 
@@ -2632,6 +2725,7 @@ async def qa_accuracy(
             "items_compare": item_compare,
             "aman_items": aman_items,
             "consumption": aman_consumption,
+            "agent_logs": agent_logs,
         })
 
     for r in pending_followup_rows:
@@ -2647,6 +2741,9 @@ async def qa_accuracy(
         agent3_result = _maybe_load(r.get("agent3_result")) or {}
         if not isinstance(agent3_result, dict):
             agent3_result = {}
+        agent_logs = _maybe_load(r.get("agent_logs")) or []
+        if not isinstance(agent_logs, list):
+            agent_logs = []
 
         submitted_enrollee = _dict(submitted_payload.get("enrollee"))
         latest_enrollee = _dict(latest_payload.get("enrollee"))
@@ -2762,6 +2859,7 @@ async def qa_accuracy(
             "items_compare": item_compare,
             "aman_items": [],
             "consumption": consumption,
+            "agent_logs": agent_logs,
         })
 
     def _blank_value_totals() -> dict:
@@ -2799,27 +2897,53 @@ async def qa_accuracy(
         return base
 
     def _aggregate(subset: list[dict], label: str, value_totals: dict | None = None) -> dict:
-        total = len(subset)
-        scored_rows = [r for r in subset if r["bucket"] in ("matched", "mismatched")]
+        line_rows: list[dict] = []
+        for r in subset:
+            items = r.get("items_compare") if isinstance(r.get("items_compare"), list) else []
+            if not items:
+                items = [{
+                    "agent_decision": r.get("agent_decision"),
+                    "agent_recommended_cost": r.get("agent_amount"),
+                    "aman_status": "approved" if r.get("aman_decision") == "APPROVE" else "rejected" if r.get("aman_decision") == "DENY" else None,
+                    "aman_approved_cost": r.get("aman_amount"),
+                }]
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                bucket, category = _qa_classify_line_item(item, tol, bool(require_amount_match))
+                line_rows.append({
+                    "record": r,
+                    "item": item,
+                    "bucket": bucket,
+                    "category": category,
+                })
+
+        total = len(line_rows)
+        scored_rows = [row for row in line_rows if row["bucket"] in ("matched", "mismatched")]
         scored = len(scored_rows)
-        matched = sum(1 for r in subset if r["bucket"] == "matched")
-        mismatched = sum(1 for r in subset if r["bucket"] == "mismatched")
-        pending = sum(1 for r in subset if r["bucket"] == "pending_aman")
-        skipped = sum(1 for r in subset if r["bucket"] == "agent_skipped")
-        decision_match = sum(
-            1 for r in subset
-            if r["agent_decision"] and r["aman_decision"] and r["agent_decision"] == r["aman_decision"]
-        )
+        matched = sum(1 for row in line_rows if row["bucket"] == "matched")
+        mismatched = sum(1 for row in line_rows if row["bucket"] == "mismatched")
+        pending = sum(1 for row in line_rows if row["bucket"] == "pending_aman")
+        skipped = sum(1 for row in line_rows if row["bucket"] == "agent_skipped")
+        decision_match = 0
         amount_match = matched
+        for row in scored_rows:
+            item = row["item"]
+            agent_decision = _qa_norm_dec(item.get("agent_decision"))
+            aman_decision = _qa_line_aman_decision(item.get("aman_status"))
+            if agent_decision and aman_decision and agent_decision == aman_decision:
+                decision_match += 1
 
         value_totals = value_totals or _blank_value_totals()
         overturned = sum(
-            r["aman_amount"] or 0 for r in scored_rows
-            if r["agent_decision"] == "DENY" and r["aman_decision"] == "APPROVE"
+            float(_number(row["item"].get("aman_approved_cost")) or 0)
+            for row in scored_rows
+            if _qa_norm_dec(row["item"].get("agent_decision")) == "DENY"
+            and _qa_line_aman_decision(row["item"].get("aman_status")) == "APPROVE"
         )
 
-        agent_latencies = [r["agent_latency_s"] for r in subset if r["agent_latency_s"] is not None]
-        aman_latencies = [r["aman_review_min"] for r in subset if r["aman_review_min"] is not None]
+        agent_latencies = [row["record"]["agent_latency_s"] for row in line_rows if row["record"].get("agent_latency_s") is not None]
+        aman_latencies = [row["record"]["aman_review_min"] for row in line_rows if row["record"].get("aman_review_min") is not None]
         latency = {
             "agent_s": (sum(agent_latencies) / len(agent_latencies)) if agent_latencies else None,
             "agent_p50": _qa_percentile(agent_latencies, 50),
@@ -2831,14 +2955,15 @@ async def qa_accuracy(
 
         category_keys = ["coverage", "amount", "aman_over", "limits", "agent_over", "eligibility"]
         counts = {k: 0 for k in category_keys}
-        for r in subset:
-            if r["bucket"] == "mismatched":
-                k = r["mismatch_category"] or "coverage"
+        for row in line_rows:
+            if row["bucket"] == "mismatched":
+                k = row["category"] or "coverage"
                 counts[k] = counts.get(k, 0) + 1
         categories = [{"key": k, "v": counts.get(k, 0)} for k in category_keys]
 
         return {
             "label": label,
+            "pa_total": len(subset),
             "total": total, "scored": scored,
             "matched": matched, "mismatched": mismatched,
             "pending_aman": pending, "agent_skipped": skipped,
