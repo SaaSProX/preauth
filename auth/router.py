@@ -2894,6 +2894,97 @@ async def qa_accuracy(
     }
 
 
+@router.get("/qa/comparison")
+async def qa_comparison(
+    date_from: date | None = None,
+    date_to: date | None = None,
+    checkin_id: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+    claims: dict = Depends(verify_session_token),
+):
+    """PA decision comparison job (SAA-53).
+    
+    Compares agent decisions with AMAN's actual item decisions.
+    Returns match status, amount delta, and mismatch category for each PA.
+    
+    Use this for:
+    - QA accuracy tracking
+    - Mismatch review workflow
+    - Agent fine-tuning analysis
+    """
+    from services.pa_comparison import get_comparison_records
+    from datetime import datetime, timezone
+    
+    org_id = _dashboard_org_id(claims)
+    
+    # Default to last 7 days
+    today = datetime.now(timezone.utc).date()
+    if date_to is None:
+        date_to = today
+    if date_from is None:
+        date_from = date_to - timedelta(days=6)
+    
+    lagos_tz = ZoneInfo("Africa/Lagos")
+    date_from_dt = datetime.combine(date_from, time.min, tzinfo=lagos_tz)
+    date_to_dt = datetime.combine(date_to + timedelta(days=1), time.min, tzinfo=lagos_tz)
+    
+    result = await get_comparison_records(
+        org_id=org_id,
+        date_from=date_from_dt,
+        date_to=date_to_dt,
+        limit=min(max(limit, 1), 500),
+        offset=max(offset, 0),
+        checkin_id=checkin_id,
+    )
+    
+    return result
+
+
+@router.get("/qa/comparison/summary")
+async def qa_comparison_summary(
+    date_from: date | None = None,
+    date_to: date | None = None,
+    claims: dict = Depends(verify_session_token),
+):
+    """Mismatch summary by category (SAA-53).
+    
+    Returns breakdown of mismatches for weekly reporting.
+    """
+    from services.pa_comparison import get_mismatch_summary
+    from datetime import datetime, timezone
+    
+    org_id = _dashboard_org_id(claims)
+    
+    today = datetime.now(timezone.utc).date()
+    if date_to is None:
+        date_to = today
+    if date_from is None:
+        date_from = date_to - timedelta(days=6)
+    
+    lagos_tz = ZoneInfo("Africa/Lagos")
+    date_from_dt = datetime.combine(date_from, time.min, tzinfo=lagos_tz)
+    date_to_dt = datetime.combine(date_to + timedelta(days=1), time.min, tzinfo=lagos_tz)
+    
+    return await get_mismatch_summary(
+        org_id=org_id,
+        date_from=date_from_dt,
+        date_to=date_to_dt,
+    )
+
+
+@router.get("/qa/comparison/{checkin_id:path}")
+async def qa_score_single(
+    checkin_id: str,
+    claims: dict = Depends(verify_session_token),
+):
+    """Score a single PA by checkin_id (SAA-53)."""
+    from services.pa_comparison import score_single_pa
+    
+    org_id = _dashboard_org_id(claims)
+    return await score_single_pa(org_id=org_id, checkin_id=checkin_id)
+
+
 @router.post("/preauth/retry")
 async def retry_preauth(payload: RetryPreauthPayload, background: BackgroundTasks, claims: dict = Depends(verify_session_token)):
     org_id = await _resolve_mutation_org_id(claims, payload.org_id)
