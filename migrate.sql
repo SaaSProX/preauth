@@ -330,3 +330,40 @@ CREATE TABLE IF NOT EXISTS pa_comments (
 CREATE INDEX IF NOT EXISTS idx_pa_comments_org_id ON pa_comments(org_id);
 CREATE INDEX IF NOT EXISTS idx_pa_comments_request_id ON pa_comments(request_id);
 CREATE INDEX IF NOT EXISTS idx_pa_comments_created_at ON pa_comments(created_at DESC);
+
+-- Mismatch review workflow (SAA-54)
+-- Tracks classification and resolution of agent/AMAN disagreements
+CREATE TABLE IF NOT EXISTS mismatch_reviews (
+    id                    SERIAL PRIMARY KEY,
+    org_id                INT REFERENCES organizations(id),
+    request_id            VARCHAR(100) NOT NULL,
+    checkin_id            VARCHAR(100),
+    reviewer_id           INT REFERENCES clients(id),
+    reviewer_email        VARCHAR(200),
+    
+    -- Classification
+    mismatch_type         VARCHAR(50) NOT NULL,  -- decision | amount | coverage | eligibility
+    cause_category        VARCHAR(50),           -- rule_gap | missing_data | plan_ambiguity | pricing | clinical | aman_override | other
+    
+    -- Details
+    agent_decision        VARCHAR(20),
+    agent_amount          NUMERIC,
+    aman_decision         VARCHAR(20),
+    aman_amount           NUMERIC,
+    amount_delta          NUMERIC,
+    
+    -- Review
+    notes                 TEXT,
+    follow_up_action      TEXT,
+    fix_status            VARCHAR(30) DEFAULT 'open',  -- open | in_progress | fixed | accepted_difference | wont_fix
+    
+    -- Timestamps
+    created_at            TIMESTAMPTZ DEFAULT NOW(),
+    updated_at            TIMESTAMPTZ DEFAULT NOW(),
+    resolved_at           TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_mismatch_reviews_org ON mismatch_reviews(org_id);
+CREATE INDEX IF NOT EXISTS idx_mismatch_reviews_request ON mismatch_reviews(request_id);
+CREATE INDEX IF NOT EXISTS idx_mismatch_reviews_status ON mismatch_reviews(fix_status);
+CREATE INDEX IF NOT EXISTS idx_mismatch_reviews_cause ON mismatch_reviews(cause_category);

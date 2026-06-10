@@ -3085,6 +3085,131 @@ async def check_applied_mode_eligibility(
     }
 
 
+# ─────────────────────────────────────────────
+# Mismatch Review Workflow (SAA-54)
+# ─────────────────────────────────────────────
+
+class CreateMismatchReviewPayload(BaseModel):
+    request_id: str
+    checkin_id: str | None = None
+    mismatch_type: str
+    cause_category: str
+    agent_decision: str | None = None
+    agent_amount: float | None = None
+    aman_decision: str | None = None
+    aman_amount: float | None = None
+    notes: str | None = None
+    follow_up_action: str | None = None
+
+
+class UpdateMismatchReviewPayload(BaseModel):
+    cause_category: str | None = None
+    notes: str | None = None
+    follow_up_action: str | None = None
+    fix_status: str | None = None
+
+
+@router.get("/mismatch-reviews")
+async def list_mismatch_reviews(
+    fix_status: str | None = None,
+    cause_category: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    claims: dict = Depends(verify_session_token),
+):
+    """List mismatch reviews with optional filters (SAA-54)."""
+    from services.mismatch_review import get_reviews
+    
+    org_id = _dashboard_org_id(claims)
+    return await get_reviews(
+        org_id=org_id,
+        fix_status=fix_status,
+        cause_category=cause_category,
+        limit=min(max(limit, 1), 200),
+        offset=max(offset, 0),
+    )
+
+
+@router.get("/mismatch-reviews/summary")
+async def get_mismatch_summary(
+    claims: dict = Depends(verify_session_token),
+):
+    """Get mismatch review summary for weekly reporting (SAA-54)."""
+    from services.mismatch_review import get_review_summary
+    
+    org_id = _dashboard_org_id(claims)
+    return await get_review_summary(org_id=org_id)
+
+
+@router.post("/mismatch-reviews")
+async def create_mismatch_review(
+    payload: CreateMismatchReviewPayload,
+    claims: dict = Depends(verify_session_token),
+):
+    """Create a new mismatch review (SAA-54)."""
+    from services.mismatch_review import create_review
+    
+    org_id = _dashboard_org_id(claims)
+    reviewer_id = int(claims.get("sub", 0))
+    reviewer_email = claims.get("email", "")
+    
+    try:
+        return await create_review(
+            org_id=org_id,
+            request_id=payload.request_id,
+            checkin_id=payload.checkin_id,
+            reviewer_id=reviewer_id,
+            reviewer_email=reviewer_email,
+            mismatch_type=payload.mismatch_type,
+            cause_category=payload.cause_category,
+            agent_decision=payload.agent_decision,
+            agent_amount=payload.agent_amount,
+            aman_decision=payload.aman_decision,
+            aman_amount=payload.aman_amount,
+            notes=payload.notes,
+            follow_up_action=payload.follow_up_action,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.patch("/mismatch-reviews/{review_id}")
+async def update_mismatch_review(
+    review_id: int,
+    payload: UpdateMismatchReviewPayload,
+    claims: dict = Depends(verify_session_token),
+):
+    """Update a mismatch review (SAA-54)."""
+    from services.mismatch_review import update_review
+    
+    org_id = _dashboard_org_id(claims)
+    
+    try:
+        return await update_review(
+            review_id=review_id,
+            org_id=org_id,
+            cause_category=payload.cause_category,
+            notes=payload.notes,
+            follow_up_action=payload.follow_up_action,
+            fix_status=payload.fix_status,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/mismatch-reviews/categories")
+async def get_mismatch_categories(
+    claims: dict = Depends(verify_session_token),
+):
+    """Get valid cause categories and fix statuses (SAA-54)."""
+    from services.mismatch_review import CAUSE_CATEGORIES, FIX_STATUSES
+    
+    return {
+        "cause_categories": CAUSE_CATEGORIES,
+        "fix_statuses": FIX_STATUSES,
+    }
+
+
 @router.post("/preauth/retry")
 async def retry_preauth(payload: RetryPreauthPayload, background: BackgroundTasks, claims: dict = Depends(verify_session_token)):
     org_id = await _resolve_mutation_org_id(claims, payload.org_id)
