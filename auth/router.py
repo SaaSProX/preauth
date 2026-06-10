@@ -2086,9 +2086,9 @@ async def qa_accuracy(
     date_to_end = datetime.combine(date_to + timedelta(days=1), time.min, tzinfo=lagos_tz)
     record_limit = min(max(int(record_limit), 1), 500)
 
-    # One row per PA, joined to its latest explicit AMAN outcome event. The
-    # submitted row remains the intake context; `line_outcomes[]` is the AMAN
-    # final source of truth for scoring.
+    # One row per submitted event that has an explicit AMAN outcome. AMAN batch
+    # approvals can include line outcomes for multiple submitted events in one
+    # payload, so matching must look inside line_outcomes[].partner_advisory.
     rows = await pg_query_all(
         """
         SELECT
@@ -2121,7 +2121,7 @@ async def qa_accuracy(
                      p.raw_payload->'encounter'->>'diagnosis',
                      p.raw_payload->>'diagnosis')                   AS diagnosis,
             p.extracted_fields->'items'                             AS agent_items,
-            p.agent_result                                          AS agent_result,
+            COALESCE(agent3.result, p.agent_result)                 AS agent_result,
             (CASE
                 WHEN (p.extracted_fields->>'total_requested_cost') ~ '^-?[0-9]+(\\.[0-9]+)?$'
                 THEN (p.extracted_fields->>'total_requested_cost')::numeric
@@ -2132,32 +2132,48 @@ async def qa_accuracy(
                 THEN (p.agent_result->>'amount_approved')::numeric
                 ELSE 0
              END)                                                   AS agent_amount,
-            EXTRACT(EPOCH FROM (p.processed_at - p.received_at))::float AS agent_latency_s,
+            EXTRACT(EPOCH FROM (agent3.logged_at - submitted.created_at))::float AS agent_latency_s,
             outcome.raw_payload                                     AS aman_payload,
             outcome.event_type                                      AS aman_event_type,
             COALESCE(outcome.occurred_at, outcome.last_seen_at, outcome.created_at) AS aman_event_at,
             submitted.event_id                                      AS submitted_event_id,
             submitted.correlation_id                                AS submitted_correlation_id,
+            submitted.event_sequence                                AS submitted_event_sequence,
             submitted.raw_payload                                   AS submitted_payload,
             submitted.extracted_fields                              AS submitted_extracted_fields,
             COALESCE(submitted.occurred_at, submitted.submitted_at, submitted.last_seen_at, submitted.created_at) AS submitted_event_at,
             submitted.created_at                                     AS submitted_webhook_received_at,
             agentlog.agent_logs                                      AS agent_logs
-        FROM preauth_logs p
+        FROM preauth_events submitted
+        JOIN preauth_logs p ON p.id = submitted.preauth_log_id
+        LEFT JOIN LATERAL (
+            SELECT MIN(e2.created_at) AS next_submitted_at
+            FROM preauth_events e2
+            WHERE e2.org_id = submitted.org_id
+              AND e2.checkin_id = submitted.checkin_id
+              AND LOWER(COALESCE(e2.event_type, '')) = 'pa.submitted'
+              AND e2.event_sequence > submitted.event_sequence
+        ) next_sub ON TRUE
         LEFT JOIN LATERAL (
             SELECT raw_payload, event_type, occurred_at, last_seen_at, created_at, event_sequence
             FROM preauth_events e
-            WHERE e.org_id = p.org_id
+            WHERE e.org_id = submitted.org_id
               AND LOWER(COALESCE(e.event_type, '')) IN ('pa.approved', 'pa.rejected', 'pa.finalized', 'pa.updated')
               AND e.raw_payload ? 'line_outcomes'
+              AND e.checkin_id = submitted.checkin_id
               AND (
-                e.preauth_log_id = p.id
-                OR e.request_id = p.request_id
-                OR e.checkin_id = COALESCE(
-                    p.raw_payload->'encounter'->>'checkin_id',
-                    p.raw_payload->>'checkin_id',
-                    p.extracted_fields->>'checkin_id',
-                    p.request_id
+                e.correlation_id IN (submitted.correlation_id, submitted.event_id)
+                OR e.raw_payload->>'correlation_id' IN (submitted.correlation_id, submitted.event_id)
+                OR EXISTS (
+                    SELECT 1
+                    FROM jsonb_array_elements(
+                        CASE
+                            WHEN jsonb_typeof(e.raw_payload->'line_outcomes') = 'array'
+                            THEN e.raw_payload->'line_outcomes'
+                            ELSE '[]'::jsonb
+                        END
+                    ) AS line(value)
+                    WHERE NULLIF(line.value->'partner_advisory'->>'correlation_id', '') IN (submitted.correlation_id, submitted.event_id)
                 )
               )
             ORDER BY COALESCE(e.occurred_at, e.last_seen_at, e.created_at) DESC,
@@ -2165,35 +2181,18 @@ async def qa_accuracy(
             LIMIT 1
         ) outcome ON TRUE
         LEFT JOIN LATERAL (
-            SELECT event_id, correlation_id, raw_payload, extracted_fields, occurred_at, submitted_at, last_seen_at, created_at, event_sequence
-            FROM preauth_events e
-            WHERE e.org_id = p.org_id
-              AND LOWER(COALESCE(e.event_type, '')) = 'pa.submitted'
+            SELECT al.result, al.logged_at
+            FROM agent_logs al
+            WHERE al.request_id = p.request_id
+              AND al.agent_num = 3
+              AND al.logged_at >= submitted.created_at
               AND (
-                e.preauth_log_id = p.id
-                OR e.request_id = p.request_id
-                OR e.checkin_id = COALESCE(
-                    p.raw_payload->'encounter'->>'checkin_id',
-                    p.raw_payload->>'checkin_id',
-                    p.extracted_fields->>'checkin_id',
-                    p.request_id
-                )
+                next_sub.next_submitted_at IS NULL
+                OR al.logged_at < next_sub.next_submitted_at
               )
-            ORDER BY
-              CASE
-                WHEN outcome.raw_payload IS NOT NULL
-                 AND (
-                   e.event_id = outcome.raw_payload->>'correlation_id'
-                   OR e.correlation_id = outcome.raw_payload->>'correlation_id'
-                   OR e.correlation_id = outcome.raw_payload->>'event_id'
-                 )
-                THEN 0
-                ELSE 1
-              END,
-              COALESCE(e.occurred_at, e.submitted_at, e.last_seen_at, e.created_at) DESC,
-              e.event_sequence DESC
+            ORDER BY al.logged_at DESC
             LIMIT 1
-        ) submitted ON TRUE
+        ) agent3 ON TRUE
         LEFT JOIN LATERAL (
             SELECT COALESCE(
                 jsonb_agg(
@@ -2210,16 +2209,18 @@ async def qa_accuracy(
             ) AS agent_logs
             FROM agent_logs al
             WHERE al.request_id = p.request_id
+              AND al.logged_at >= submitted.created_at - INTERVAL '3 minutes'
               AND (
-                submitted.created_at IS NULL
-                OR al.logged_at >= submitted.created_at - INTERVAL '3 minutes'
+                next_sub.next_submitted_at IS NULL
+                OR al.logged_at < next_sub.next_submitted_at
               )
               AND (
                 outcome.raw_payload IS NULL
                 OR al.logged_at <= COALESCE(outcome.occurred_at, outcome.last_seen_at, outcome.created_at) + INTERVAL '5 seconds'
               )
         ) agentlog ON TRUE
-        WHERE p.org_id = $1
+        WHERE submitted.org_id = $1
+          AND LOWER(COALESCE(submitted.event_type, '')) = 'pa.submitted'
           AND outcome.raw_payload IS NOT NULL
           AND COALESCE(submitted.occurred_at, submitted.submitted_at, submitted.last_seen_at, submitted.created_at, p.received_at) >= $2::timestamptz
           AND COALESCE(submitted.occurred_at, submitted.submitted_at, submitted.last_seen_at, submitted.created_at, p.received_at) < $3::timestamptz
@@ -2311,6 +2312,17 @@ async def qa_accuracy(
               AND (
                 outcome.correlation_id = e.correlation_id
                 OR outcome.raw_payload->>'correlation_id' = e.correlation_id
+                OR EXISTS (
+                    SELECT 1
+                    FROM jsonb_array_elements(
+                        CASE
+                            WHEN jsonb_typeof(outcome.raw_payload->'line_outcomes') = 'array'
+                            THEN outcome.raw_payload->'line_outcomes'
+                            ELSE '[]'::jsonb
+                        END
+                    ) AS line(value)
+                    WHERE NULLIF(line.value->'partner_advisory'->>'correlation_id', '') IN (e.correlation_id, e.event_id)
+                )
               )
           )
         ORDER BY e.created_at DESC, e.event_sequence DESC
@@ -2759,8 +2771,9 @@ async def qa_accuracy(
             or _qa_parse_dt(r.get("received_at"))
         )
         webhook_received_dt = _qa_parse_dt(r.get("submitted_webhook_received_at")) or _qa_parse_dt(r.get("received_at"))
+        event_suffix = f"#event-{r.get('submitted_event_sequence')}" if r.get("submitted_event_sequence") else ""
         enriched.append({
-            "request_id": r["request_id"],
+            "request_id": f"{r['request_id']}{event_suffix}",
             "display_request_id": r["request_id"],
             "patient_id": r["patient_id"],
             "patient_name": submitted_fields.get("patient_name") or r.get("patient_name") or aman_patient_name,
