@@ -2595,11 +2595,11 @@ async def qa_accuracy(
             item_compare.append({
                 "claim_item_id": cid_raw,
                 "name": (
-                    line.get("item_name")
-                    or intake_item.get("item_name")
+                    intake_item.get("item_name")
                     or intake_item.get("name")
                     or ag.get("name")
                     or ag.get("item_name")
+                    or line.get("item_name")
                     or "(unnamed item)"
                 ),
                 "quantity": line.get("quantity") or intake_item.get("quantity") or ag.get("quantity"),
