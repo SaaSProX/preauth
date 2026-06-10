@@ -2220,6 +2220,7 @@ async def qa_accuracy(
               )
         ) agentlog ON TRUE
         WHERE p.org_id = $1
+          AND outcome.raw_payload IS NOT NULL
           AND COALESCE(submitted.occurred_at, submitted.submitted_at, submitted.last_seen_at, submitted.created_at, p.received_at) >= $2::timestamptz
           AND COALESCE(submitted.occurred_at, submitted.submitted_at, submitted.last_seen_at, submitted.created_at, p.received_at) < $3::timestamptz
         ORDER BY COALESCE(submitted.occurred_at, submitted.submitted_at, submitted.last_seen_at, submitted.created_at, p.received_at) DESC
@@ -2300,15 +2301,6 @@ async def qa_accuracy(
           AND LOWER(COALESCE(e.event_type, '')) = 'pa.submitted'
           AND COALESCE(e.occurred_at, e.submitted_at, e.last_seen_at, e.created_at) >= $2::timestamptz
           AND COALESCE(e.occurred_at, e.submitted_at, e.last_seen_at, e.created_at) < $3::timestamptz
-          AND EXISTS (
-            SELECT 1
-            FROM preauth_events prior_outcome
-            WHERE prior_outcome.org_id = e.org_id
-              AND prior_outcome.checkin_id = e.checkin_id
-              AND LOWER(COALESCE(prior_outcome.event_type, '')) IN ('pa.approved', 'pa.rejected', 'pa.finalized', 'pa.updated')
-              AND prior_outcome.raw_payload ? 'line_outcomes'
-              AND prior_outcome.event_sequence < e.event_sequence
-          )
           AND NOT EXISTS (
             SELECT 1
             FROM preauth_events outcome
