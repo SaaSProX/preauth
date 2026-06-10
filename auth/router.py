@@ -1897,6 +1897,56 @@ def _qa_parse_dt(value) -> datetime | None:
     return parsed.astimezone(timezone.utc) if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
+def _qa_scope_line_outcomes_to_submission(
+    line_outcomes: list[dict],
+    submitted_event_id: str | None,
+    submitted_correlation_id: str | None,
+    submitted_at: datetime | None,
+) -> list[dict]:
+    """Keep only AMAN line outcomes that belong to one submitted event.
+
+    AMAN `pa.approved` payloads are cumulative for the check-in. A single final
+    event can repeat older approved lines, so accuracy must score only the lines
+    tied to the submitted event under review.
+    """
+    if not line_outcomes:
+        return []
+
+    correlation_keys = {
+        str(value).strip()
+        for value in (submitted_event_id, submitted_correlation_id)
+        if str(value or "").strip()
+    }
+    if correlation_keys:
+        matched = []
+        for line in line_outcomes:
+            if not isinstance(line, dict):
+                continue
+            advisory = line.get("partner_advisory") if isinstance(line.get("partner_advisory"), dict) else {}
+            if str(advisory.get("correlation_id") or "").strip() in correlation_keys:
+                matched.append(line)
+        if matched:
+            return matched
+
+    if submitted_at is not None:
+        # Fallback for legacy/manual lines without partner_advisory correlation.
+        # Allow a small skew because AMAN timestamps may precede our webhook
+        # receipt by a few seconds.
+        threshold = submitted_at - timedelta(minutes=2)
+        matched = []
+        for line in line_outcomes:
+            if not isinstance(line, dict):
+                continue
+            decision = line.get("aman_decision") if isinstance(line.get("aman_decision"), dict) else {}
+            decided_at = _qa_parse_dt(decision.get("decided_at"))
+            if decided_at is not None and decided_at >= threshold:
+                matched.append(line)
+        if matched:
+            return matched
+
+    return line_outcomes
+
+
 def _qa_classify(agent: str | None, aman: str | None,
                  agent_amount: float, aman_amount: float,
                  tol: float, require_amount: bool,
@@ -2086,6 +2136,8 @@ async def qa_accuracy(
             outcome.raw_payload                                     AS aman_payload,
             outcome.event_type                                      AS aman_event_type,
             COALESCE(outcome.occurred_at, outcome.last_seen_at, outcome.created_at) AS aman_event_at,
+            submitted.event_id                                      AS submitted_event_id,
+            submitted.correlation_id                                AS submitted_correlation_id,
             submitted.raw_payload                                   AS submitted_payload,
             submitted.extracted_fields                              AS submitted_extracted_fields,
             COALESCE(submitted.occurred_at, submitted.submitted_at, submitted.last_seen_at, submitted.created_at) AS submitted_event_at,
@@ -2113,7 +2165,7 @@ async def qa_accuracy(
             LIMIT 1
         ) outcome ON TRUE
         LEFT JOIN LATERAL (
-            SELECT raw_payload, extracted_fields, occurred_at, submitted_at, last_seen_at, created_at, event_sequence
+            SELECT event_id, correlation_id, raw_payload, extracted_fields, occurred_at, submitted_at, last_seen_at, created_at, event_sequence
             FROM preauth_events e
             WHERE e.org_id = p.org_id
               AND LOWER(COALESCE(e.event_type, '')) = 'pa.submitted'
@@ -2285,6 +2337,7 @@ async def qa_accuracy(
                 e.request_id AS event_request_id,
                 e.event_sequence,
                 e.created_at,
+                COALESCE(e.occurred_at, e.submitted_at, e.created_at) AS submitted_at,
                 COALESCE(NULLIF(p.callback_mode, ''), 'advisory') AS mode,
                 COALESCE(p.request_id, e.request_id, e.checkin_id) AS log_request_id,
                 COALESCE(e.items_added_total, e.total_requested_cost, 0)::float AS submitted_value,
@@ -2418,6 +2471,13 @@ async def qa_accuracy(
                         ELSE '[]'::jsonb
                     END
                 ) AS line(value)
+                WHERE (
+                    NULLIF(line.value->'partner_advisory'->>'correlation_id', '') IN (s.submitted_correlation_id, s.submitted_event_id)
+                    OR (
+                        (line.value->'aman_decision'->>'decided_at') ~ '^\\d{4}-\\d{2}-\\d{2}'
+                        AND ((line.value->'aman_decision'->>'decided_at')::timestamp AT TIME ZONE 'UTC') >= (s.submitted_at - INTERVAL '2 minutes')
+                    )
+                )
             ) outcome_stats ON TRUE
             GROUP BY s.mode
         )
@@ -2497,6 +2557,13 @@ async def qa_accuracy(
         if not isinstance(outcome_payload, dict):
             outcome_payload = {}
         line_outcomes = _list_of_dicts(outcome_payload.get("line_outcomes"))
+        submitted_event_dt_for_scope = _qa_parse_dt(r.get("submitted_event_at"))
+        line_outcomes = _qa_scope_line_outcomes_to_submission(
+            line_outcomes,
+            r.get("submitted_event_id"),
+            r.get("submitted_correlation_id"),
+            submitted_event_dt_for_scope,
+        )
 
         intake_enrollee = _dict(intake_payload.get("enrollee"))
         outcome_enrollee = _dict(outcome_payload.get("enrollee"))
