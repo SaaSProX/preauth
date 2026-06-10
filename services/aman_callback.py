@@ -283,12 +283,18 @@ async def _record_callback(request_id, *, status, http_status, error):
         logger.exception("[AmanCallback] failed to record status for %s", request_id)
 
 
-async def send_decision_to_aman(request_id: str, *, force: bool = False) -> dict:
+async def send_decision_to_aman(request_id: str, *, force: bool = False, check_guardrails: bool = True) -> dict:
     """Read the stored decision and POST it back to Aman.
 
     Records the outcome on preauth_logs.callback_* and returns a short
     status dict. Never raises.
+    
+    When check_guardrails=True (default), the decision mode is determined by
+    the applied_guardrails service. Decisions outside guardrails are sent as
+    advisory-only even if applied_mode_enabled=True.
     """
+    from services.applied_guardrails import check_guardrails as run_guardrails, GuardrailResult
+    
     url = settings.aman_decisions_url
     key = settings.kpa_key
 
@@ -308,7 +314,75 @@ async def send_decision_to_aman(request_id: str, *, force: bool = False) -> dict
         await _record_callback(request_id, status="skipped_no_row", http_status=None, error=None)
         return {"status": "skipped_no_row"}
 
+    # Check guardrails to determine applied vs advisory mode
+    callback_mode = "advisory"
+    guardrail_result = None
+    
+    if check_guardrails:
+        raw = _coerce_dict(row.get("raw_payload"))
+        ar = _coerce_dict(row.get("agent_result"))
+        enc = raw.get("encounter") if isinstance(raw.get("encounter"), dict) else {}
+        
+        # Extract items for guardrail check
+        items = raw.get("pa_items") or raw.get("items") or raw.get("requested_items") or []
+        if isinstance(items, str):
+            try:
+                items = json.loads(items)
+            except (json.JSONDecodeError, ValueError):
+                items = []
+        
+        # Calculate total requested
+        total_requested = sum(_item_cost(item) for item in items if isinstance(item, dict))
+        
+        # Get utilization percentage if available
+        util = raw.get("utilization") or {}
+        annual_used = _number(util.get("maximum_annual_benefit_used"))
+        annual_limit = _number(util.get("maximum_annual_benefit_limit"))
+        utilization_pct = (annual_used / annual_limit) if annual_used and annual_limit else None
+        
+        # Check eligibility completeness
+        elig = raw.get("eligibility") or ar.get("agent1", {}).get("checks", {})
+        eligibility_complete = bool(
+            elig and 
+            elig.get("status_active") is not None and
+            elig.get("not_expired") is not None
+        )
+        
+        guardrail_result = run_guardrails(
+            agent_decision=row.get("decision") or ar.get("decision") or "",
+            agent_confidence=ar.get("confidence") or "",
+            agent_amount=_number(ar.get("amount_approved")),
+            total_requested=total_requested,
+            items=items,
+            care_type=enc.get("care_type"),
+            plan_name=raw.get("policy", {}).get("plan_name"),
+            utilization_pct=utilization_pct,
+            eligibility_complete=eligibility_complete,
+        )
+        
+        callback_mode = guardrail_result.mode
+        logger.info(
+            "[AmanCallback] guardrails request_id=%s mode=%s violations=%s",
+            request_id, callback_mode, guardrail_result.violations
+        )
+    
+    # Record the callback mode
+    try:
+        await pg_execute(
+            "UPDATE preauth_logs SET callback_mode = $2 WHERE request_id = $1",
+            str(request_id), callback_mode
+        )
+    except Exception:
+        logger.exception("[AmanCallback] failed to record callback_mode for %s", request_id)
+
     payload = _build_payload(dict(row))
+    
+    # Update event_type based on mode
+    if callback_mode == "applied":
+        payload["event_type"] = "pa.decision.applied"
+    else:
+        payload["event_type"] = "pa.decision.advisory"
+    
     if not payload.get("line_decisions"):
         await _record_callback(
             request_id,

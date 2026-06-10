@@ -2985,6 +2985,106 @@ async def qa_score_single(
     return await score_single_pa(org_id=org_id, checkin_id=checkin_id)
 
 
+@router.get("/applied-mode/config")
+async def get_applied_mode_config(
+    claims: dict = Depends(verify_session_token),
+):
+    """Get current applied-mode guardrail configuration (SAA-61).
+    
+    Returns thresholds, allowlists, and denylists for applied mode.
+    Useful for dashboard display and debugging.
+    """
+    from services.applied_guardrails import get_guardrail_config
+    return get_guardrail_config()
+
+
+@router.post("/applied-mode/check")
+async def check_applied_mode_eligibility(
+    request_id: str,
+    claims: dict = Depends(verify_session_token),
+):
+    """Check if a specific PA is eligible for applied mode (SAA-61).
+    
+    Returns guardrail check result with mode and any violations.
+    """
+    from services.applied_guardrails import check_guardrails
+    import json
+    
+    org_id = _dashboard_org_id(claims)
+    
+    row = await pg_query_one(
+        """
+        SELECT request_id, raw_payload, agent_result, decision
+        FROM preauth_logs
+        WHERE org_id = $1 AND request_id = $2
+        """,
+        org_id, request_id.strip()
+    )
+    
+    if not row:
+        raise HTTPException(status_code=404, detail="PA not found")
+    
+    raw = row.get("raw_payload") or {}
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            raw = {}
+    
+    ar = row.get("agent_result") or {}
+    if isinstance(ar, str):
+        try:
+            ar = json.loads(ar)
+        except (json.JSONDecodeError, ValueError):
+            ar = {}
+    
+    enc = raw.get("encounter") if isinstance(raw.get("encounter"), dict) else {}
+    items = raw.get("pa_items") or raw.get("items") or raw.get("requested_items") or []
+    
+    def _num(v):
+        try:
+            return float(v)
+        except:
+            return None
+    
+    total_requested = sum(
+        float(_num(item.get("requested_cost")) or _num(item.get("cost")) or 0)
+        for item in items if isinstance(item, dict)
+    )
+    
+    util = raw.get("utilization") or {}
+    annual_used = _num(util.get("maximum_annual_benefit_used"))
+    annual_limit = _num(util.get("maximum_annual_benefit_limit"))
+    utilization_pct = (annual_used / annual_limit) if annual_used and annual_limit else None
+    
+    elig = raw.get("eligibility") or ar.get("agent1", {}).get("checks", {})
+    eligibility_complete = bool(
+        elig and 
+        elig.get("status_active") is not None and
+        elig.get("not_expired") is not None
+    )
+    
+    result = check_guardrails(
+        agent_decision=row.get("decision") or ar.get("decision") or "",
+        agent_confidence=ar.get("confidence") or "",
+        agent_amount=_num(ar.get("amount_approved")),
+        total_requested=total_requested,
+        items=items,
+        care_type=enc.get("care_type"),
+        plan_name=raw.get("policy", {}).get("plan_name"),
+        utilization_pct=utilization_pct,
+        eligibility_complete=eligibility_complete,
+    )
+    
+    return {
+        "request_id": request_id,
+        "can_apply": result.can_apply,
+        "mode": result.mode,
+        "reason": result.reason,
+        "violations": result.violations,
+    }
+
+
 @router.post("/preauth/retry")
 async def retry_preauth(payload: RetryPreauthPayload, background: BackgroundTasks, claims: dict = Depends(verify_session_token)):
     org_id = await _resolve_mutation_org_id(claims, payload.org_id)
