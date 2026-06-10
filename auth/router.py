@@ -2594,11 +2594,18 @@ async def qa_accuracy(
 
         aman, aman_amount, aman_counts = _qa_aman_from_line_outcomes(line_outcomes)
 
-        # AMAN review window = when AMAN received/held our advisory to AMAN's
-        # explicit final outcome timestamp.
+        # AMAN review window usually starts when AMAN has our advisory. Some
+        # fast/manual approvals can finalize before our callback is delivered;
+        # in that case, fall back to submitted_at -> AMAN final instead of
+        # leaving the review time blank.
         aman_event_at = r.get("aman_event_at")
         aman_event_dt = _qa_parse_dt(aman_event_at)
         callback_sent_at = r.get("callback_sent_at")
+        submitted_anchor = (
+            submitted_event_dt_for_scope
+            or _qa_parse_dt(r.get("submitted_webhook_received_at"))
+            or _qa_parse_dt(r.get("received_at"))
+        )
         partner_anchor_candidates: list[datetime] = []
         for line in line_outcomes:
             advisory = line.get("partner_advisory") if isinstance(line.get("partner_advisory"), dict) else {}
@@ -2609,24 +2616,27 @@ async def qa_accuracy(
         partner_anchor = min(partner_anchor_candidates) if partner_anchor_candidates else None
         aman_review_min = None
         if aman is not None and aman_event_dt is not None:
-            anchor = (
+            advisory_anchor = (
                 partner_anchor
                 or _qa_parse_dt(callback_sent_at)
                 or _qa_parse_dt(r.get("processed_at"))
                 or _qa_parse_dt(r.get("received_at"))
             )
-            if anchor and aman_event_dt > anchor:
-                aman_review_min = (aman_event_dt - anchor).total_seconds() / 60.0
+            if advisory_anchor and aman_event_dt >= advisory_anchor:
+                aman_review_min = (aman_event_dt - advisory_anchor).total_seconds() / 60.0
+            elif submitted_anchor and aman_event_dt >= submitted_anchor:
+                aman_review_min = (aman_event_dt - submitted_anchor).total_seconds() / 60.0
 
         bucket, category = _qa_classify(
             agent, aman, agent_amount, aman_amount,
             tol, bool(require_amount_match), aman_counts,
         )
 
-        total_end_to_end_min = (
-            (aman_review_min + (agent_lat_s or 0) / 60.0)
-            if aman_review_min is not None else None
-        )
+        total_end_to_end_min = None
+        if aman_event_dt is not None and submitted_anchor and aman_event_dt >= submitted_anchor:
+            total_end_to_end_min = (aman_event_dt - submitted_anchor).total_seconds() / 60.0
+        elif aman_review_min is not None:
+            total_end_to_end_min = aman_review_min + (agent_lat_s or 0) / 60.0
 
         agent_by_id: dict[str, dict] = {}
         for d in agent_item_decisions:
