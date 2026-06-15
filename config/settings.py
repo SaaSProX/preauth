@@ -4,6 +4,7 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     # Anthropic
     anthropic_api_key: str = ""
+    anthropic_model: str = "claude-sonnet-4-6"
  
     # Aman HMO DB (MySQL)
     aman_db_host: str = ""
@@ -88,6 +89,7 @@ class Settings(BaseSettings):
 
     @field_validator(
         "aman_decisions_url",
+        "anthropic_model",
         "kpa_key",
         "cors_origins",
         "dashboard_base_url",
