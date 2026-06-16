@@ -367,3 +367,35 @@ CREATE INDEX IF NOT EXISTS idx_mismatch_reviews_org ON mismatch_reviews(org_id);
 CREATE INDEX IF NOT EXISTS idx_mismatch_reviews_request ON mismatch_reviews(request_id);
 CREATE INDEX IF NOT EXISTS idx_mismatch_reviews_status ON mismatch_reviews(fix_status);
 CREATE INDEX IF NOT EXISTS idx_mismatch_reviews_cause ON mismatch_reviews(cause_category);
+
+-- ============================================================================
+-- SAA-85: Performance indexes for common query patterns
+-- ============================================================================
+
+-- Preauth logs: patient history and dashboard queries
+CREATE INDEX IF NOT EXISTS idx_preauth_logs_patient_id ON preauth_logs(patient_id);
+CREATE INDEX IF NOT EXISTS idx_preauth_logs_org_patient ON preauth_logs(org_id, patient_id);
+CREATE INDEX IF NOT EXISTS idx_preauth_logs_decision ON preauth_logs(decision);
+CREATE INDEX IF NOT EXISTS idx_preauth_logs_org_received ON preauth_logs(org_id, received_at DESC);
+CREATE INDEX IF NOT EXISTS idx_preauth_logs_callback_status ON preauth_logs(callback_status);
+
+-- Preauth events: event type filtering and joins
+CREATE INDEX IF NOT EXISTS idx_preauth_events_event_type ON preauth_events(event_type);
+CREATE INDEX IF NOT EXISTS idx_preauth_events_request_id ON preauth_events(request_id);
+CREATE INDEX IF NOT EXISTS idx_preauth_events_org_type_created ON preauth_events(org_id, event_type, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_preauth_events_org_checkin ON preauth_events(org_id, checkin_id);
+
+-- Agent logs: latency calculations
+CREATE INDEX IF NOT EXISTS idx_agent_logs_agent_num ON agent_logs(agent_num);
+CREATE INDEX IF NOT EXISTS idx_agent_logs_request_agent ON agent_logs(request_id, agent_num);
+
+-- Webhook delivery logs: duplicate tracking
+CREATE INDEX IF NOT EXISTS idx_webhook_delivery_logs_db_status ON webhook_delivery_logs(db_insert_status);
+CREATE INDEX IF NOT EXISTS idx_webhook_delivery_logs_org_status_created ON webhook_delivery_logs(org_id, db_insert_status, created_at DESC);
+
+-- Clients: login and authentication
+CREATE INDEX IF NOT EXISTS idx_clients_email ON clients(email);
+
+-- API clients: key lookup
+CREATE INDEX IF NOT EXISTS idx_api_clients_api_key ON api_clients(api_key);
+CREATE INDEX IF NOT EXISTS idx_api_clients_org_active ON api_clients(org_id, is_active);
