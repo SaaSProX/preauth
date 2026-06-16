@@ -12,3 +12,4 @@ pyjwt
 python-multipart
 certifi
 httpx
+slowapi

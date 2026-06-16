@@ -7,6 +7,7 @@ from datetime import date, datetime
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from agent import agent
 from config.settings import settings
+from middleware.rate_limit import limiter
 from services.db import pg_execute, pg_query_one
 from services.preauth_events import persist_preauth_intake_event
 from services.webhook_delivery import (
@@ -399,6 +400,7 @@ def extract_preauth_fields(payload: dict):
 
 
 @router.post("/webhook/preauth")
+@limiter.limit(settings.rate_limit_webhook)
 async def receive_preauth(
     request: Request,
     background: BackgroundTasks,
