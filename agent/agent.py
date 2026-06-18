@@ -1147,6 +1147,12 @@ def _build_item_decision(
 ) -> dict:
     amount = _item_cost(item) if requested_cost is None else requested_cost
     approved_cost = amount if decision == "APPROVE" else 0
+    coverage_reason = (coverage or {}).get("reason")
+    reviewer_reason = _reviewer_item_reason(
+        decision,
+        coverage_reason=coverage_reason,
+        utilization_reason=reason,
+    )
     return {
         "claim_item_id": _item_id(item),
         "facility_tariff_item_id": item.get("facility_tariff_item_id"),
@@ -1160,9 +1166,10 @@ def _build_item_decision(
         "source_item_status": _item_status(item),
         "decision": decision,
         "recommendation": "approve" if decision == "APPROVE" else "reject" if decision == "DENY" else "review",
-        "reason": reason,
+        "reason": reviewer_reason,
+        "utilization_reason": reason,
         "coverage_decision": _coverage_decision(coverage),
-        "coverage_reason": (coverage or {}).get("reason"),
+        "coverage_reason": coverage_reason,
         "benefit_category": (coverage or {}).get("benefit_category"),
         "bucket_key": bucket_key,
         "bucket": bucket_name,
@@ -1178,6 +1185,28 @@ def _build_item_decision(
         "bucket_remaining_after": bucket_remaining_after,
         "bucket_exceeded": bucket_exceeded,
     }
+
+
+def _reviewer_item_reason(
+    decision: str,
+    *,
+    coverage_reason: str | None,
+    utilization_reason: str | None,
+) -> str:
+    """Create the line-level rationale shown to AMAN reviewers."""
+    coverage_text = str(coverage_reason or "").strip()
+    utilization_text = str(utilization_reason or "").strip()
+    decision_text = str(decision or "").upper()
+
+    if decision_text == "APPROVE":
+        parts = []
+        if coverage_text:
+            parts.append(coverage_text)
+        if utilization_text and utilization_text != coverage_text:
+            parts.append(f"Utilization check: {utilization_text}")
+        return " ".join(parts) or "Approved based on eligibility, coverage, and utilization checks."
+
+    return utilization_text or coverage_text or "Requires manual review based on eligibility, coverage, or utilization checks."
 
 
 def _summarize_item_utilization(item_decisions: list[dict], fallback_reason: str | None = None) -> dict:
