@@ -12,6 +12,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 TODAY = date.today().isoformat()
+ANTHROPIC_INPUT_USD_PER_1M = 3.0
+ANTHROPIC_OUTPUT_USD_PER_1M = 15.0
 
 
 class AgentJSONParseError(ValueError):
@@ -330,6 +332,32 @@ def _parse_agent_json(raw: str) -> dict:
     raise AgentJSONParseError(str(last_error), raw) from last_error
 
 
+def _anthropic_usage_payload(response) -> dict:
+    usage = getattr(response, "usage", None)
+    input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+    output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+    cache_creation_input_tokens = int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
+    cache_read_input_tokens = int(getattr(usage, "cache_read_input_tokens", 0) or 0)
+    estimated_cost_usd = (
+        (input_tokens / 1_000_000) * ANTHROPIC_INPUT_USD_PER_1M
+        + (output_tokens / 1_000_000) * ANTHROPIC_OUTPUT_USD_PER_1M
+    )
+    return {
+        "provider": "anthropic",
+        "model": settings.anthropic_model,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_creation_input_tokens": cache_creation_input_tokens,
+        "cache_read_input_tokens": cache_read_input_tokens,
+        "total_tokens": input_tokens + output_tokens,
+        "estimated_cost_usd": estimated_cost_usd,
+        "pricing": {
+            "input_usd_per_1m": ANTHROPIC_INPUT_USD_PER_1M,
+            "output_usd_per_1m": ANTHROPIC_OUTPUT_USD_PER_1M,
+        },
+    }
+
+
 async def _call_claude(system_prompt: str, user_message: str, *, max_tokens: int = 1000) -> dict:
     """Call Claude API and return parsed JSON response."""
     response = await client.messages.create(
@@ -339,7 +367,9 @@ async def _call_claude(system_prompt: str, user_message: str, *, max_tokens: int
         messages=[{"role": "user", "content": user_message}],
     )
     raw = response.content[0].text.strip()
-    return _parse_agent_json(raw)
+    parsed = _parse_agent_json(raw)
+    parsed["__model_usage"] = _anthropic_usage_payload(response)
+    return parsed
 
 
 def _parse_json_field(value):
@@ -753,19 +783,39 @@ def _coverage_decision(coverage: dict | None) -> str:
 
 async def _log_agent(request_id: str, agent_num: int, agent_name: str, result: dict):
     """Save individual agent result to agent_logs table and log to console."""
+    model_usage = result.pop("__model_usage", None) if isinstance(result, dict) else None
     passed = result.get("pass", result.get("decision") == "APPROVE")
     status = "pass" if passed else "fail"
     logger.info(f"[Agent {agent_num} - {agent_name}] status={status} | {json.dumps(result)}")
     await pg_execute(
         """
-        INSERT INTO agent_logs (request_id, agent_num, agent_name, status, result, logged_at)
-        VALUES ($1, $2, $3, $4, $5::jsonb, NOW())
+        INSERT INTO agent_logs (
+            request_id,
+            agent_num,
+            agent_name,
+            status,
+            result,
+            model,
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            estimated_cost_usd,
+            model_usage,
+            logged_at
+        )
+        VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11::jsonb, NOW())
         """,
         str(request_id),
         agent_num,
         agent_name,
         status,
-        json.dumps(result)
+        json.dumps(result),
+        model_usage.get("model") if model_usage else None,
+        model_usage.get("input_tokens") if model_usage else None,
+        model_usage.get("output_tokens") if model_usage else None,
+        model_usage.get("total_tokens") if model_usage else None,
+        model_usage.get("estimated_cost_usd") if model_usage else None,
+        json.dumps(model_usage) if model_usage else None,
     )
 
 
