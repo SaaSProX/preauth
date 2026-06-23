@@ -157,7 +157,7 @@ radical hysterectomy, complex myomectomy, obstetric hysterectomy,
 surgery for ruptured ectopic pregnancy, pelvic reconstructive surgery
 
 ──────────────────────────────────────────
-MATERNITY & NEONATAL SERVICES (all plans)
+MATERNITY & NEONATAL SERVICES (family plan subscribers only)
 ──────────────────────────────────────────
 Antenatal Care: Covered | Normal Delivery: Covered | Induction of Labour: Covered
 Caesarean Section: Covered (up to surgical limit) | Postnatal Care (6 weeks): Covered
@@ -171,13 +171,14 @@ SPECIAL RULES
 2. FIRST YEAR SURGICAL EXCLUSION: Non-accidental surgical claims within the first year of cover are excluded.
 3. CHRONIC DISEASE WAITING PERIOD: Hypertension, Diabetes, Hyperlipidemia, and similar chronic diseases have a 6-month waiting period from enrollment date.
 4. PREGNANCY WAITING PERIOD: Pregnancy has a 9-month waiting period. Delivery is NOT covered in the first year of enrollment.
-5. AGE LIMIT: Principal must be 65 or under. Above 65 → must be on Senior Citizens Plan, not standard plans.
-6. OPTICAL LENSES: Once every 2 years only.
-7. HEALTH CHECKS: Only at designated centers during institutions' health week. Non-refundable otherwise.
-8. GYM/SPA: Principal only.
-9. NEWBORN REGISTRATION: Newborns not registered within 6 weeks of birth are excluded.
-10. ROOM TYPE: Bronze=General Ward, Silver=Semi-Private, Gold/Platinum/Platinum Plus=Private. Upgrades not covered.
-11. NEONATAL BENEFIT: Drawn from nursing mother's limit (live birth only).
+5. MATERNITY/NEONATAL FAMILY PLAN RULE: Maternity and neonatal benefits are exclusive to family plan subscribers. If family plan/subscriber type is unknown, ESCALATE rather than deny or approve solely on plan tier.
+6. AGE LIMIT: Principal must be 65 or under. Above 65 → must be on Senior Citizens Plan, not standard plans.
+7. OPTICAL LENSES: Once every 2 years only.
+8. HEALTH CHECKS: Only at designated centers during institutions' health week. Non-refundable otherwise.
+9. GYM/SPA: Principal only.
+10. NEWBORN REGISTRATION: Newborns not registered within 6 weeks of birth are excluded.
+11. ROOM TYPE: Bronze=General Ward, Silver=Semi-Private, Gold/Platinum/Platinum Plus=Private. Upgrades not covered.
+12. NEONATAL BENEFIT: Drawn from nursing mother's limit (live birth only).
 
 ──────────────────────────────────────────
 EXCLUSIONS — ALWAYS DENY (ALL PLANS)
