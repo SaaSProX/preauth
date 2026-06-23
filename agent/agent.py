@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import re
@@ -14,12 +15,15 @@ logger = logging.getLogger(__name__)
 TODAY = date.today().isoformat()
 ANTHROPIC_INPUT_USD_PER_1M = 3.0
 ANTHROPIC_OUTPUT_USD_PER_1M = 15.0
+ANTHROPIC_TRANSIENT_STATUS_CODES = {408, 409, 429, 500, 502, 503, 504, 529}
+ANTHROPIC_RETRY_DELAYS_SECONDS = (1, 3, 6)
 
 
 class AgentJSONParseError(ValueError):
-    def __init__(self, message: str, raw_output: str):
+    def __init__(self, message: str, raw_output: str, model_usage: dict | None = None):
         super().__init__(message)
         self.raw_output = raw_output
+        self.model_usage = model_usage
 
 # ---------------------------------------------------------------------------
 # KNOWLEDGE BASE — extracted from Aman HMO 2026 Retail Prices PDF
@@ -358,17 +362,100 @@ def _anthropic_usage_payload(response) -> dict:
     }
 
 
+def _combine_model_usage(*usages) -> dict | None:
+    valid_usages = [usage for usage in usages if isinstance(usage, dict)]
+    if not valid_usages:
+        return None
+
+    combined = dict(valid_usages[-1])
+    for key in (
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+        "total_tokens",
+    ):
+        combined[key] = sum(int(usage.get(key) or 0) for usage in valid_usages)
+    combined["estimated_cost_usd"] = sum(
+        float(usage.get("estimated_cost_usd") or 0) for usage in valid_usages
+    )
+    combined["api_attempts"] = sum(int(usage.get("api_attempts") or 1) for usage in valid_usages)
+    combined["api_retries"] = sum(int(usage.get("api_retries") or 0) for usage in valid_usages)
+    combined["attempts"] = len(valid_usages)
+    combined["attempt_usages"] = valid_usages
+    return combined
+
+
+def _anthropic_error_type(exc: Exception) -> str:
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict):
+            return str(error.get("type") or "")
+        return str(body.get("type") or "")
+    return ""
+
+
+def _is_transient_anthropic_error(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    if status_code in ANTHROPIC_TRANSIENT_STATUS_CODES:
+        return True
+
+    error_type = _anthropic_error_type(exc).lower()
+    if error_type in {"overloaded_error", "rate_limit_error", "api_error"}:
+        return True
+
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "overloaded_error",
+            "rate_limit_error",
+            "temporarily unavailable",
+            "timeout",
+            "timed out",
+        )
+    )
+
+
 async def _call_claude(system_prompt: str, user_message: str, *, max_tokens: int = 1000) -> dict:
     """Call Claude API and return parsed JSON response."""
-    response = await client.messages.create(
-        model=settings.anthropic_model,
-        max_tokens=max_tokens,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_message}],
-    )
+    response = None
+    attempt = 1
+    for attempt, delay in enumerate((*ANTHROPIC_RETRY_DELAYS_SECONDS, None), start=1):
+        try:
+            response = await client.messages.create(
+                model=settings.anthropic_model,
+                max_tokens=max_tokens,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_message}],
+            )
+            break
+        except Exception as exc:
+            if delay is None or not _is_transient_anthropic_error(exc):
+                raise
+            logger.warning(
+                "[Agent] Claude transient error attempt=%s/%s delay=%ss error=%s",
+                attempt,
+                len(ANTHROPIC_RETRY_DELAYS_SECONDS) + 1,
+                delay,
+                exc,
+            )
+            await asyncio.sleep(delay)
+
+    if response is None:
+        raise RuntimeError("Claude API did not return a response")
+
     raw = response.content[0].text.strip()
-    parsed = _parse_agent_json(raw)
-    parsed["__model_usage"] = _anthropic_usage_payload(response)
+    usage_payload = _anthropic_usage_payload(response)
+    usage_payload["api_attempts"] = attempt
+    usage_payload["api_retries"] = attempt - 1
+    try:
+        parsed = _parse_agent_json(raw)
+    except AgentJSONParseError as exc:
+        exc.model_usage = usage_payload
+        raise
+    parsed["__model_usage"] = usage_payload
     return parsed
 
 
@@ -918,7 +1005,41 @@ Return ONLY this JSON:
   "plan_restriction_detail": "which plan restriction applies, or null"
 }}"""
 
-    return await _call_claude(system_prompt, user_message, max_tokens=3000)
+    coverage_max_tokens = 5000
+    try:
+        return await _call_claude(system_prompt, user_message, max_tokens=coverage_max_tokens)
+    except AgentJSONParseError as first_error:
+        retry_message = f"""{user_message}
+
+The previous coverage-agent response failed JSON parsing with this error:
+{str(first_error)}
+
+Retry once. Return ONLY one complete strict JSON object matching the requested schema.
+Do not use markdown fences. Do not include trailing commas. Close every string, object, and array.
+If an item is uncertain, mark that item ESCALATE inside item_results instead of adding prose outside JSON."""
+        try:
+            retry_result = await _call_claude(
+                system_prompt,
+                retry_message,
+                max_tokens=coverage_max_tokens,
+            )
+        except AgentJSONParseError as second_error:
+            second_error.model_usage = _combine_model_usage(
+                getattr(first_error, "model_usage", None),
+                getattr(second_error, "model_usage", None),
+            )
+            second_error.first_parse_error = str(first_error)
+            second_error.first_raw_output_preview = first_error.raw_output[:2000]
+            raise
+
+        retry_usage = retry_result.get("__model_usage")
+        retry_result["__model_usage"] = (
+            _combine_model_usage(getattr(first_error, "model_usage", None), retry_usage)
+            or retry_usage
+        )
+        retry_result["parse_retry_attempted"] = True
+        retry_result["first_parse_error"] = str(first_error)
+        return retry_result
 
 
 # ---------------------------------------------------------------------------
@@ -1544,6 +1665,9 @@ async def run(patient_id: str, request_id: str):
                 "parse_failed": True,
                 "parse_error": str(e),
                 "raw_output_preview": e.raw_output[:2000],
+                "first_parse_error": getattr(e, "first_parse_error", None),
+                "first_raw_output_preview": getattr(e, "first_raw_output_preview", None),
+                "__model_usage": getattr(e, "model_usage", None),
             }
         await _log_agent(request_id, 2, "Plan & Coverage", result_2)
 
