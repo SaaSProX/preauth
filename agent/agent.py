@@ -77,6 +77,18 @@ CATEGORY_BUCKET_OVERRIDES = {
     8: ("wellness", "Wellness"),
 }
 
+AMAN_LIMIT_DEFINITION_BUCKETS = {
+    # AMAN limit_definition_id values are tier-specific. Keep this map limited
+    # to IDs we have observed consistently for core inpatient/outpatient rows;
+    # other benefit rows can share amounts across unrelated buckets.
+    1: "inpatient",
+    2: "outpatient",
+    6: "inpatient",
+    7: "outpatient",
+    11: "inpatient",
+    12: "outpatient",
+}
+
 
 def _strip_json_fences(raw: str) -> str:
     text = (raw or "").strip()
@@ -556,6 +568,39 @@ def _limit_row_by_value(limits: list[dict], expected_value: float | None) -> dic
     return None
 
 
+def _limit_bucket_for_definition_id(value) -> str | None:
+    try:
+        definition_id = int(value)
+    except (TypeError, ValueError):
+        return None
+    return AMAN_LIMIT_DEFINITION_BUCKETS.get(definition_id)
+
+
+def _limit_row_by_bucket(limits: list[dict], bucket_key: str | None) -> dict | None:
+    if not bucket_key:
+        return None
+    for limit in limits:
+        if _limit_bucket_for_definition_id(limit.get("limit_definition_id")) == bucket_key:
+            return limit
+    return None
+
+
+def _limit_row_for_bucket(
+    limits: list[dict],
+    bucket_key: str | None,
+    expected_value: float | None,
+) -> tuple[dict | None, str | None]:
+    limit_row = _limit_row_by_bucket(limits, bucket_key)
+    if limit_row:
+        return limit_row, "limit_definition_id"
+
+    limit_row = _limit_row_by_value(limits, expected_value)
+    if limit_row:
+        return limit_row, "limit_value"
+
+    return None, None
+
+
 def _coverage_key(value) -> str:
     return str(value or "").strip().lower()
 
@@ -913,18 +958,19 @@ def agent_item_utilization(pa: dict, agent2: dict) -> dict:
         result["aman_prior_context"] = prior_context
         return result
 
-    running_used_by_bucket: dict[str, float] = {}
-    if utilization_data_missing:
-        for historical_item in _historical_items(pa, items):
-            if _item_status(historical_item) != "approved":
-                continue
-            bucket_key, _bucket_name, _bucket_source = _item_bucket(pa, historical_item)
-            if not bucket_key:
-                continue
-            running_used_by_bucket[bucket_key] = (
-                running_used_by_bucket.get(bucket_key, 0.0)
-                + _item_approved_cost(historical_item)
-            )
+    historical_used_by_bucket: dict[str, float] = {}
+    for historical_item in _historical_items(pa, items):
+        if _item_status(historical_item) != "approved":
+            continue
+        bucket_key, _bucket_name, _bucket_source = _item_bucket(pa, historical_item)
+        if not bucket_key:
+            continue
+        historical_used_by_bucket[bucket_key] = (
+            historical_used_by_bucket.get(bucket_key, 0.0)
+            + _item_approved_cost(historical_item)
+        )
+
+    running_used_by_bucket: dict[str, float] = dict(historical_used_by_bucket) if utilization_data_missing else {}
 
     item_decisions = []
     for item in items:
@@ -932,7 +978,10 @@ def agent_item_utilization(pa: dict, agent2: dict) -> dict:
         coverage_decision = _coverage_decision(coverage)
         bucket_key, bucket_name, bucket_source = _item_bucket(pa, item, coverage)
         expected_limit = plan_limits.get(bucket_key) if bucket_key else None
-        limit_row = _limit_row_by_value(limits, expected_limit) if limits else None
+        limit_row, limit_match_source = (
+            _limit_row_for_bucket(limits, bucket_key, expected_limit)
+            if limits else (None, None)
+        )
         amount = _item_cost(item)
         source_status = _item_status(item)
         amount_to_count = _item_approved_cost(item) if source_status == "approved" else amount
@@ -988,7 +1037,7 @@ def agent_item_utilization(pa: dict, agent2: dict) -> dict:
             ))
             continue
 
-        if bucket_key in {"maternity", "wellness"}:
+        if bucket_key == "wellness" and not limit_row:
             item_decisions.append(_build_item_decision(
                 item,
                 "ESCALATE",
@@ -1003,48 +1052,68 @@ def agent_item_utilization(pa: dict, agent2: dict) -> dict:
             ))
             continue
 
-        if expected_limit is None:
-            item_decisions.append(_build_item_decision(
-                item,
-                "DENY",
-                f"{bucket_name} is not covered for {plan}.",
-                coverage,
-                bucket_key=bucket_key,
-                bucket_name=bucket_name,
-                bucket_source=bucket_source,
-                requested_cost=amount,
-                utilization_data_missing=utilization_data_missing,
-            ))
-            continue
-
-        if limits and not limit_row:
+        if bucket_key == "maternity" and expected_limit is None and not limit_row:
             item_decisions.append(_build_item_decision(
                 item,
                 "ESCALATE",
-                f"Could not find the {bucket_name} row in AMAN consumption data.",
+                f"{bucket_name} has no deterministic limit mapping yet; AMAN limit_definition_id mapping is required.",
                 coverage,
                 bucket_key=bucket_key,
                 bucket_name=bucket_name,
                 bucket_source=bucket_source,
                 requested_cost=amount,
-                bucket_limit=expected_limit,
                 utilization_data_missing=utilization_data_missing,
             ))
             continue
 
-        limit_value = (_number(limit_row.get("limit_value")) if limit_row else None) or expected_limit
-        base_used = (_number(limit_row.get("consumed_value")) if limit_row else None) or 0.0
+        if expected_limit is None and not limit_row:
+            item_decisions.append(_build_item_decision(
+                item,
+                "ESCALATE",
+                f"{bucket_name} has no deterministic limit mapping for {plan}.",
+                coverage,
+                bucket_key=bucket_key,
+                bucket_name=bucket_name,
+                bucket_source=bucket_source,
+                requested_cost=amount,
+                utilization_data_missing=utilization_data_missing,
+            ))
+            continue
+
+        aman_limit_value = _number(limit_row.get("limit_value")) if limit_row else None
+        limit_value_mismatch = (
+            limit_row is not None
+            and expected_limit is not None
+            and aman_limit_value is not None
+            and not _close_amount(aman_limit_value, expected_limit)
+        )
+        used_knowledge_base_limit = not limit_row or limit_value_mismatch
+        limit_value = (
+            expected_limit
+            if used_knowledge_base_limit and expected_limit is not None
+            else aman_limit_value or expected_limit
+        )
+        base_used = _number(limit_row.get("consumed_value")) if limit_row else None
+        if base_used is None:
+            base_used = historical_used_by_bucket.get(bucket_key, 0.0)
         used_before = running_used_by_bucket.get(bucket_key, base_used)
         remaining_before = limit_value - used_before
         remaining_after = remaining_before - amount_to_count
         bucket_exceeded = remaining_after < -0.01
+        utilization_unverified = utilization_data_missing or used_knowledge_base_limit
 
         decision = "DENY" if bucket_exceeded else "APPROVE"
-        if utilization_data_missing:
+        if used_knowledge_base_limit:
+            if limit_value_mismatch:
+                fallback_context = "AMAN consumption limit value did not match this routed knowledge-base bucket"
+            elif limits:
+                fallback_context = "AMAN consumption rows did not map to this routed knowledge-base bucket"
+            else:
+                fallback_context = "Consumption limits were not configured in the payload"
             reason = (
-                f"Consumption limits were not configured in the payload; approving this item would exceed the {bucket_name} fallback balance from known {plan} plan rules and the current PA snapshot."
+                f"{fallback_context}; approving this item would exceed the {bucket_name} fallback balance from known {plan} plan rules and available utilization context."
                 if bucket_exceeded
-                else f"Consumption limits were not configured in the payload; item fits within the {bucket_name} fallback balance from known {plan} plan rules and the current PA snapshot."
+                else f"{fallback_context}; item fits within the {bucket_name} fallback balance from known {plan} plan rules and available utilization context."
             )
         else:
             reason = (
@@ -1070,8 +1139,20 @@ def agent_item_utilization(pa: dict, agent2: dict) -> dict:
             bucket_remaining_after=remaining_after,
             bucket_exceeded=bucket_exceeded,
             limit_definition_id=limit_row.get("limit_definition_id") if limit_row else None,
-            utilization_data_missing=utilization_data_missing,
-            utilization_source="aman_consumption" if limit_row else "fallback_plan_rules_current_pa_snapshot",
+            utilization_data_missing=utilization_unverified,
+            utilization_source=(
+                f"aman_consumption_{limit_match_source}"
+                if limit_row and limit_match_source and not used_knowledge_base_limit
+                else (
+                    f"aman_consumption_{limit_match_source}_with_knowledge_base_limit"
+                    if limit_row and limit_match_source
+                    else (
+                        "fallback_knowledge_base_limit_unmatched_aman_consumption"
+                        if limits
+                        else "fallback_knowledge_base_limit_missing_aman_consumption"
+                    )
+                )
+            ),
         ))
 
     result = _summarize_item_utilization(item_decisions)

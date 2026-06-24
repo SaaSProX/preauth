@@ -20,8 +20,8 @@ FINANCIAL LIMITS PER PLAN (NGN)
 Total Limit / Maximum Annual Benefit (master cap — overrides all other limits):
   Bronze: 1,500,000
 
-Inpatient and outpatient benefits are covered but the source workbook does not state separate inpatient/outpatient monetary sublimits.
-For deterministic utilization, use the Total Limit as the fallback inpatient and outpatient bucket limit unless AMAN consumption data supplies a more specific limit row.
+Inpatient, outpatient, maternity, and neonatal benefits are covered but the source workbook does not state separate monetary sublimits for those buckets.
+For deterministic utilization, use the Total Limit as the fallback bucket limit unless AMAN consumption data supplies a more specific limit row.
 
 Surgical Care Limit (covers all surgery types — minor, intermediate, major, unless excluded):
   Bronze: 200,000
@@ -238,6 +238,7 @@ PLAN_LIMITS = {
         "inpatient": 1_500_000,
         "outpatient": 1_500_000,
         "surgical": 200_000,
+        "maternity": 1_500_000,
         "dental": 25_000,
         "optical_total": 35_000,
         "cancer": 100_000,
