@@ -68,6 +68,12 @@ class Settings(BaseSettings):
     resend_api_key: str = ""
     resend_from_email: str = ""
 
+    # Observability (SAA-83)
+    sentry_dsn: str = ""
+    sentry_environment: str = "development"
+    sentry_traces_sample_rate: float = 0.1
+    log_json: bool = True  # JSON logs in production, console in dev
+
     # Google OAuth / Gmail integration
     google_oauth_client_id: str = ""
     google_oauth_client_secret: str = ""

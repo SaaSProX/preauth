@@ -1,10 +1,11 @@
 import asyncio
 import json
-import logging
 import re
 from datetime import date
 from anthropic import AsyncAnthropic
 from config.settings import settings
+from config.logging import get_logger, bind_contextvars
+from config.sentry import set_sentry_context
 from services.db import pg_execute, pg_query_one
 from agent.knowledge_bases.registry import (
     DEFAULT_PLAN_CODE,
@@ -17,8 +18,7 @@ from agent.knowledge_bases.routing import resolve_plan_code, resolve_plan_contex
 
 client = AsyncAnthropic(api_key=settings.anthropic_api_key)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 TODAY = date.today().isoformat()
 ANTHROPIC_INPUT_USD_PER_1M = 3.0
@@ -227,11 +227,11 @@ async def _call_claude(system_prompt: str, user_message: str, *, max_tokens: int
             if delay is None or not _is_transient_anthropic_error(exc):
                 raise
             logger.warning(
-                "[Agent] Claude transient error attempt=%s/%s delay=%ss error=%s",
-                attempt,
-                len(ANTHROPIC_RETRY_DELAYS_SECONDS) + 1,
-                delay,
-                exc,
+                "claude_transient_error",
+                attempt=attempt,
+                max_attempts=len(ANTHROPIC_RETRY_DELAYS_SECONDS) + 1,
+                delay_seconds=delay,
+                error=str(exc),
             )
             await asyncio.sleep(delay)
 
@@ -700,7 +700,12 @@ async def _log_agent(request_id: str, agent_num: int, agent_name: str, result: d
     model_usage = result.pop("__model_usage", None) if isinstance(result, dict) else None
     passed = result.get("pass", result.get("decision") == "APPROVE")
     status = "pass" if passed else "fail"
-    logger.info(f"[Agent {agent_num} - {agent_name}] status={status} | {json.dumps(result)}")
+    logger.info(
+        "agent_step_completed",
+        agent_num=agent_num,
+        agent_name=agent_name,
+        status=status,
+    )
     await pg_execute(
         """
         INSERT INTO agent_logs (
@@ -1439,14 +1444,18 @@ Return ONLY this JSON:
 # ORCHESTRATOR
 # ---------------------------------------------------------------------------
 async def run(patient_id: str, request_id: str):
-    logger.info(f"[Agent] ── START ── request_id={request_id} patient_id={patient_id}")
+    # Bind context for all subsequent logs in this request
+    bind_contextvars(request_id=request_id, patient_id=patient_id)
+    set_sentry_context(request_id=request_id)
+    
+    logger.info("agent_started")
 
     row = await pg_query_one(
         "SELECT extracted_fields FROM preauth_logs WHERE request_id = $1",
         str(request_id)
     )
     if not row:
-        logger.error(f"[Agent] No record found for request_id={request_id}")
+        logger.error("agent_no_record_found")
         return
 
     pa = _parse_json_field(row["extracted_fields"])
@@ -1476,7 +1485,7 @@ async def run(patient_id: str, request_id: str):
             return
 
         if result_1.get("is_platinum_plus"):
-            logger.info(f"[Agent] Platinum Plus express — auto-approving request_id={request_id}")
+            logger.info("agent_platinum_plus_express", auto_approve=True)
             result_3 = _global_item_decisions(pa, "APPROVE", "Platinum Plus express card — no pre-authorization required.")
             final_result = _build_final_decision_from_items(decision_pa, result_1, {"pass": True}, result_3)
             final_result["flags"] = ["platinum_plus_express_card"]
@@ -1560,7 +1569,7 @@ async def run(patient_id: str, request_id: str):
         })
 
     except Exception as e:
-        logger.exception(f"[Agent] ERROR request_id={request_id}: {e}")
+        logger.exception("agent_error", error=str(e))
         await pg_execute(
             "UPDATE preauth_logs SET status = 'error', error_message = $2 WHERE request_id = $1",
             str(request_id), str(e)
@@ -1581,7 +1590,7 @@ async def _save_decision(request_id: str, decision: str, result: dict):
         """,
         str(request_id), status, decision, json.dumps(result)
     )
-    logger.info(f"[Agent] ── END ── request_id={request_id} decision={decision}")
+    logger.info("agent_completed", decision=decision)
 
     # Send the decision back to Aman (advisory callback — integration direction (ii)).
     # Imported lazily to avoid any startup-time coupling.
@@ -1589,7 +1598,7 @@ async def _save_decision(request_id: str, decision: str, result: dict):
         from services.aman_callback import send_decision_to_aman
         await send_decision_to_aman(str(request_id))
     except Exception:
-        logger.exception("[Agent] Aman callback failed (logged, not raised)")
+        logger.exception("agent_callback_failed")
 
 
 def _get_estimated_cost(pa: dict) -> float | None:

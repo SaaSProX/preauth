@@ -12,3 +12,7 @@ pyjwt
 python-multipart
 certifi
 httpx
+
+# Observability (SAA-83)
+sentry-sdk[fastapi]>=2.0.0
+structlog>=24.0.0
