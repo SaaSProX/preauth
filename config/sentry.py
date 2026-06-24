@@ -58,6 +58,7 @@ def set_sentry_context(
     request_id: str | None = None,
     insurance_no: str | None = None,
     org_id: int | None = None,
+    api_client_id: int | None = None,
 ) -> None:
     """
     Set contextual data for Sentry error reports.
@@ -76,6 +77,13 @@ def set_sentry_context(
     
     if context:
         sentry_sdk.set_context("preauth", context)
+    
+    # Set user context for Sentry's user tracking
+    if org_id or api_client_id:
+        sentry_sdk.set_user({
+            "id": str(org_id) if org_id else None,
+            "api_client_id": api_client_id,
+        })
 
 
 def capture_message(message: str, level: str = "info", **extra) -> None:

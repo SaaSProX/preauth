@@ -5,6 +5,7 @@ from config.settings import settings
 from config.sentry import init_sentry
 from config.logging import configure_logging, get_logger
 from middleware.request_logging import RequestLoggingMiddleware
+from middleware.exception_handler import ExceptionHandlerMiddleware
 from webhook.router import router
 from auth.router import router as auth_router
 
@@ -16,7 +17,8 @@ logger = get_logger(__name__)
 
 app = FastAPI(title="Aman HMO Pre-Auth Agent")
 
-# Add request logging middleware (must be added before CORS)
+# Middleware order matters! Exception handler wraps everything.
+app.add_middleware(ExceptionHandlerMiddleware)
 app.add_middleware(RequestLoggingMiddleware)
 
 _allowed_origins = [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
@@ -46,4 +48,16 @@ async def startup_event():
 
 @app.get("/health")
 def health():
+    """Shallow health check - just confirms app is running."""
     return {"status": "ok"}
+
+
+@app.get("/health/deep")
+async def health_deep():
+    """
+    Deep health check - verifies all dependencies.
+    
+    Use for monitoring/alerting. Don't hit this on every request.
+    """
+    from services.health import deep_health_check
+    return await deep_health_check()

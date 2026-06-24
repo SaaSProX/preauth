@@ -6,7 +6,8 @@ from datetime import date, datetime
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from agent import agent
 from config.settings import settings
-from config.logging import get_logger, bind_contextvars
+from config.logging import get_logger, bind_contextvars, get_contextvars, BackgroundTaskWithContext
+from config.sentry import set_sentry_context
 from services.db import pg_execute, pg_query_one
 from services.preauth_events import persist_preauth_intake_event
 from services.webhook_delivery import (
@@ -447,6 +448,10 @@ async def receive_preauth(
             auth_status=auth_status,
         )
 
+        # Bind org context for logging and Sentry (SAA-83)
+        bind_contextvars(org_id=client["org_id"], api_client_id=client["id"])
+        set_sentry_context(org_id=client["org_id"], api_client_id=client["id"])
+
         body = await request.body()
         payload_size_bytes = len(body)
         try:
@@ -557,7 +562,9 @@ async def receive_preauth(
         # Kick off agent in background (if enabled)
         agent_triggered = False
         if should_run_agent and not duplicate_event and settings.agent_enabled:
-            background.add_task(agent.run, str(patient_id), str(request_id))
+            # Copy logging context to background task (SAA-83)
+            ctx = get_contextvars()
+            background.add_task(BackgroundTaskWithContext(agent.run, ctx), str(patient_id), str(request_id))
             agent_triggered = True
         elif not should_run_agent:
             logger.info(

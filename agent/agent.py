@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+import time
 from datetime import date
 from anthropic import AsyncAnthropic
 from config.settings import settings
@@ -214,6 +215,8 @@ async def _call_claude(system_prompt: str, user_message: str, *, max_tokens: int
     """Call Claude API and return parsed JSON response."""
     response = None
     attempt = 1
+    start_time = time.perf_counter()
+    
     for attempt, delay in enumerate((*ANTHROPIC_RETRY_DELAYS_SECONDS, None), start=1):
         try:
             response = await client.messages.create(
@@ -238,10 +241,24 @@ async def _call_claude(system_prompt: str, user_message: str, *, max_tokens: int
     if response is None:
         raise RuntimeError("Claude API did not return a response")
 
+    latency_ms = (time.perf_counter() - start_time) * 1000
     raw = response.content[0].text.strip()
     usage_payload = _anthropic_usage_payload(response)
     usage_payload["api_attempts"] = attempt
     usage_payload["api_retries"] = attempt - 1
+    usage_payload["latency_ms"] = round(latency_ms, 2)
+    
+    # Log Claude API performance (SAA-83)
+    logger.info(
+        "claude_api_call",
+        model=settings.anthropic_model,
+        latency_ms=round(latency_ms, 2),
+        input_tokens=usage_payload.get("input_tokens"),
+        output_tokens=usage_payload.get("output_tokens"),
+        estimated_cost_usd=usage_payload.get("estimated_cost_usd"),
+        attempts=attempt,
+    )
+    
     try:
         parsed = _parse_agent_json(raw)
     except AgentJSONParseError as exc:
