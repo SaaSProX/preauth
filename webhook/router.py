@@ -1,5 +1,4 @@
 import json
-import logging
 import time
 import uuid
 from datetime import date, datetime
@@ -7,6 +6,8 @@ from datetime import date, datetime
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from agent import agent
 from config.settings import settings
+from config.logging import get_logger, bind_contextvars, get_contextvars, BackgroundTaskWithContext
+from config.sentry import set_sentry_context
 from services.db import pg_execute, pg_query_one
 from services.preauth_events import persist_preauth_intake_event
 from services.webhook_delivery import (
@@ -16,7 +17,7 @@ from services.webhook_delivery import (
 )
 
 router = APIRouter()
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def get_nested(payload: dict, path: str):
@@ -78,7 +79,7 @@ async def authenticate_webhook_request(request: Request):
             client["id"],
         )
     except Exception:
-        logger.exception("failed to update last_used_at for api_client %s", client.get("id"))
+        logger.exception("failed_to_update_api_client_last_used", client_id=client.get("id"))
 
     return client, "auth_success", None
 
@@ -426,7 +427,7 @@ async def receive_preauth(
                 error_message=str(exc),
                 processing_time_ms=elapsed_ms(started_at),
             )
-            logger.exception("Webhook auth check failed")
+            logger.exception("webhook_auth_check_failed")
             raise HTTPException(status_code=500, detail="Webhook authentication failed")
 
         if not client:
@@ -446,6 +447,10 @@ async def receive_preauth(
             api_client_id=client["id"],
             auth_status=auth_status,
         )
+
+        # Bind org context for logging and Sentry (SAA-83)
+        bind_contextvars(org_id=client["org_id"], api_client_id=client["id"])
+        set_sentry_context(org_id=client["org_id"], api_client_id=client["id"])
 
         body = await request.body()
         payload_size_bytes = len(body)
@@ -527,7 +532,7 @@ async def receive_preauth(
                 error_message=str(exc),
                 processing_time_ms=elapsed_ms(started_at),
             )
-            logger.exception("Failed to persist preauth webhook payload")
+            logger.exception("webhook_persist_failed", request_id=str(request_id))
             raise HTTPException(status_code=500, detail="Failed to persist webhook payload")
 
         preauth_row = persisted["preauth_row"]
@@ -557,24 +562,28 @@ async def receive_preauth(
         # Kick off agent in background (if enabled)
         agent_triggered = False
         if should_run_agent and not duplicate_event and settings.agent_enabled:
-            background.add_task(agent.run, str(patient_id), str(request_id))
+            # Copy logging context to background task (SAA-83)
+            ctx = get_contextvars()
+            background.add_task(BackgroundTaskWithContext(agent.run, ctx), str(patient_id), str(request_id))
             agent_triggered = True
         elif not should_run_agent:
             logger.info(
-                "Webhook event_type=%s is an update/final-decision event. Saved without running agent for request_id=%s",
-                payload.get("event_type"),
-                request_id,
+                "webhook_non_submission_event",
+                event_type=payload.get("event_type"),
+                request_id=request_id,
+                reason="update_or_final_decision_event",
             )
         elif duplicate_event:
             logger.info(
-                "Duplicate webhook event_id=%s. Saved duplicate attempt without running agent for request_id=%s",
-                payload.get("event_id"),
-                request_id,
+                "webhook_duplicate_event",
+                event_id=payload.get("event_id"),
+                request_id=request_id,
             )
         else:
             logger.info(
-                "Agent is paused (AGENT_ENABLED=false). Skipping auto-decision for request_id=%s",
-                request_id,
+                "webhook_agent_paused",
+                request_id=request_id,
+                agent_enabled=settings.agent_enabled,
             )
 
         return {
@@ -598,5 +607,5 @@ async def receive_preauth(
             error_message=str(exc),
             processing_time_ms=elapsed_ms(started_at),
         )
-        logger.exception("Unhandled webhook processing error")
+        logger.exception("webhook_unhandled_error")
         raise
