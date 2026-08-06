@@ -74,6 +74,9 @@ class Settings(BaseSettings):
     sentry_traces_sample_rate: float = 0.1
     log_json: bool = True  # JSON logs in production, console in dev
 
+    # Slack alerts (Incoming Webhook URL). Empty = alerts disabled (no-op).
+    slack_webhook_url: str = ""
+
     # Google OAuth / Gmail integration
     google_oauth_client_id: str = ""
     google_oauth_client_secret: str = ""
