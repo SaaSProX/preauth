@@ -1473,6 +1473,12 @@ async def run(patient_id: str, request_id: str):
     )
     if not row:
         logger.error("agent_no_record_found")
+        from services.alerts import alert_pipeline_failure
+        await alert_pipeline_failure(
+            "agent record not found",
+            request_id=str(request_id),
+            error_class="no preauth_logs row for request_id",
+        )
         return
 
     pa = _parse_json_field(row["extracted_fields"])
@@ -1528,6 +1534,12 @@ async def run(patient_id: str, request_id: str):
                 "[Agent] Agent 2 JSON parse failed request_id=%s raw=%s",
                 request_id,
                 e.raw_output[:1000],
+            )
+            from services.alerts import alert_quality_warning
+            await alert_quality_warning(
+                "Agent 2 (coverage) returned malformed JSON",
+                request_id=str(request_id),
+                detail="all items routed to human review (ESCALATE)",
             )
             result_2 = {
                 "pass": None,
@@ -1590,6 +1602,12 @@ async def run(patient_id: str, request_id: str):
         await pg_execute(
             "UPDATE preauth_logs SET status = 'error', error_message = $2 WHERE request_id = $1",
             str(request_id), str(e)
+        )
+        from services.alerts import alert_pipeline_failure
+        await alert_pipeline_failure(
+            "agent pipeline crashed",
+            request_id=str(request_id),
+            error_class=type(e).__name__,
         )
 
 
