@@ -533,6 +533,12 @@ async def receive_preauth(
                 processing_time_ms=elapsed_ms(started_at),
             )
             logger.exception("webhook_persist_failed", request_id=str(request_id))
+            from services.alerts import alert_pipeline_failure
+            await alert_pipeline_failure(
+                "failed to persist intake event",
+                request_id=str(request_id),
+                error_class=type(exc).__name__,
+            )
             raise HTTPException(status_code=500, detail="Failed to persist webhook payload")
 
         preauth_row = persisted["preauth_row"]

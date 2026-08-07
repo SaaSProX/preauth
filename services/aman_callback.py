@@ -417,8 +417,27 @@ async def send_decision_to_aman(request_id: str, *, force: bool = False, check_g
             status = f"http_{code}"
         await _record_callback(request_id, status=status, http_status=code, error=response.text)
         logger.warning("[AmanCallback] %s request_id=%s http=%s", status, request_id, code)
+        # Alert only on "integration broken" outcomes (auth/scope/5xx). 409
+        # stale_revision is an expected race and is left un-alerted.
+        if status in {"auth_failed", "scope_missing"} or code >= 500:
+            from services.alerts import alert_pipeline_failure
+            await alert_pipeline_failure(
+                "AMAN write-back failed",
+                request_id=str(request_id),
+                error_class=f"{status} (HTTP {code})",
+                dedup_key=f"aman_callback:{status}",
+                cooldown_seconds=300,
+            )
         return {"status": status, "http_status": code}
     except httpx.HTTPError as exc:
         await _record_callback(request_id, status="network_error", http_status=None, error=str(exc))
         logger.exception("[AmanCallback] network error request_id=%s", request_id)
+        from services.alerts import alert_pipeline_failure
+        await alert_pipeline_failure(
+            "AMAN write-back failed",
+            request_id=str(request_id),
+            error_class=f"network_error ({type(exc).__name__})",
+            dedup_key="aman_callback:network_error",
+            cooldown_seconds=300,
+        )
         return {"status": "network_error", "error": str(exc)}
