@@ -76,8 +76,12 @@ async def init_pg_pool() -> None:
                 # asyncpg's statement cache keeps the same code safe on both
                 # direct Postgres and PgBouncer-backed production URLs.
                 statement_cache_size=0,
-                min_size=2,
-                max_size=10,
+                # Vercel Fluid Compute keeps one shared process handling all
+                # concurrent requests, so this is the *only* pool, not one per
+                # instance. Sized against Supabase's max_connections=60 with
+                # headroom for Supavisor's own overhead and other consumers.
+                min_size=5,
+                max_size=30,
             )
 
 
