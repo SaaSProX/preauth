@@ -955,6 +955,36 @@ def agent_item_utilization(pa: dict, agent2: dict) -> dict:
     prior_context = _aman_prior_context(pa, items)
 
     if not items:
+        all_items = _items(pa)
+        if (
+            all_items
+            and prior_context.get("rejected_count", 0) == 0
+            and prior_context.get("approved_count", 0) == len(all_items)
+        ):
+            # Nothing is pending because AMAN had already approved every line
+            # in this snapshot before sending it to us (e.g. auto-approved
+            # low-risk items). Mirror AMAN's own decision instead of
+            # escalating with nothing left to advise on.
+            item_decisions = [
+                _build_item_decision(
+                    item,
+                    "APPROVE",
+                    "AMAN had already approved this item prior to our review; mirroring AMAN's decision.",
+                    {"decision": "APPROVE", "reason": "Already approved by AMAN."},
+                    bucket_key=None,
+                    bucket_name="AMAN pre-approved",
+                    requested_cost=_item_approved_cost(item),
+                    utilization_source="aman_prior_approval_mirror",
+                )
+                for item in all_items
+            ]
+            result = _summarize_item_utilization(
+                item_decisions,
+                "All line items were already approved by AMAN prior to agent review.",
+            )
+            result["aman_prior_context"] = prior_context
+            return result
+
         result = {
             "pass": None,
             "reason": "No current pending submission items were available for item-level utilization.",
