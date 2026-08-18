@@ -1,3 +1,5 @@
+import asyncio
+
 import aiomysql
 import asyncpg
 from config.settings import settings
@@ -49,30 +51,79 @@ async def aman_execute(sql: str, *args):
 # ─────────────────────────────────────────────
 # Our DB (PostgreSQL) — store logs for dashboard
 # ─────────────────────────────────────────────
+#
+# Every query used to open + close a brand-new asyncpg connection (fresh
+# TCP + TLS + Supavisor auth handshake each time — measured at 1-4s per
+# connect against the prod pooler). Under concurrent requests that cost
+# multiplies and can dominate wall-clock time even though the queries
+# themselves run in well under a second. A shared pool amortizes that
+# handshake across requests instead of paying it on every query.
+
+_pg_pool: asyncpg.Pool | None = None
+_pg_pool_lock = asyncio.Lock()
+
+
+async def init_pg_pool() -> None:
+    """Create the shared pool. Call once from app startup."""
+    global _pg_pool
+    if _pg_pool is not None:
+        return
+    async with _pg_pool_lock:
+        if _pg_pool is None:
+            _pg_pool = await asyncpg.create_pool(
+                settings.our_db_url,
+                # Supabase's transaction pooler sits behind PgBouncer. Disabling
+                # asyncpg's statement cache keeps the same code safe on both
+                # direct Postgres and PgBouncer-backed production URLs.
+                statement_cache_size=0,
+                min_size=2,
+                max_size=10,
+            )
+
+
+async def close_pg_pool() -> None:
+    """Close the shared pool. Call once from app shutdown."""
+    global _pg_pool
+    if _pg_pool is not None:
+        await _pg_pool.close()
+        _pg_pool = None
+
+
+async def _get_pool() -> asyncpg.Pool:
+    if _pg_pool is None:
+        # Defensive fallback for scripts/tests that use these helpers without
+        # going through the FastAPI startup lifecycle.
+        await init_pg_pool()
+    return _pg_pool
+
 
 async def get_pg_conn():
-    # Supabase's transaction pooler sits behind PgBouncer. Disabling asyncpg's
-    # statement cache keeps the same code safe on both direct Postgres and
-    # PgBouncer-backed production URLs.
-    return await asyncpg.connect(settings.our_db_url, statement_cache_size=0)
+    pool = await _get_pool()
+    return await pool.acquire()
+
+
+async def release_pg_conn(conn) -> None:
+    pool = await _get_pool()
+    await pool.release(conn)
+
 
 async def pg_query_one(sql: str, *args):
     conn = await get_pg_conn()
     try:
         return await conn.fetchrow(sql, *args)
     finally:
-        await conn.close()
+        await release_pg_conn(conn)
 
 async def pg_query_all(sql: str, *args):
     conn = await get_pg_conn()
     try:
         return await conn.fetch(sql, *args)
     finally:
-        await conn.close()
+        await release_pg_conn(conn)
 
 async def pg_execute(sql: str, *args):
     conn = await get_pg_conn()
     try:
         return await conn.execute(sql, *args)
     finally:
-        await conn.close()
+        await release_pg_conn(conn)
