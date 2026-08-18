@@ -420,7 +420,15 @@ async def sync_gmail_history(connection_id: int, notification_history_id: str, l
 
             stored = 0
             for message_id in sorted(message_ids):
-                message = await _fetch_message(client, access_token, message_id)
+                try:
+                    message = await _fetch_message(client, access_token, message_id)
+                except httpx.HTTPStatusError as exc:
+                    # Gmail history can reference a message that was deleted or
+                    # became unavailable before we fetched it. Skip that message
+                    # without blocking later mail or leaving the cursor stale.
+                    if exc.response is not None and exc.response.status_code == 404:
+                        continue
+                    raise
                 await _store_support_message(connection, message, latest_history_id)
                 stored += 1
 

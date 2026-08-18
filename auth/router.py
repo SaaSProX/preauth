@@ -2158,7 +2158,7 @@ async def qa_accuracy(
             SELECT raw_payload, event_type, occurred_at, last_seen_at, created_at, event_sequence
             FROM preauth_events e
             WHERE e.org_id = submitted.org_id
-              AND LOWER(COALESCE(e.event_type, '')) IN ('pa.approved', 'pa.rejected', 'pa.finalized', 'pa.updated')
+              AND LOWER(COALESCE(e.event_type, '')) IN ('pa.decided', 'pa.approved', 'pa.rejected', 'pa.finalized', 'pa.updated')
               AND e.raw_payload ? 'line_outcomes'
               AND e.checkin_id = submitted.checkin_id
               AND (
@@ -2307,7 +2307,7 @@ async def qa_accuracy(
             FROM preauth_events outcome
             WHERE outcome.org_id = e.org_id
               AND outcome.checkin_id = e.checkin_id
-              AND LOWER(COALESCE(outcome.event_type, '')) IN ('pa.approved', 'pa.rejected', 'pa.finalized', 'pa.updated')
+              AND LOWER(COALESCE(outcome.event_type, '')) IN ('pa.decided', 'pa.approved', 'pa.rejected', 'pa.finalized', 'pa.updated')
               AND outcome.raw_payload ? 'line_outcomes'
               AND (
                 outcome.correlation_id = e.correlation_id
@@ -2432,7 +2432,7 @@ async def qa_accuracy(
                 SELECT oe.raw_payload
                 FROM preauth_events oe
                 WHERE oe.org_id = $1
-                  AND LOWER(COALESCE(oe.event_type, '')) IN ('pa.approved', 'pa.rejected', 'pa.finalized', 'pa.updated')
+                  AND LOWER(COALESCE(oe.event_type, '')) IN ('pa.decided', 'pa.approved', 'pa.rejected', 'pa.finalized', 'pa.updated')
                   AND oe.raw_payload ? 'line_outcomes'
                   AND (
                     oe.correlation_id = s.submitted_correlation_id
@@ -2593,7 +2593,8 @@ async def qa_accuracy(
         intake_items_list = _list_of_dicts(intake_payload.get("pa_items"))
 
         outcome_agent, outcome_agent_amount, _partner_counts = _qa_partner_from_line_outcomes(line_outcomes)
-        agent = outcome_agent or _qa_norm_dec(r.get("decision_raw"))
+        agent_was_skipped = agent_result_obj.get("agent_skipped") is True
+        agent = None if agent_was_skipped else (outcome_agent or _qa_norm_dec(r.get("decision_raw")))
         agent_amount = float(outcome_agent_amount if outcome_agent is not None else (r.get("agent_amount") or 0))
 
         aman, aman_amount, aman_counts = _qa_aman_from_line_outcomes(line_outcomes)

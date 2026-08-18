@@ -1,280 +1,67 @@
+import asyncio
 import json
-import logging
 import re
+import time
 from datetime import date
 from anthropic import AsyncAnthropic
 from config.settings import settings
+from config.logging import get_logger, bind_contextvars
+from config.sentry import set_sentry_context
 from services.db import pg_execute, pg_query_one
+from agent.knowledge_bases.registry import (
+    DEFAULT_PLAN_CODE,
+    get_knowledge_base,
+    get_knowledge_base_by_plan_code,
+    get_plan_limits,
+    get_plan_limits_by_plan_code,
+)
+from agent.knowledge_bases.routing import resolve_plan_code, resolve_plan_context
 
 client = AsyncAnthropic(api_key=settings.anthropic_api_key)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 TODAY = date.today().isoformat()
+ANTHROPIC_INPUT_USD_PER_1M = 3.0
+ANTHROPIC_OUTPUT_USD_PER_1M = 15.0
+ANTHROPIC_TRANSIENT_STATUS_CODES = {408, 409, 429, 500, 502, 503, 504, 529}
+ANTHROPIC_RETRY_DELAYS_SECONDS = (1, 3, 6)
 
 
 class AgentJSONParseError(ValueError):
-    def __init__(self, message: str, raw_output: str):
+    def __init__(self, message: str, raw_output: str, model_usage: dict | None = None):
         super().__init__(message)
         self.raw_output = raw_output
+        self.model_usage = model_usage
 
 # ---------------------------------------------------------------------------
-# KNOWLEDGE BASE — extracted from Aman HMO 2026 Retail Prices PDF
+# KNOWLEDGE BASE SELECTION
 # ---------------------------------------------------------------------------
-KNOWLEDGE_BASE = """
-AMAN HMO PLAN BENEFITS — 2026 KNOWLEDGE BASE
-Today's date: {today}
+KNOWLEDGE_BASE = get_knowledge_base(DEFAULT_PLAN_CODE, today=TODAY)
+PLAN_LIMITS = get_plan_limits(DEFAULT_PLAN_CODE)
+KNOWLEDGE_BASE_BY_PLAN_CODE = get_knowledge_base_by_plan_code(today=TODAY)
+PLAN_LIMITS_BY_PLAN_CODE = get_plan_limits_by_plan_code()
 
-PLAN TIERS (ascending): Bronze → Silver → Gold → Platinum → Platinum Plus
 
-──────────────────────────────────────────
-FINANCIAL LIMITS PER PLAN (NGN)
-──────────────────────────────────────────
-Maximum Annual Benefit (master cap — overrides all other limits):
-  Bronze: 1,000,000 | Silver: 1,700,000 | Gold: 2,500,000 | Platinum: 3,500,000 | Platinum Plus: 5,000,000
+def _plan_code_for_request(pa: dict | None = None) -> str:
+    return resolve_plan_code(pa)
 
-Inpatient Limit:
-  Bronze: 600,000 | Silver: 1,000,000 | Gold: 1,500,000 | Platinum: 2,100,000 | Platinum Plus: 3,000,000
 
-Outpatient Limit:
-  Bronze: 400,000 | Silver: 700,000 | Gold: 1,000,000 | Platinum: 1,400,000 | Platinum Plus: 2,000,000
+def _knowledge_base_context_for_request(pa: dict | None = None) -> dict:
+    return resolve_plan_context(pa)
 
-Surgical Care Limit (covers all surgery types — minor, intermediate, major):
-  Bronze: 200,000 | Silver: 350,000 | Gold: 600,000 | Platinum: 1,000,000 | Platinum Plus: 1,500,000
 
-Dental Care Limit:
-  Bronze: 15,000 | Silver: 30,000 | Gold: 70,000 | Platinum: 100,000 | Platinum Plus: 200,000
+def _knowledge_base_for_request(pa: dict) -> str:
+    return get_knowledge_base(_plan_code_for_request(pa), today=TODAY)
 
-Optical — Lenses/Frames/Contact Lenses (once every 2 years only):
-  Bronze: 5,000 (lenses only) | Silver: 10,000 | Gold: 15,000 | Platinum: 30,000 | Platinum Plus: 50,000
 
-Optical — Eye Testing + Acute/Chronic Eye Disease Treatment (surgery inclusive):
-  Bronze: 25,000 | Silver: 50,000 | Gold: 75,000 | Platinum: 100,000 | Platinum Plus: 300,000
-
-Optical — Total Optical Limit:
-  Bronze: 30,000 | Silver: 60,000 | Gold: 90,000 | Platinum: 130,000 | Platinum Plus: 350,000
-
-Cancer Care (Consultation, Investigation, Counselling, Chemotherapy, Radiotherapy, Surgery):
-  Bronze: 100,000 | Silver: 150,000 | Gold: 250,000 | Platinum: 400,000 | Platinum Plus: 700,000
-
-Chronic Disease Medication:
-  Bronze: 80,000 | Silver: 150,000 | Gold: 250,000 | Platinum: 350,000 | Platinum Plus: 500,000
-
-HIV/AIDS Care Treatment:
-  Bronze: 100,000 | Silver: 150,000 | Gold: 350,000 | Platinum: 500,000 | Platinum Plus: 500,000
-
-Kidney Dialysis:
-  Bronze: NOT COVERED | Silver: 70,000 | Gold: 90,000 | Platinum: 120,000 | Platinum Plus: 500,000
-
-Neonatal Care — Incubator/SCBU (global limit, drawn from nursing mother's limit):
-  Bronze: 50,000 | Silver: 100,000 | Gold: 250,000 | Platinum: 500,000 | Platinum Plus: 700,000
-
-Mortuary Services (Cleaning, Embalmment, Storage, Autopsy):
-  Bronze: NOT COVERED | Silver: 50,000 | Gold: 100,000 | Platinum: 150,000 | Platinum Plus: 150,000
-
-Critical Illness + Death Cover (cancer, kidney failure, heart attack, stroke, or death):
-  Bronze: NOT COVERED | Silver: 100,000 | Gold: 200,000 | Platinum: 400,000 | Platinum Plus: 400,000
-
-Fertility Investigation (family plan subscribers only):
-  Bronze: NOT COVERED
-  Silver: 35,000 (Consultations, Counseling, USS, SFA)
-  Gold: 50,000 (Consultations, Counseling, USS, SFA)
-  Platinum: 100,000 (Consultations, Counseling, USS, SFA, HSG, Hormone Profile)
-  Platinum Plus: 200,000 (Consultations, Counseling, USS, SFA, HSG, Hormone Profile)
-
-──────────────────────────────────────────
-SESSION / FREQUENCY LIMITS
-──────────────────────────────────────────
-Psychiatric Care sessions per year:
-  Bronze: 2 | Silver: 4 | Gold: 8 | Platinum: 12 | Platinum Plus: 20
-
-Physiotherapy sessions per year:
-  Bronze: 2 | Silver: 6 | Gold: 10 | Platinum: 15 | Platinum Plus: 20
-
-CT Scan / MRI Scan:
-  Bronze: CT only, emergency cases only, once per annum
-  Silver: CT or MRI, emergency cases only, once per annum
-  Gold: CT or MRI, up to 3 times per annum
-  Platinum: Up to outpatient limit
-  Platinum Plus: Up to outpatient limit
-
-Echocardiogram:
-  Bronze: NOT COVERED | Silver, Gold, Platinum, Platinum Plus: COVERED
-
-Molecular Diagnostics (including Covid-19 testing, designated centers only):
-  Bronze: NOT COVERED | Silver: once per annum | Gold: up to 2/year | Platinum: up to 2/year | Platinum Plus: up to 2/year
-
-Endoscopic Procedures (Colonoscopy, Sigmoidoscopy, Bronchoscopy, Laryngoscopy, Hysteroscopy, Laparoscopy, etc.):
-  Bronze: NOT COVERED | Silver, Gold, Platinum, Platinum Plus: COVERED
-
-ICU / High Dependency Unit (HDU):
-  Bronze: 24 hours | Silver: 48 hours | Gold: 72 hours | Platinum: 5 days | Platinum Plus: 7 days
-
-Mother Accommodation for Dependent Admission (SCBU/NICU only, excluding feeding):
-  Bronze: 24 hours | Silver: 48 hours | Gold: 72 hours | Platinum: 5 days | Platinum Plus: 7 days
-
-Phototherapy:
-  Bronze: 24 hours | Silver: 48 hours | Gold: 72 hours | Platinum: 5 days | Platinum Plus: 7 days
-
-Wellness — Gym (Principal only):
-  Bronze: NOT COVERED | Silver: 2x/month | Gold: 4x/month | Platinum: 8x/month | Platinum Plus: Unlimited
-
-Wellness — Spa (Principal only):
-  Bronze: NOT COVERED | Silver: NOT COVERED | Gold: 2 sessions/year | Platinum: 3 sessions/year | Platinum Plus: 4 sessions/year
-
-──────────────────────────────────────────
-SURGERY CLASSIFICATION (all draw from Surgical Care Limit)
-──────────────────────────────────────────
-MINOR SURGERIES (covered all plans):
-Wound suturing, incision and drainage of abscess, removal of foreign bodies, circumcision,
-excision of lumps, punch biopsy, skin biopsy, ear syringing, episiotomy repair,
-Bartholin cyst incision and drainage, closed reduction of minor dislocations, POP application
-
-INTERMEDIATE SURGERIES (covered all plans):
-Appendectomy, hernia repair (inguinal/umbilical), hydrocelectomy, hemorrhoidectomy,
-fistulectomy/fistulotomy, excision of large lipoma, incisional biopsy, varicose vein surgery (simple),
-pilonidal sinus excision, tonsillectomy, adenoidectomy, septoplasty, turbinectomy, nasal polypectomy,
-TURP, orchidopexy, varicocelectomy, cystoscopy, myomectomy (simple), D&C, MVA,
-tubal ligation, repair of 3rd/4th degree perineal tear, ORIF (simple fractures),
-arthroscopy (diagnostic/simple), tendon repair, removal of deep implants,
-wide local excision of skin lesions, keloid excision with flap closure, skin grafting
-
-MAJOR SURGERIES (covered all plans):
-Exploratory laparotomy, bowel resection and anastomosis, gastrectomy, colectomy,
-splenectomy, pancreatic surgery (Whipple), thyroidectomy, mastectomy, major trauma surgery,
-hepatectomy, craniotomy, brain tumor excision, spinal cord decompression, aneurysm clipping,
-VP shunt insertion, total hip replacement, total knee replacement, spinal fusion surgery,
-major pelvic fracture fixation, limb amputation (major), radical prostatectomy,
-nephrectomy (partial or total), cystectomy, major reconstructive urologic surgery,
-radical hysterectomy, complex myomectomy, obstetric hysterectomy,
-surgery for ruptured ectopic pregnancy, pelvic reconstructive surgery
-
-──────────────────────────────────────────
-MATERNITY & NEONATAL SERVICES (all plans)
-──────────────────────────────────────────
-Antenatal Care: Covered | Normal Delivery: Covered | Induction of Labour: Covered
-Caesarean Section: Covered (up to surgical limit) | Postnatal Care (6 weeks): Covered
-Neonatal basic services (male circumcision, ear piercing): Covered
-Treatment of mild/moderate neonatal sepsis: Covered
-
-──────────────────────────────────────────
-SPECIAL RULES
-──────────────────────────────────────────
-1. PLATINUM PLUS EXPRESS CARD: No pre-authorization required. Auto-approve all requests.
-2. FIRST YEAR SURGICAL EXCLUSION: Non-accidental surgical claims within the first year of cover are excluded.
-3. CHRONIC DISEASE WAITING PERIOD: Hypertension, Diabetes, Hyperlipidemia, and similar chronic diseases have a 6-month waiting period from enrollment date.
-4. PREGNANCY WAITING PERIOD: Pregnancy has a 9-month waiting period. Delivery is NOT covered in the first year of enrollment.
-5. AGE LIMIT: Principal must be 65 or under. Above 65 → must be on Senior Citizens Plan, not standard plans.
-6. OPTICAL LENSES: Once every 2 years only.
-7. HEALTH CHECKS: Only at designated centers during institutions' health week. Non-refundable otherwise.
-8. GYM/SPA: Principal only.
-9. NEWBORN REGISTRATION: Newborns not registered within 6 weeks of birth are excluded.
-10. ROOM TYPE: Bronze=General Ward, Silver=Semi-Private, Gold/Platinum/Platinum Plus=Private. Upgrades not covered.
-11. NEONATAL BENEFIT: Drawn from nursing mother's limit (live birth only).
-
-──────────────────────────────────────────
-EXCLUSIONS — ALWAYS DENY (ALL PLANS)
-──────────────────────────────────────────
-1. Transplant surgery (all types)
-2. Speech disorders
-3. Thyroid disorders — neurological and neurosurgical
-4. Plastic and cosmetic surgeries (all types)
-5. Infertility treatment: IVF, GIFT, artificial insemination, hydrotubation, hysterosalpingogram as treatment
-6. Virility enhancing drugs
-7. Herbal drugs, non-prescription drugs, food supplements, experimental drugs and treatments
-8. Joint replacements and prosthetic limbs
-9. Long-term psychiatric illness (duration longer than 6 months)
-10. Self-inflicted injuries
-11. Treatment of obesity
-12. All Covid-19 treatment and Hepatitis treatment (except molecular diagnostics at designated centers)
-13. Severe burns covering more than 10% of body surface area
-14. Learning difficulties, behavioral and developmental problems
-15. Pre-school health examinations
-16. Newborns not registered within 6 weeks of birth
-17. Neonatal care not in the covered neonatal services schedule
-18. Room upgrades beyond plan specification
-19. Home care and domiciliary services
-20. Consultations with unrecognized practitioners (unrecognized consultants, hospitals, family doctors, therapists, complementary medicine)
-21. Comprehensive health screening outside the health check scope
-22. Advanced/complex investigations not in the schedule
-23. Dental care not in the schedule
-24. Laboratory investigations not in the schedule
-25. Any service, treatment, procedure, or investigation not listed in the covered schedule
-""".format(today=TODAY)
+def _plan_limits_for_request(pa: dict) -> dict:
+    return get_plan_limits(_plan_code_for_request(pa))
 
 
 # ---------------------------------------------------------------------------
 # HELPERS
 # ---------------------------------------------------------------------------
-PLAN_LIMITS = {
-    "Bronze": {
-        "annual_cap": 1_000_000,
-        "inpatient": 600_000,
-        "outpatient": 400_000,
-        "surgical": 200_000,
-        "dental": 15_000,
-        "optical_total": 30_000,
-        "cancer": 100_000,
-        "chronic": 80_000,
-        "hiv": 100_000,
-        "dialysis": None,
-        "neonatal": 50_000,
-    },
-    "Silver": {
-        "annual_cap": 1_700_000,
-        "inpatient": 1_000_000,
-        "outpatient": 700_000,
-        "surgical": 350_000,
-        "dental": 30_000,
-        "optical_total": 60_000,
-        "cancer": 150_000,
-        "chronic": 150_000,
-        "hiv": 150_000,
-        "dialysis": 70_000,
-        "neonatal": 100_000,
-    },
-    "Gold": {
-        "annual_cap": 2_500_000,
-        "inpatient": 1_500_000,
-        "outpatient": 1_000_000,
-        "surgical": 600_000,
-        "dental": 70_000,
-        "optical_total": 90_000,
-        "cancer": 250_000,
-        "chronic": 250_000,
-        "hiv": 350_000,
-        "dialysis": 90_000,
-        "neonatal": 250_000,
-    },
-    "Platinum": {
-        "annual_cap": 3_500_000,
-        "inpatient": 2_100_000,
-        "outpatient": 1_400_000,
-        "surgical": 1_000_000,
-        "dental": 100_000,
-        "optical_total": 130_000,
-        "cancer": 400_000,
-        "chronic": 350_000,
-        "hiv": 500_000,
-        "dialysis": 120_000,
-        "neonatal": 500_000,
-    },
-    "Platinum Plus": {
-        "annual_cap": 5_000_000,
-        "inpatient": 3_000_000,
-        "outpatient": 2_000_000,
-        "surgical": 1_500_000,
-        "dental": 200_000,
-        "optical_total": 350_000,
-        "cancer": 700_000,
-        "chronic": 500_000,
-        "hiv": 500_000,
-        "dialysis": 500_000,
-        "neonatal": 700_000,
-    },
-}
-
 CARE_TYPE_BUCKETS = {
     1: ("inpatient", "Inpatient Limit"),
     2: ("outpatient", "Outpatient Limit"),
@@ -289,6 +76,18 @@ CATEGORY_BUCKET_OVERRIDES = {
     5: ("dental", "Dental Care Limit"),
     6: ("optical_total", "Optical Total Limit"),
     8: ("wellness", "Wellness"),
+}
+
+AMAN_LIMIT_DEFINITION_BUCKETS = {
+    # AMAN limit_definition_id values are tier-specific. Keep this map limited
+    # to IDs we have observed consistently for core inpatient/outpatient rows;
+    # other benefit rows can share amounts across unrelated buckets.
+    1: "inpatient",
+    2: "outpatient",
+    6: "inpatient",
+    7: "outpatient",
+    11: "inpatient",
+    12: "outpatient",
 }
 
 
@@ -330,16 +129,143 @@ def _parse_agent_json(raw: str) -> dict:
     raise AgentJSONParseError(str(last_error), raw) from last_error
 
 
+def _anthropic_usage_payload(response) -> dict:
+    usage = getattr(response, "usage", None)
+    input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
+    output_tokens = int(getattr(usage, "output_tokens", 0) or 0)
+    cache_creation_input_tokens = int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
+    cache_read_input_tokens = int(getattr(usage, "cache_read_input_tokens", 0) or 0)
+    estimated_cost_usd = (
+        (input_tokens / 1_000_000) * ANTHROPIC_INPUT_USD_PER_1M
+        + (output_tokens / 1_000_000) * ANTHROPIC_OUTPUT_USD_PER_1M
+    )
+    return {
+        "provider": "anthropic",
+        "model": settings.anthropic_model,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_creation_input_tokens": cache_creation_input_tokens,
+        "cache_read_input_tokens": cache_read_input_tokens,
+        "total_tokens": input_tokens + output_tokens,
+        "estimated_cost_usd": estimated_cost_usd,
+        "pricing": {
+            "input_usd_per_1m": ANTHROPIC_INPUT_USD_PER_1M,
+            "output_usd_per_1m": ANTHROPIC_OUTPUT_USD_PER_1M,
+        },
+    }
+
+
+def _combine_model_usage(*usages) -> dict | None:
+    valid_usages = [usage for usage in usages if isinstance(usage, dict)]
+    if not valid_usages:
+        return None
+
+    combined = dict(valid_usages[-1])
+    for key in (
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+        "total_tokens",
+    ):
+        combined[key] = sum(int(usage.get(key) or 0) for usage in valid_usages)
+    combined["estimated_cost_usd"] = sum(
+        float(usage.get("estimated_cost_usd") or 0) for usage in valid_usages
+    )
+    combined["api_attempts"] = sum(int(usage.get("api_attempts") or 1) for usage in valid_usages)
+    combined["api_retries"] = sum(int(usage.get("api_retries") or 0) for usage in valid_usages)
+    combined["attempts"] = len(valid_usages)
+    combined["attempt_usages"] = valid_usages
+    return combined
+
+
+def _anthropic_error_type(exc: Exception) -> str:
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict):
+            return str(error.get("type") or "")
+        return str(body.get("type") or "")
+    return ""
+
+
+def _is_transient_anthropic_error(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    if status_code in ANTHROPIC_TRANSIENT_STATUS_CODES:
+        return True
+
+    error_type = _anthropic_error_type(exc).lower()
+    if error_type in {"overloaded_error", "rate_limit_error", "api_error"}:
+        return True
+
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "overloaded_error",
+            "rate_limit_error",
+            "temporarily unavailable",
+            "timeout",
+            "timed out",
+        )
+    )
+
+
 async def _call_claude(system_prompt: str, user_message: str, *, max_tokens: int = 1000) -> dict:
     """Call Claude API and return parsed JSON response."""
-    response = await client.messages.create(
-        model=settings.anthropic_model,
-        max_tokens=max_tokens,
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_message}],
-    )
+    response = None
+    attempt = 1
+    start_time = time.perf_counter()
+    
+    for attempt, delay in enumerate((*ANTHROPIC_RETRY_DELAYS_SECONDS, None), start=1):
+        try:
+            response = await client.messages.create(
+                model=settings.anthropic_model,
+                max_tokens=max_tokens,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_message}],
+            )
+            break
+        except Exception as exc:
+            if delay is None or not _is_transient_anthropic_error(exc):
+                raise
+            logger.warning(
+                "claude_transient_error",
+                attempt=attempt,
+                max_attempts=len(ANTHROPIC_RETRY_DELAYS_SECONDS) + 1,
+                delay_seconds=delay,
+                error=str(exc),
+            )
+            await asyncio.sleep(delay)
+
+    if response is None:
+        raise RuntimeError("Claude API did not return a response")
+
+    latency_ms = (time.perf_counter() - start_time) * 1000
     raw = response.content[0].text.strip()
-    return _parse_agent_json(raw)
+    usage_payload = _anthropic_usage_payload(response)
+    usage_payload["api_attempts"] = attempt
+    usage_payload["api_retries"] = attempt - 1
+    usage_payload["latency_ms"] = round(latency_ms, 2)
+    
+    # Log Claude API performance (SAA-83)
+    logger.info(
+        "claude_api_call",
+        model=settings.anthropic_model,
+        latency_ms=round(latency_ms, 2),
+        input_tokens=usage_payload.get("input_tokens"),
+        output_tokens=usage_payload.get("output_tokens"),
+        estimated_cost_usd=usage_payload.get("estimated_cost_usd"),
+        attempts=attempt,
+    )
+    
+    try:
+        parsed = _parse_agent_json(raw)
+    except AgentJSONParseError as exc:
+        exc.model_usage = usage_payload
+        raise
+    parsed["__model_usage"] = usage_payload
+    return parsed
 
 
 def _parse_json_field(value):
@@ -367,6 +293,8 @@ def _plan_tier(pa: dict) -> str | None:
         return "Silver"
     if "bronze" in plan:
         return "Bronze"
+    if "basic" in plan:
+        return "Basic"
     return None
 
 
@@ -657,6 +585,39 @@ def _limit_row_by_value(limits: list[dict], expected_value: float | None) -> dic
     return None
 
 
+def _limit_bucket_for_definition_id(value) -> str | None:
+    try:
+        definition_id = int(value)
+    except (TypeError, ValueError):
+        return None
+    return AMAN_LIMIT_DEFINITION_BUCKETS.get(definition_id)
+
+
+def _limit_row_by_bucket(limits: list[dict], bucket_key: str | None) -> dict | None:
+    if not bucket_key:
+        return None
+    for limit in limits:
+        if _limit_bucket_for_definition_id(limit.get("limit_definition_id")) == bucket_key:
+            return limit
+    return None
+
+
+def _limit_row_for_bucket(
+    limits: list[dict],
+    bucket_key: str | None,
+    expected_value: float | None,
+) -> tuple[dict | None, str | None]:
+    limit_row = _limit_row_by_bucket(limits, bucket_key)
+    if limit_row:
+        return limit_row, "limit_definition_id"
+
+    limit_row = _limit_row_by_value(limits, expected_value)
+    if limit_row:
+        return limit_row, "limit_value"
+
+    return None, None
+
+
 def _coverage_key(value) -> str:
     return str(value or "").strip().lower()
 
@@ -753,19 +714,44 @@ def _coverage_decision(coverage: dict | None) -> str:
 
 async def _log_agent(request_id: str, agent_num: int, agent_name: str, result: dict):
     """Save individual agent result to agent_logs table and log to console."""
+    model_usage = result.pop("__model_usage", None) if isinstance(result, dict) else None
     passed = result.get("pass", result.get("decision") == "APPROVE")
     status = "pass" if passed else "fail"
-    logger.info(f"[Agent {agent_num} - {agent_name}] status={status} | {json.dumps(result)}")
+    logger.info(
+        "agent_step_completed",
+        agent_num=agent_num,
+        agent_name=agent_name,
+        status=status,
+    )
     await pg_execute(
         """
-        INSERT INTO agent_logs (request_id, agent_num, agent_name, status, result, logged_at)
-        VALUES ($1, $2, $3, $4, $5::jsonb, NOW())
+        INSERT INTO agent_logs (
+            request_id,
+            agent_num,
+            agent_name,
+            status,
+            result,
+            model,
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            estimated_cost_usd,
+            model_usage,
+            logged_at
+        )
+        VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11::jsonb, NOW())
         """,
         str(request_id),
         agent_num,
         agent_name,
         status,
-        json.dumps(result)
+        json.dumps(result),
+        model_usage.get("model") if model_usage else None,
+        model_usage.get("input_tokens") if model_usage else None,
+        model_usage.get("output_tokens") if model_usage else None,
+        model_usage.get("total_tokens") if model_usage else None,
+        model_usage.get("estimated_cost_usd") if model_usage else None,
+        json.dumps(model_usage) if model_usage else None,
     )
 
 
@@ -811,12 +797,13 @@ Return ONLY this JSON:
 # AGENT 2 — Plan & Coverage
 # ---------------------------------------------------------------------------
 async def agent_plan_coverage(pa: dict) -> dict:
+    knowledge_base = _knowledge_base_for_request(pa)
     system_prompt = f"""You are Agent 2 of a pre-authorization pipeline for Aman HMO.
 Your ONLY job is to check whether requested items are covered under the member's plan tier.
 Use the knowledge base below. Return ONLY valid JSON. No markdown.
 
 KNOWLEDGE BASE:
-{KNOWLEDGE_BASE}"""
+{knowledge_base}"""
 
     user_message = f"""Check plan coverage for this pre-authorization request.
 Today's date is {TODAY}.
@@ -868,19 +855,54 @@ Return ONLY this JSON:
   "plan_restriction_detail": "which plan restriction applies, or null"
 }}"""
 
-    return await _call_claude(system_prompt, user_message, max_tokens=3000)
+    coverage_max_tokens = 5000
+    try:
+        return await _call_claude(system_prompt, user_message, max_tokens=coverage_max_tokens)
+    except AgentJSONParseError as first_error:
+        retry_message = f"""{user_message}
+
+The previous coverage-agent response failed JSON parsing with this error:
+{str(first_error)}
+
+Retry once. Return ONLY one complete strict JSON object matching the requested schema.
+Do not use markdown fences. Do not include trailing commas. Close every string, object, and array.
+If an item is uncertain, mark that item ESCALATE inside item_results instead of adding prose outside JSON."""
+        try:
+            retry_result = await _call_claude(
+                system_prompt,
+                retry_message,
+                max_tokens=coverage_max_tokens,
+            )
+        except AgentJSONParseError as second_error:
+            second_error.model_usage = _combine_model_usage(
+                getattr(first_error, "model_usage", None),
+                getattr(second_error, "model_usage", None),
+            )
+            second_error.first_parse_error = str(first_error)
+            second_error.first_raw_output_preview = first_error.raw_output[:2000]
+            raise
+
+        retry_usage = retry_result.get("__model_usage")
+        retry_result["__model_usage"] = (
+            _combine_model_usage(getattr(first_error, "model_usage", None), retry_usage)
+            or retry_usage
+        )
+        retry_result["parse_retry_attempted"] = True
+        retry_result["first_parse_error"] = str(first_error)
+        return retry_result
 
 
 # ---------------------------------------------------------------------------
 # AGENT 3 — Utilization & Limits
 # ---------------------------------------------------------------------------
 async def agent_utilization(pa: dict, benefit_category: str) -> dict:
+    knowledge_base = _knowledge_base_for_request(pa)
     system_prompt = f"""You are Agent 3 of a pre-authorization pipeline for Aman HMO.
 Your ONLY job is to check utilization limits and remaining balances.
 Use the knowledge base below. Return ONLY valid JSON. No markdown.
 
 KNOWLEDGE BASE:
-{KNOWLEDGE_BASE}"""
+{knowledge_base}"""
 
     user_message = f"""Check utilization and limits for this pre-authorization request.
 Benefit category from Agent 2: {benefit_category}
@@ -926,13 +948,43 @@ Return ONLY this JSON:
 def agent_item_utilization(pa: dict, agent2: dict) -> dict:
     items = _current_submission_items(pa)
     plan = _plan_tier(pa)
-    plan_limits = PLAN_LIMITS.get(plan or "")
+    plan_limits = _plan_limits_for_request(pa).get(plan or "")
     limits = _all_limits(pa)
     utilization_data_missing = not bool(limits)
     coverage_map = _coverage_by_item(agent2, items)
     prior_context = _aman_prior_context(pa, items)
 
     if not items:
+        all_items = _items(pa)
+        if (
+            all_items
+            and prior_context.get("rejected_count", 0) == 0
+            and prior_context.get("approved_count", 0) == len(all_items)
+        ):
+            # Nothing is pending because AMAN had already approved every line
+            # in this snapshot before sending it to us (e.g. auto-approved
+            # low-risk items). Mirror AMAN's own decision instead of
+            # escalating with nothing left to advise on.
+            item_decisions = [
+                _build_item_decision(
+                    item,
+                    "APPROVE",
+                    "AMAN had already approved this item prior to our review; mirroring AMAN's decision.",
+                    {"decision": "APPROVE", "reason": "Already approved by AMAN."},
+                    bucket_key=None,
+                    bucket_name="AMAN pre-approved",
+                    requested_cost=_item_approved_cost(item),
+                    utilization_source="aman_prior_approval_mirror",
+                )
+                for item in all_items
+            ]
+            result = _summarize_item_utilization(
+                item_decisions,
+                "All line items were already approved by AMAN prior to agent review.",
+            )
+            result["aman_prior_context"] = prior_context
+            return result
+
         result = {
             "pass": None,
             "reason": "No current pending submission items were available for item-level utilization.",
@@ -958,18 +1010,19 @@ def agent_item_utilization(pa: dict, agent2: dict) -> dict:
         result["aman_prior_context"] = prior_context
         return result
 
-    running_used_by_bucket: dict[str, float] = {}
-    if utilization_data_missing:
-        for historical_item in _historical_items(pa, items):
-            if _item_status(historical_item) != "approved":
-                continue
-            bucket_key, _bucket_name, _bucket_source = _item_bucket(pa, historical_item)
-            if not bucket_key:
-                continue
-            running_used_by_bucket[bucket_key] = (
-                running_used_by_bucket.get(bucket_key, 0.0)
-                + _item_approved_cost(historical_item)
-            )
+    historical_used_by_bucket: dict[str, float] = {}
+    for historical_item in _historical_items(pa, items):
+        if _item_status(historical_item) != "approved":
+            continue
+        bucket_key, _bucket_name, _bucket_source = _item_bucket(pa, historical_item)
+        if not bucket_key:
+            continue
+        historical_used_by_bucket[bucket_key] = (
+            historical_used_by_bucket.get(bucket_key, 0.0)
+            + _item_approved_cost(historical_item)
+        )
+
+    running_used_by_bucket: dict[str, float] = dict(historical_used_by_bucket) if utilization_data_missing else {}
 
     item_decisions = []
     for item in items:
@@ -977,7 +1030,10 @@ def agent_item_utilization(pa: dict, agent2: dict) -> dict:
         coverage_decision = _coverage_decision(coverage)
         bucket_key, bucket_name, bucket_source = _item_bucket(pa, item, coverage)
         expected_limit = plan_limits.get(bucket_key) if bucket_key else None
-        limit_row = _limit_row_by_value(limits, expected_limit) if limits else None
+        limit_row, limit_match_source = (
+            _limit_row_for_bucket(limits, bucket_key, expected_limit)
+            if limits else (None, None)
+        )
         amount = _item_cost(item)
         source_status = _item_status(item)
         amount_to_count = _item_approved_cost(item) if source_status == "approved" else amount
@@ -1033,7 +1089,7 @@ def agent_item_utilization(pa: dict, agent2: dict) -> dict:
             ))
             continue
 
-        if bucket_key in {"maternity", "wellness"}:
+        if bucket_key == "wellness" and not limit_row:
             item_decisions.append(_build_item_decision(
                 item,
                 "ESCALATE",
@@ -1048,48 +1104,68 @@ def agent_item_utilization(pa: dict, agent2: dict) -> dict:
             ))
             continue
 
-        if expected_limit is None:
-            item_decisions.append(_build_item_decision(
-                item,
-                "DENY",
-                f"{bucket_name} is not covered for {plan}.",
-                coverage,
-                bucket_key=bucket_key,
-                bucket_name=bucket_name,
-                bucket_source=bucket_source,
-                requested_cost=amount,
-                utilization_data_missing=utilization_data_missing,
-            ))
-            continue
-
-        if limits and not limit_row:
+        if bucket_key == "maternity" and expected_limit is None and not limit_row:
             item_decisions.append(_build_item_decision(
                 item,
                 "ESCALATE",
-                f"Could not find the {bucket_name} row in AMAN consumption data.",
+                f"{bucket_name} has no deterministic limit mapping yet; AMAN limit_definition_id mapping is required.",
                 coverage,
                 bucket_key=bucket_key,
                 bucket_name=bucket_name,
                 bucket_source=bucket_source,
                 requested_cost=amount,
-                bucket_limit=expected_limit,
                 utilization_data_missing=utilization_data_missing,
             ))
             continue
 
-        limit_value = (_number(limit_row.get("limit_value")) if limit_row else None) or expected_limit
-        base_used = (_number(limit_row.get("consumed_value")) if limit_row else None) or 0.0
+        if expected_limit is None and not limit_row:
+            item_decisions.append(_build_item_decision(
+                item,
+                "ESCALATE",
+                f"{bucket_name} has no deterministic limit mapping for {plan}.",
+                coverage,
+                bucket_key=bucket_key,
+                bucket_name=bucket_name,
+                bucket_source=bucket_source,
+                requested_cost=amount,
+                utilization_data_missing=utilization_data_missing,
+            ))
+            continue
+
+        aman_limit_value = _number(limit_row.get("limit_value")) if limit_row else None
+        limit_value_mismatch = (
+            limit_row is not None
+            and expected_limit is not None
+            and aman_limit_value is not None
+            and not _close_amount(aman_limit_value, expected_limit)
+        )
+        used_knowledge_base_limit = not limit_row or limit_value_mismatch
+        limit_value = (
+            expected_limit
+            if used_knowledge_base_limit and expected_limit is not None
+            else aman_limit_value or expected_limit
+        )
+        base_used = _number(limit_row.get("consumed_value")) if limit_row else None
+        if base_used is None:
+            base_used = historical_used_by_bucket.get(bucket_key, 0.0)
         used_before = running_used_by_bucket.get(bucket_key, base_used)
         remaining_before = limit_value - used_before
         remaining_after = remaining_before - amount_to_count
         bucket_exceeded = remaining_after < -0.01
+        utilization_unverified = utilization_data_missing or used_knowledge_base_limit
 
         decision = "DENY" if bucket_exceeded else "APPROVE"
-        if utilization_data_missing:
+        if used_knowledge_base_limit:
+            if limit_value_mismatch:
+                fallback_context = "AMAN consumption limit value did not match this routed knowledge-base bucket"
+            elif limits:
+                fallback_context = "AMAN consumption rows did not map to this routed knowledge-base bucket"
+            else:
+                fallback_context = "Consumption limits were not configured in the payload"
             reason = (
-                f"Consumption limits were not configured in the payload; approving this item would exceed the {bucket_name} fallback balance from known {plan} plan rules and the current PA snapshot."
+                f"{fallback_context}; approving this item would exceed the {bucket_name} fallback balance from known {plan} plan rules and available utilization context."
                 if bucket_exceeded
-                else f"Consumption limits were not configured in the payload; item fits within the {bucket_name} fallback balance from known {plan} plan rules and the current PA snapshot."
+                else f"{fallback_context}; item fits within the {bucket_name} fallback balance from known {plan} plan rules and available utilization context."
             )
         else:
             reason = (
@@ -1115,8 +1191,20 @@ def agent_item_utilization(pa: dict, agent2: dict) -> dict:
             bucket_remaining_after=remaining_after,
             bucket_exceeded=bucket_exceeded,
             limit_definition_id=limit_row.get("limit_definition_id") if limit_row else None,
-            utilization_data_missing=utilization_data_missing,
-            utilization_source="aman_consumption" if limit_row else "fallback_plan_rules_current_pa_snapshot",
+            utilization_data_missing=utilization_unverified,
+            utilization_source=(
+                f"aman_consumption_{limit_match_source}"
+                if limit_row and limit_match_source and not used_knowledge_base_limit
+                else (
+                    f"aman_consumption_{limit_match_source}_with_knowledge_base_limit"
+                    if limit_row and limit_match_source
+                    else (
+                        "fallback_knowledge_base_limit_unmatched_aman_consumption"
+                        if limits
+                        else "fallback_knowledge_base_limit_missing_aman_consumption"
+                    )
+                )
+            ),
         ))
 
     result = _summarize_item_utilization(item_decisions)
@@ -1147,6 +1235,12 @@ def _build_item_decision(
 ) -> dict:
     amount = _item_cost(item) if requested_cost is None else requested_cost
     approved_cost = amount if decision == "APPROVE" else 0
+    coverage_reason = (coverage or {}).get("reason")
+    reviewer_reason = _reviewer_item_reason(
+        decision,
+        coverage_reason=coverage_reason,
+        utilization_reason=reason,
+    )
     return {
         "claim_item_id": _item_id(item),
         "facility_tariff_item_id": item.get("facility_tariff_item_id"),
@@ -1160,9 +1254,10 @@ def _build_item_decision(
         "source_item_status": _item_status(item),
         "decision": decision,
         "recommendation": "approve" if decision == "APPROVE" else "reject" if decision == "DENY" else "review",
-        "reason": reason,
+        "reason": reviewer_reason,
+        "utilization_reason": reason,
         "coverage_decision": _coverage_decision(coverage),
-        "coverage_reason": (coverage or {}).get("reason"),
+        "coverage_reason": coverage_reason,
         "benefit_category": (coverage or {}).get("benefit_category"),
         "bucket_key": bucket_key,
         "bucket": bucket_name,
@@ -1178,6 +1273,28 @@ def _build_item_decision(
         "bucket_remaining_after": bucket_remaining_after,
         "bucket_exceeded": bucket_exceeded,
     }
+
+
+def _reviewer_item_reason(
+    decision: str,
+    *,
+    coverage_reason: str | None,
+    utilization_reason: str | None,
+) -> str:
+    """Create the line-level rationale shown to AMAN reviewers."""
+    coverage_text = str(coverage_reason or "").strip()
+    utilization_text = str(utilization_reason or "").strip()
+    decision_text = str(decision or "").upper()
+
+    if decision_text == "APPROVE":
+        parts = []
+        if coverage_text:
+            parts.append(coverage_text)
+        if utilization_text and utilization_text != coverage_text:
+            parts.append(f"Utilization check: {utilization_text}")
+        return " ".join(parts) or "Approved based on eligibility, coverage, and utilization checks."
+
+    return utilization_text or coverage_text or "Requires manual review based on eligibility, coverage, or utilization checks."
 
 
 def _summarize_item_utilization(item_decisions: list[dict], fallback_reason: str | None = None) -> dict:
@@ -1292,6 +1409,7 @@ def _build_final_decision_from_items(pa: dict, agent1: dict, agent2: dict, agent
             "agent2_pass": agent2.get("pass"),
             "agent3_pass": agent3.get("pass"),
         },
+        "knowledge_base": _knowledge_base_context_for_request(pa),
         "item_summary": {
             "approved": len(approved),
             "denied": len(denied),
@@ -1373,20 +1491,66 @@ Return ONLY this JSON:
 # ORCHESTRATOR
 # ---------------------------------------------------------------------------
 async def run(patient_id: str, request_id: str):
-    logger.info(f"[Agent] ── START ── request_id={request_id} patient_id={patient_id}")
+    # Bind context for all subsequent logs in this request
+    bind_contextvars(request_id=request_id, patient_id=patient_id)
+    set_sentry_context(request_id=request_id)
+    
+    logger.info("agent_started")
 
     row = await pg_query_one(
         "SELECT extracted_fields FROM preauth_logs WHERE request_id = $1",
         str(request_id)
     )
     if not row:
-        logger.error(f"[Agent] No record found for request_id={request_id}")
+        logger.error("agent_no_record_found")
+        from services.alerts import alert_pipeline_failure
+        await alert_pipeline_failure(
+            "agent record not found",
+            request_id=str(request_id),
+            error_class="no preauth_logs row for request_id",
+        )
         return
 
     pa = _parse_json_field(row["extracted_fields"])
     decision_pa = _pa_with_items(pa, _current_submission_items(pa))
 
     try:
+        # ── Fast path: AMAN already approved every line before this PA
+        # reached us — skip the LLM pipeline entirely and mirror AMAN's
+        # decision directly. Nothing to check here: AMAN's own systems
+        # already validated eligibility, coverage, and limits for lines it
+        # approved, so there's no action for our agent to take.
+        all_items = _items(pa)
+        pending_items = _current_submission_items(pa)
+        if all_items and not pending_items:
+            prior_context = _aman_prior_context(pa, pending_items)
+            if (
+                prior_context.get("rejected_count", 0) == 0
+                and prior_context.get("approved_count", 0) == len(all_items)
+            ):
+                logger.info("agent_skipped_aman_already_approved", auto_approve=True)
+                await pg_execute(
+                    "UPDATE preauth_logs SET status = 'processing', agent_step = 'aman_prior_approval' WHERE request_id = $1",
+                    str(request_id)
+                )
+                result_3 = agent_item_utilization(pa, {})
+                skipped_agent1 = {
+                    "pass": True,
+                    "skipped": True,
+                    "reason": "Skipped — AMAN had already approved every line in this PA before it reached us.",
+                }
+                skipped_agent2 = {"pass": True, "skipped": True}
+                final_result = _build_final_decision_from_items(decision_pa, skipped_agent1, skipped_agent2, result_3)
+                await _log_agent(
+                    request_id, 0, "AMAN Pre-Approved — Pipeline Skipped", dict(final_result)
+                )
+                await _save_decision(request_id, "APPROVE", {
+                    "agent1": skipped_agent1, "agent2": skipped_agent2, "agent3": result_3, "agent4": final_result,
+                    **final_result,
+                    "item_decisions": result_3.get("item_decisions", []),
+                })
+                return
+
         # ── Agent 1: Eligibility ──────────────────────────────────────────
         await pg_execute(
             "UPDATE preauth_logs SET status = 'processing', agent_step = 'eligibility' WHERE request_id = $1",
@@ -1410,7 +1574,7 @@ async def run(patient_id: str, request_id: str):
             return
 
         if result_1.get("is_platinum_plus"):
-            logger.info(f"[Agent] Platinum Plus express — auto-approving request_id={request_id}")
+            logger.info("agent_platinum_plus_express", auto_approve=True)
             result_3 = _global_item_decisions(pa, "APPROVE", "Platinum Plus express card — no pre-authorization required.")
             final_result = _build_final_decision_from_items(decision_pa, result_1, {"pass": True}, result_3)
             final_result["flags"] = ["platinum_plus_express_card"]
@@ -1436,6 +1600,12 @@ async def run(patient_id: str, request_id: str):
                 "[Agent] Agent 2 JSON parse failed request_id=%s raw=%s",
                 request_id,
                 e.raw_output[:1000],
+            )
+            from services.alerts import alert_quality_warning
+            await alert_quality_warning(
+                "Agent 2 (coverage) returned malformed JSON",
+                request_id=str(request_id),
+                detail="all items routed to human review (ESCALATE)",
             )
             result_2 = {
                 "pass": None,
@@ -1465,6 +1635,9 @@ async def run(patient_id: str, request_id: str):
                 "parse_failed": True,
                 "parse_error": str(e),
                 "raw_output_preview": e.raw_output[:2000],
+                "first_parse_error": getattr(e, "first_parse_error", None),
+                "first_raw_output_preview": getattr(e, "first_raw_output_preview", None),
+                "__model_usage": getattr(e, "model_usage", None),
             }
         await _log_agent(request_id, 2, "Plan & Coverage", result_2)
 
@@ -1491,10 +1664,16 @@ async def run(patient_id: str, request_id: str):
         })
 
     except Exception as e:
-        logger.exception(f"[Agent] ERROR request_id={request_id}: {e}")
+        logger.exception("agent_error", error=str(e))
         await pg_execute(
             "UPDATE preauth_logs SET status = 'error', error_message = $2 WHERE request_id = $1",
             str(request_id), str(e)
+        )
+        from services.alerts import alert_pipeline_failure
+        await alert_pipeline_failure(
+            "agent pipeline crashed",
+            request_id=str(request_id),
+            error_class=type(e).__name__,
         )
 
 
@@ -1512,7 +1691,7 @@ async def _save_decision(request_id: str, decision: str, result: dict):
         """,
         str(request_id), status, decision, json.dumps(result)
     )
-    logger.info(f"[Agent] ── END ── request_id={request_id} decision={decision}")
+    logger.info("agent_completed", decision=decision)
 
     # Send the decision back to Aman (advisory callback — integration direction (ii)).
     # Imported lazily to avoid any startup-time coupling.
@@ -1520,7 +1699,7 @@ async def _save_decision(request_id: str, decision: str, result: dict):
         from services.aman_callback import send_decision_to_aman
         await send_decision_to_aman(str(request_id))
     except Exception:
-        logger.exception("[Agent] Aman callback failed (logged, not raised)")
+        logger.exception("agent_callback_failed")
 
 
 def _get_estimated_cost(pa: dict) -> float | None:
