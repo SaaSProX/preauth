@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from services.db import get_pg_conn
+from services.db import get_pg_conn, release_pg_conn
 from services.json_utils import json_param as _json_param
 
 
@@ -233,4 +233,4 @@ async def persist_preauth_intake_event(
                 "latest_state_updated": updates_latest_state,
             }
     finally:
-        await conn.close()
+        await release_pg_conn(conn)
