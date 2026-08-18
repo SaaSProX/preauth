@@ -143,6 +143,41 @@ def normalize_status(value):
     return value
 
 
+def finalized_submission_decision(payload: dict) -> str | None:
+    """Return AMAN's PA-level result when a submission is already finalized.
+
+    These payloads are snapshots of work AMAN completed before SaaSPro received
+    the event. They must be displayed, but must not be treated as agent output.
+    """
+    event_type = str(payload.get("event_type") or "").strip().lower()
+    if event_type != "pa.submitted":
+        return None
+
+    items = payload.get("pa_items")
+    if not isinstance(items, list) or not items:
+        return None
+
+    statuses = [
+        str(item.get("status") or "").strip().lower()
+        for item in items
+        if isinstance(item, dict)
+    ]
+    if not statuses or any(status in ("", "pending", "0") for status in statuses):
+        return None
+
+    aggregated_status = str(get_nested(payload, "encounter.aggregated_status") or "").strip().lower()
+    if aggregated_status not in {"approved", "rejected", "mixed", "finalized", "decided"}:
+        return None
+
+    approved = sum(status in {"approved", "approve", "1"} for status in statuses)
+    rejected = sum(status in {"rejected", "reject", "denied", "deny", "3"} for status in statuses)
+    if approved:
+        return "APPROVE"
+    if rejected:
+        return "DENY"
+    return None
+
+
 def normalize_plan_tier(plan_name):
     if not isinstance(plan_name, str):
         return plan_name
@@ -504,7 +539,8 @@ async def receive_preauth(
 
         extracted_fields = extract_preauth_fields(payload)
         event_type = str(payload.get("event_type") or "").strip().lower()
-        should_run_agent = event_type == "pa.submitted"
+        finalized_decision = finalized_submission_decision(payload)
+        should_run_agent = event_type == "pa.submitted" and finalized_decision is None
         request_id = extracted_fields["request_id"] or f"intake-{uuid.uuid4().hex}"
         patient_id = extracted_fields["patient_id"] or "unknown"
         missing_recommended_fields = [
@@ -544,6 +580,31 @@ async def receive_preauth(
         preauth_row = persisted["preauth_row"]
         event_row = persisted["event_row"]
         duplicate_event = persisted["duplicate_event"]
+
+        if finalized_decision is not None and preauth_row:
+            await pg_execute(
+                """
+                UPDATE preauth_logs
+                SET status = $2,
+                    decision = $3,
+                    agent_step = 'skipped_finalized_at_submission',
+                    agent_result = $4::jsonb,
+                    processed_at = NOW(),
+                    callback_status = 'skipped_finalized_at_submission',
+                    callback_error = NULL
+                WHERE id = $1
+                """,
+                preauth_row["id"],
+                finalized_decision.lower(),
+                finalized_decision,
+                json.dumps({
+                    "decision": finalized_decision,
+                    "decision_source": "aman_submission_state",
+                    "agent_skipped": True,
+                    "reasoning": "PA was already finalized by AMAN when submitted; no agents were run.",
+                    "item_decisions": [],
+                }),
+            )
         db_insert_status = (
             "duplicate_event_seen"
             if duplicate_event
@@ -600,6 +661,8 @@ async def receive_preauth(
             "duplicate_event": duplicate_event,
             "latest_state_updated": persisted["latest_state_updated"],
             "agent_triggered": agent_triggered,
+            "finalized_at_submission": finalized_decision is not None,
+            "finalized_decision": finalized_decision,
             "captured_fields": extracted_fields,
             "missing_recommended_fields": missing_recommended_fields,
         }
