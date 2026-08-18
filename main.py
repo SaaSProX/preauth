@@ -6,6 +6,7 @@ from config.sentry import init_sentry
 from config.logging import configure_logging, get_logger
 from middleware.request_logging import RequestLoggingMiddleware
 from middleware.exception_handler import ExceptionHandlerMiddleware
+from services.db import init_pg_pool, close_pg_pool
 from webhook.router import router
 from auth.router import router as auth_router
 
@@ -36,7 +37,8 @@ app.include_router(auth_router)
 
 @app.on_event("startup")
 async def startup_event():
-    """Log startup information."""
+    """Log startup information and open the shared DB pool."""
+    await init_pg_pool()
     logger.info(
         "app_started",
         sentry_enabled=sentry_enabled,
@@ -44,6 +46,12 @@ async def startup_event():
         agent_enabled=settings.agent_enabled,
         applied_mode_enabled=settings.applied_mode_enabled,
     )
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Close the shared DB pool."""
+    await close_pg_pool()
 
 
 @app.get("/health")

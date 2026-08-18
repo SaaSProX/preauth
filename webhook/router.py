@@ -143,6 +143,60 @@ def normalize_status(value):
     return value
 
 
+def aman_prior_approval_result(pa: dict) -> dict | None:
+    """Return a mirrored APPROVE decision when AMAN already approved every
+    line in this submission before it reached us.
+
+    AMAN sends the whole check-in snapshot on every event. When zero items
+    are pending and 100% of what AMAN sent is already approved — nothing
+    rejected, nothing queried, nothing unaccounted — there's nothing left
+    for our agent to evaluate, so we mirror AMAN's own approval instead of
+    running the pipeline. Any mixed, rejected, or genuinely empty snapshot
+    returns None so the normal agent pipeline runs as usual.
+
+    `pa` must be the already-extracted field shape (i.e. the output of
+    extract_preauth_fields), not the raw webhook payload — that's the exact
+    shape agent.agent's helpers expect, since it's the same data that later
+    becomes the `pa` dict inside agent.run().
+    """
+    if str(pa.get("event_type") or "").strip().lower() != "pa.submitted":
+        return None
+
+    all_items = agent._items(pa)
+    if not all_items:
+        return None
+
+    pending_items = agent._current_submission_items(pa)
+    if pending_items:
+        return None
+
+    prior_context = agent._aman_prior_context(pa, pending_items)
+    if (
+        prior_context.get("rejected_count", 0) != 0
+        or prior_context.get("approved_count", 0) != len(all_items)
+    ):
+        return None
+
+    result_3 = agent.agent_item_utilization(pa, {})
+    skipped_agent1 = {
+        "pass": True,
+        "skipped": True,
+        "reason": "Skipped — AMAN had already approved every line in this PA before it reached us.",
+    }
+    skipped_agent2 = {"pass": True, "skipped": True}
+    final_result = agent._build_final_decision_from_items(pa, skipped_agent1, skipped_agent2, result_3)
+    return {
+        "agent1": skipped_agent1,
+        "agent2": skipped_agent2,
+        "agent3": result_3,
+        "agent4": final_result,
+        **final_result,
+        "item_decisions": result_3.get("item_decisions", []),
+        "decision_source": "aman_submission_state",
+        "agent_skipped": True,
+    }
+
+
 def normalize_plan_tier(plan_name):
     if not isinstance(plan_name, str):
         return plan_name
@@ -504,7 +558,8 @@ async def receive_preauth(
 
         extracted_fields = extract_preauth_fields(payload)
         event_type = str(payload.get("event_type") or "").strip().lower()
-        should_run_agent = event_type == "pa.submitted"
+        aman_prior_result = aman_prior_approval_result(extracted_fields)
+        should_run_agent = event_type == "pa.submitted" and aman_prior_result is None
         request_id = extracted_fields["request_id"] or f"intake-{uuid.uuid4().hex}"
         patient_id = extracted_fields["patient_id"] or "unknown"
         missing_recommended_fields = [
@@ -544,6 +599,25 @@ async def receive_preauth(
         preauth_row = persisted["preauth_row"]
         event_row = persisted["event_row"]
         duplicate_event = persisted["duplicate_event"]
+
+        if aman_prior_result is not None and preauth_row:
+            await pg_execute(
+                """
+                UPDATE preauth_logs
+                SET status = $2,
+                    decision = $3,
+                    agent_step = 'skipped_aman_prior_approval',
+                    agent_result = $4::jsonb,
+                    processed_at = NOW(),
+                    callback_status = 'skipped_aman_prior_approval',
+                    callback_error = NULL
+                WHERE id = $1
+                """,
+                preauth_row["id"],
+                "approve",
+                "APPROVE",
+                json.dumps(aman_prior_result),
+            )
         db_insert_status = (
             "duplicate_event_seen"
             if duplicate_event
@@ -600,6 +674,8 @@ async def receive_preauth(
             "duplicate_event": duplicate_event,
             "latest_state_updated": persisted["latest_state_updated"],
             "agent_triggered": agent_triggered,
+            "finalized_at_submission": aman_prior_result is not None,
+            "finalized_decision": "APPROVE" if aman_prior_result is not None else None,
             "captured_fields": extracted_fields,
             "missing_recommended_fields": missing_recommended_fields,
         }
