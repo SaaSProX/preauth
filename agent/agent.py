@@ -955,6 +955,36 @@ def agent_item_utilization(pa: dict, agent2: dict) -> dict:
     prior_context = _aman_prior_context(pa, items)
 
     if not items:
+        all_items = _items(pa)
+        if (
+            all_items
+            and prior_context.get("rejected_count", 0) == 0
+            and prior_context.get("approved_count", 0) == len(all_items)
+        ):
+            # Nothing is pending because AMAN had already approved every line
+            # in this snapshot before sending it to us (e.g. auto-approved
+            # low-risk items). Mirror AMAN's own decision instead of
+            # escalating with nothing left to advise on.
+            item_decisions = [
+                _build_item_decision(
+                    item,
+                    "APPROVE",
+                    "AMAN had already approved this item prior to our review; mirroring AMAN's decision.",
+                    {"decision": "APPROVE", "reason": "Already approved by AMAN."},
+                    bucket_key=None,
+                    bucket_name="AMAN pre-approved",
+                    requested_cost=_item_approved_cost(item),
+                    utilization_source="aman_prior_approval_mirror",
+                )
+                for item in all_items
+            ]
+            result = _summarize_item_utilization(
+                item_decisions,
+                "All line items were already approved by AMAN prior to agent review.",
+            )
+            result["aman_prior_context"] = prior_context
+            return result
+
         result = {
             "pass": None,
             "reason": "No current pending submission items were available for item-level utilization.",
@@ -1485,6 +1515,42 @@ async def run(patient_id: str, request_id: str):
     decision_pa = _pa_with_items(pa, _current_submission_items(pa))
 
     try:
+        # ── Fast path: AMAN already approved every line before this PA
+        # reached us — skip the LLM pipeline entirely and mirror AMAN's
+        # decision directly. Nothing to check here: AMAN's own systems
+        # already validated eligibility, coverage, and limits for lines it
+        # approved, so there's no action for our agent to take.
+        all_items = _items(pa)
+        pending_items = _current_submission_items(pa)
+        if all_items and not pending_items:
+            prior_context = _aman_prior_context(pa, pending_items)
+            if (
+                prior_context.get("rejected_count", 0) == 0
+                and prior_context.get("approved_count", 0) == len(all_items)
+            ):
+                logger.info("agent_skipped_aman_already_approved", auto_approve=True)
+                await pg_execute(
+                    "UPDATE preauth_logs SET status = 'processing', agent_step = 'aman_prior_approval' WHERE request_id = $1",
+                    str(request_id)
+                )
+                result_3 = agent_item_utilization(pa, {})
+                skipped_agent1 = {
+                    "pass": True,
+                    "skipped": True,
+                    "reason": "Skipped — AMAN had already approved every line in this PA before it reached us.",
+                }
+                skipped_agent2 = {"pass": True, "skipped": True}
+                final_result = _build_final_decision_from_items(decision_pa, skipped_agent1, skipped_agent2, result_3)
+                await _log_agent(
+                    request_id, 0, "AMAN Pre-Approved — Pipeline Skipped", dict(final_result)
+                )
+                await _save_decision(request_id, "APPROVE", {
+                    "agent1": skipped_agent1, "agent2": skipped_agent2, "agent3": result_3, "agent4": final_result,
+                    **final_result,
+                    "item_decisions": result_3.get("item_decisions", []),
+                })
+                return
+
         # ── Agent 1: Eligibility ──────────────────────────────────────────
         await pg_execute(
             "UPDATE preauth_logs SET status = 'processing', agent_step = 'eligibility' WHERE request_id = $1",
