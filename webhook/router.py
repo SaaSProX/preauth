@@ -1,5 +1,4 @@
 import json
-import logging
 import time
 import uuid
 from datetime import date, datetime
@@ -8,6 +7,8 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 from agent import agent
 from config.settings import settings
 from middleware.rate_limit import limiter
+from config.logging import get_logger, bind_contextvars, get_contextvars, BackgroundTaskWithContext
+from config.sentry import set_sentry_context
 from services.db import pg_execute, pg_query_one
 from services.preauth_events import persist_preauth_intake_event
 from services.webhook_delivery import (
@@ -17,7 +18,7 @@ from services.webhook_delivery import (
 )
 
 router = APIRouter()
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def get_nested(payload: dict, path: str):
@@ -79,7 +80,7 @@ async def authenticate_webhook_request(request: Request):
             client["id"],
         )
     except Exception:
-        logger.exception("failed to update last_used_at for api_client %s", client.get("id"))
+        logger.exception("failed_to_update_api_client_last_used", client_id=client.get("id"))
 
     return client, "auth_success", None
 
@@ -141,6 +142,60 @@ def normalize_status(value):
         if cleaned in {"0", "inactive", "disabled", "expired", "rejected", "blocked"}:
             return "inactive"
     return value
+
+
+def aman_prior_approval_result(pa: dict) -> dict | None:
+    """Return a mirrored APPROVE decision when AMAN already approved every
+    line in this submission before it reached us.
+
+    AMAN sends the whole check-in snapshot on every event. When zero items
+    are pending and 100% of what AMAN sent is already approved — nothing
+    rejected, nothing queried, nothing unaccounted — there's nothing left
+    for our agent to evaluate, so we mirror AMAN's own approval instead of
+    running the pipeline. Any mixed, rejected, or genuinely empty snapshot
+    returns None so the normal agent pipeline runs as usual.
+
+    `pa` must be the already-extracted field shape (i.e. the output of
+    extract_preauth_fields), not the raw webhook payload — that's the exact
+    shape agent.agent's helpers expect, since it's the same data that later
+    becomes the `pa` dict inside agent.run().
+    """
+    if str(pa.get("event_type") or "").strip().lower() != "pa.submitted":
+        return None
+
+    all_items = agent._items(pa)
+    if not all_items:
+        return None
+
+    pending_items = agent._current_submission_items(pa)
+    if pending_items:
+        return None
+
+    prior_context = agent._aman_prior_context(pa, pending_items)
+    if (
+        prior_context.get("rejected_count", 0) != 0
+        or prior_context.get("approved_count", 0) != len(all_items)
+    ):
+        return None
+
+    result_3 = agent.agent_item_utilization(pa, {})
+    skipped_agent1 = {
+        "pass": True,
+        "skipped": True,
+        "reason": "Skipped — AMAN had already approved every line in this PA before it reached us.",
+    }
+    skipped_agent2 = {"pass": True, "skipped": True}
+    final_result = agent._build_final_decision_from_items(pa, skipped_agent1, skipped_agent2, result_3)
+    return {
+        "agent1": skipped_agent1,
+        "agent2": skipped_agent2,
+        "agent3": result_3,
+        "agent4": final_result,
+        **final_result,
+        "item_decisions": result_3.get("item_decisions", []),
+        "decision_source": "aman_submission_state",
+        "agent_skipped": True,
+    }
 
 
 def normalize_plan_tier(plan_name):
@@ -428,7 +483,7 @@ async def receive_preauth(
                 error_message=str(exc),
                 processing_time_ms=elapsed_ms(started_at),
             )
-            logger.exception("Webhook auth check failed")
+            logger.exception("webhook_auth_check_failed")
             raise HTTPException(status_code=500, detail="Webhook authentication failed")
 
         if not client:
@@ -448,6 +503,10 @@ async def receive_preauth(
             api_client_id=client["id"],
             auth_status=auth_status,
         )
+
+        # Bind org context for logging and Sentry (SAA-83)
+        bind_contextvars(org_id=client["org_id"], api_client_id=client["id"])
+        set_sentry_context(org_id=client["org_id"], api_client_id=client["id"])
 
         body = await request.body()
         payload_size_bytes = len(body)
@@ -501,7 +560,8 @@ async def receive_preauth(
 
         extracted_fields = extract_preauth_fields(payload)
         event_type = str(payload.get("event_type") or "").strip().lower()
-        should_run_agent = event_type == "pa.submitted"
+        aman_prior_result = aman_prior_approval_result(extracted_fields)
+        should_run_agent = event_type == "pa.submitted" and aman_prior_result is None
         request_id = extracted_fields["request_id"] or f"intake-{uuid.uuid4().hex}"
         patient_id = extracted_fields["patient_id"] or "unknown"
         missing_recommended_fields = [
@@ -529,12 +589,37 @@ async def receive_preauth(
                 error_message=str(exc),
                 processing_time_ms=elapsed_ms(started_at),
             )
-            logger.exception("Failed to persist preauth webhook payload")
+            logger.exception("webhook_persist_failed", request_id=str(request_id))
+            from services.alerts import alert_pipeline_failure
+            await alert_pipeline_failure(
+                "failed to persist intake event",
+                request_id=str(request_id),
+                error_class=type(exc).__name__,
+            )
             raise HTTPException(status_code=500, detail="Failed to persist webhook payload")
 
         preauth_row = persisted["preauth_row"]
         event_row = persisted["event_row"]
         duplicate_event = persisted["duplicate_event"]
+
+        if aman_prior_result is not None and preauth_row:
+            await pg_execute(
+                """
+                UPDATE preauth_logs
+                SET status = $2,
+                    decision = $3,
+                    agent_step = 'skipped_aman_prior_approval',
+                    agent_result = $4::jsonb,
+                    processed_at = NOW(),
+                    callback_status = 'skipped_aman_prior_approval',
+                    callback_error = NULL
+                WHERE id = $1
+                """,
+                preauth_row["id"],
+                "approve",
+                "APPROVE",
+                json.dumps(aman_prior_result),
+            )
         db_insert_status = (
             "duplicate_event_seen"
             if duplicate_event
@@ -559,24 +644,28 @@ async def receive_preauth(
         # Kick off agent in background (if enabled)
         agent_triggered = False
         if should_run_agent and not duplicate_event and settings.agent_enabled:
-            background.add_task(agent.run, str(patient_id), str(request_id))
+            # Copy logging context to background task (SAA-83)
+            ctx = get_contextvars()
+            background.add_task(BackgroundTaskWithContext(agent.run, ctx), str(patient_id), str(request_id))
             agent_triggered = True
         elif not should_run_agent:
             logger.info(
-                "Webhook event_type=%s is an update/final-decision event. Saved without running agent for request_id=%s",
-                payload.get("event_type"),
-                request_id,
+                "webhook_non_submission_event",
+                event_type=payload.get("event_type"),
+                request_id=request_id,
+                reason="update_or_final_decision_event",
             )
         elif duplicate_event:
             logger.info(
-                "Duplicate webhook event_id=%s. Saved duplicate attempt without running agent for request_id=%s",
-                payload.get("event_id"),
-                request_id,
+                "webhook_duplicate_event",
+                event_id=payload.get("event_id"),
+                request_id=request_id,
             )
         else:
             logger.info(
-                "Agent is paused (AGENT_ENABLED=false). Skipping auto-decision for request_id=%s",
-                request_id,
+                "webhook_agent_paused",
+                request_id=request_id,
+                agent_enabled=settings.agent_enabled,
             )
 
         return {
@@ -587,6 +676,8 @@ async def receive_preauth(
             "duplicate_event": duplicate_event,
             "latest_state_updated": persisted["latest_state_updated"],
             "agent_triggered": agent_triggered,
+            "finalized_at_submission": aman_prior_result is not None,
+            "finalized_decision": "APPROVE" if aman_prior_result is not None else None,
             "captured_fields": extracted_fields,
             "missing_recommended_fields": missing_recommended_fields,
         }
@@ -600,5 +691,5 @@ async def receive_preauth(
             error_message=str(exc),
             processing_time_ms=elapsed_ms(started_at),
         )
-        logger.exception("Unhandled webhook processing error")
+        logger.exception("webhook_unhandled_error")
         raise

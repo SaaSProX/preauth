@@ -1088,7 +1088,20 @@ async def preauth_dashboard(
     today_start = datetime.now(lagos_tz).replace(hour=0, minute=0, second=0, microsecond=0)
     today_end = today_start + timedelta(days=1)
 
-    summary = await pg_query_one(
+    (
+        summary,
+        event_summary,
+        all_time_event_summary,
+        today_event_summary,
+        duplicate_summary,
+        all_time_duplicate_summary,
+        today_duplicate_summary,
+        rows,
+        series_rows,
+        plans_rows,
+        window_row,
+    ) = await asyncio.gather(
+        pg_query_one(
         """
         SELECT
             COUNT(*)::int AS total,
@@ -1291,9 +1304,8 @@ async def preauth_dashboard(
           ))
         """,
         org_id, date_from_start, date_to_end, plan_filter, search_pattern
-    )
-
-    event_summary = await pg_query_one(
+        ),
+        pg_query_one(
         """
         SELECT
             COUNT(*)::int AS event_count,
@@ -1307,9 +1319,8 @@ async def preauth_dashboard(
           AND ($3::timestamptz IS NULL OR created_at < $3::timestamptz)
         """,
         org_id, event_date_from_start, event_date_to_end
-    )
-
-    all_time_event_summary = await pg_query_one(
+        ),
+        pg_query_one(
         """
         SELECT
             COUNT(*)::int AS event_count,
@@ -1321,9 +1332,8 @@ async def preauth_dashboard(
           AND event_type = 'pa.submitted'
         """,
         org_id
-    )
-
-    today_event_summary = await pg_query_one(
+        ),
+        pg_query_one(
         """
         SELECT
             COUNT(*)::int AS event_count,
@@ -1337,9 +1347,8 @@ async def preauth_dashboard(
           AND created_at < $3::timestamptz
         """,
         org_id, today_start, today_end
-    )
-
-    duplicate_summary = await pg_query_one(
+        ),
+        pg_query_one(
         """
         SELECT COUNT(*)::int AS duplicate_event_attempts
         FROM webhook_delivery_logs
@@ -1349,9 +1358,8 @@ async def preauth_dashboard(
           AND ($3::timestamptz IS NULL OR created_at < $3::timestamptz)
         """,
         org_id, event_date_from_start, event_date_to_end
-    )
-
-    all_time_duplicate_summary = await pg_query_one(
+        ),
+        pg_query_one(
         """
         SELECT COUNT(*)::int AS duplicate_event_attempts
         FROM webhook_delivery_logs
@@ -1359,9 +1367,8 @@ async def preauth_dashboard(
           AND db_insert_status = 'duplicate_event_seen'
         """,
         org_id
-    )
-
-    today_duplicate_summary = await pg_query_one(
+        ),
+        pg_query_one(
         """
         SELECT COUNT(*)::int AS duplicate_event_attempts
         FROM webhook_delivery_logs
@@ -1371,9 +1378,8 @@ async def preauth_dashboard(
           AND created_at < $3::timestamptz
         """,
         org_id, today_start, today_end
-    )
-
-    rows = await pg_query_all(
+        ),
+        pg_query_all(
         """
         SELECT
             p.request_id,
@@ -1502,9 +1508,8 @@ async def preauth_dashboard(
         LIMIT $6 OFFSET $7
         """,
         org_id, date_from_start, date_to_end, plan_filter, search_pattern, page_size, offset
-    )
-
-    series_rows = await pg_query_all(
+        ),
+        pg_query_all(
         """
         SELECT
             to_char(date(p.received_at), 'YYYY-MM-DD') AS day,
@@ -1562,9 +1567,8 @@ async def preauth_dashboard(
         ORDER BY day
         """,
         org_id, date_from_start, date_to_end, plan_filter, search_pattern
-    )
-
-    plans_rows = await pg_query_all(
+        ),
+        pg_query_all(
         """
         SELECT DISTINCT
             COALESCE(extracted_fields->>'plan', raw_payload->'policy'->>'plan_name', raw_payload->'policy'->>'insurance_package') AS plan
@@ -1574,12 +1578,13 @@ async def preauth_dashboard(
         ORDER BY plan
         """,
         org_id
-    )
+        ),
     # The full date span the org has ever received PAs over (ignores active filters).
     # Used by the dashboard header so the visible timeframe is always honest.
-    window_row = await pg_query_one(
+        pg_query_one(
         "SELECT MIN(received_at) AS earliest, MAX(received_at) AS latest FROM preauth_logs WHERE org_id = $1",
         org_id
+        ),
     )
     data_window = {
         "earliest": window_row["earliest"].isoformat() if window_row and window_row.get("earliest") else None,
@@ -2165,7 +2170,7 @@ async def qa_accuracy(
             SELECT raw_payload, event_type, occurred_at, last_seen_at, created_at, event_sequence
             FROM preauth_events e
             WHERE e.org_id = submitted.org_id
-              AND LOWER(COALESCE(e.event_type, '')) IN ('pa.approved', 'pa.rejected', 'pa.finalized', 'pa.updated')
+              AND LOWER(COALESCE(e.event_type, '')) IN ('pa.decided', 'pa.approved', 'pa.rejected', 'pa.finalized', 'pa.updated')
               AND e.raw_payload ? 'line_outcomes'
               AND e.checkin_id = submitted.checkin_id
               AND (
@@ -2314,7 +2319,7 @@ async def qa_accuracy(
             FROM preauth_events outcome
             WHERE outcome.org_id = e.org_id
               AND outcome.checkin_id = e.checkin_id
-              AND LOWER(COALESCE(outcome.event_type, '')) IN ('pa.approved', 'pa.rejected', 'pa.finalized', 'pa.updated')
+              AND LOWER(COALESCE(outcome.event_type, '')) IN ('pa.decided', 'pa.approved', 'pa.rejected', 'pa.finalized', 'pa.updated')
               AND outcome.raw_payload ? 'line_outcomes'
               AND (
                 outcome.correlation_id = e.correlation_id
@@ -2439,7 +2444,7 @@ async def qa_accuracy(
                 SELECT oe.raw_payload
                 FROM preauth_events oe
                 WHERE oe.org_id = $1
-                  AND LOWER(COALESCE(oe.event_type, '')) IN ('pa.approved', 'pa.rejected', 'pa.finalized', 'pa.updated')
+                  AND LOWER(COALESCE(oe.event_type, '')) IN ('pa.decided', 'pa.approved', 'pa.rejected', 'pa.finalized', 'pa.updated')
                   AND oe.raw_payload ? 'line_outcomes'
                   AND (
                     oe.correlation_id = s.submitted_correlation_id
@@ -2600,7 +2605,8 @@ async def qa_accuracy(
         intake_items_list = _list_of_dicts(intake_payload.get("pa_items"))
 
         outcome_agent, outcome_agent_amount, _partner_counts = _qa_partner_from_line_outcomes(line_outcomes)
-        agent = outcome_agent or _qa_norm_dec(r.get("decision_raw"))
+        agent_was_skipped = agent_result_obj.get("agent_skipped") is True
+        agent = None if agent_was_skipped else (outcome_agent or _qa_norm_dec(r.get("decision_raw")))
         agent_amount = float(outcome_agent_amount if outcome_agent is not None else (r.get("agent_amount") or 0))
 
         aman, aman_amount, aman_counts = _qa_aman_from_line_outcomes(line_outcomes)

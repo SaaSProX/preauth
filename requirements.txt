@@ -13,3 +13,7 @@ python-multipart
 certifi
 httpx
 slowapi
+
+# Observability (SAA-83)
+sentry-sdk[fastapi]>=2.0.0
+structlog>=24.0.0
