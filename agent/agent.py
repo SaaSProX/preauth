@@ -684,6 +684,21 @@ def _item_bucket(pa: dict, item: dict, coverage: dict | None = None) -> tuple[st
         return "dialysis", "Kidney Dialysis Limit", "coverage_category"
     if "neonatal" in benefit_category:
         return "neonatal", "Neonatal Care Limit", "coverage_category"
+    if "maternity" in benefit_category or "antenatal" in benefit_category:
+        return "maternity", "Antenatal/Maternity", "coverage_category"
+    if "dental" in benefit_category:
+        return "dental", "Dental Care Limit", "coverage_category"
+    if "optical" in benefit_category or "ophthalm" in benefit_category:
+        return "optical_total", "Optical Total Limit", "coverage_category"
+    if "hiv" in benefit_category or "aids" in benefit_category:
+        return "hiv", "HIV/AIDS Care Limit", "coverage_category"
+    if any(label in benefit_category for label in (
+        "outpatient", "out-patient", "health check", "annual medical",
+        "laboratory", "diagnostic", "ct scan", "mri scan",
+    )):
+        return "outpatient", "Outpatient Limit", "coverage_category"
+    if "inpatient" in benefit_category or "in-patient" in benefit_category:
+        return "inpatient", "Inpatient Limit", "coverage_category"
 
     try:
         care_type = int(pa.get("care_type"))
@@ -693,6 +708,15 @@ def _item_bucket(pa: dict, item: dict, coverage: dict | None = None) -> tuple[st
     if care_type in CARE_TYPE_BUCKETS:
         bucket_key, bucket_name = CARE_TYPE_BUCKETS[care_type]
         return bucket_key, bucket_name, "care_type"
+
+    # AMAN occasionally omits the numeric care_type while still providing a
+    # descriptive checkin_type. Use it before giving up on deterministic
+    # utilization routing.
+    checkin_type = re.sub(r"[^a-z0-9]+", " ", str(pa.get("checkin_type") or "").lower()).strip()
+    if any(label in checkin_type for label in ("out patient", "outpatient", "annual medical", "health check")):
+        return "outpatient", "Outpatient Limit", "checkin_type"
+    if "in patient" in checkin_type or "inpatient" in checkin_type:
+        return "inpatient", "Inpatient Limit", "checkin_type"
 
     return None, "Unknown Limit Bucket", None
 
@@ -1133,13 +1157,10 @@ def agent_item_utilization(pa: dict, agent2: dict) -> dict:
             continue
 
         aman_limit_value = _number(limit_row.get("limit_value")) if limit_row else None
-        limit_value_mismatch = (
-            limit_row is not None
-            and expected_limit is not None
-            and aman_limit_value is not None
-            and not _close_amount(aman_limit_value, expected_limit)
-        )
-        used_knowledge_base_limit = not limit_row or limit_value_mismatch
+        # A definition-ID match is live AMAN policy state and is more specific
+        # than the static knowledge base. Use the KB only when no matching AMAN
+        # row was supplied.
+        used_knowledge_base_limit = not limit_row
         limit_value = (
             expected_limit
             if used_knowledge_base_limit and expected_limit is not None
@@ -1156,9 +1177,7 @@ def agent_item_utilization(pa: dict, agent2: dict) -> dict:
 
         decision = "DENY" if bucket_exceeded else "APPROVE"
         if used_knowledge_base_limit:
-            if limit_value_mismatch:
-                fallback_context = "AMAN consumption limit value did not match this routed knowledge-base bucket"
-            elif limits:
+            if limits:
                 fallback_context = "AMAN consumption rows did not map to this routed knowledge-base bucket"
             else:
                 fallback_context = "Consumption limits were not configured in the payload"
