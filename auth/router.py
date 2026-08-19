@@ -3837,8 +3837,6 @@ async def patients_list(
         LIMIT $5 OFFSET $6
     """
 
-    rows = await pg_query_all(base_sql, org_id, date_from_start, date_to_end, search_pattern, page_size, offset)
-
     # Total count (post-filter) for pagination — reuses the same CTEs minus LIMIT/OFFSET
     count_sql = f"""
         WITH pa_with_cost AS (
@@ -3876,18 +3874,23 @@ async def patients_list(
             OR COALESCE(latest_payload->'enrollee'->>'insurance_no', '') ILIKE $4
         ))
     """
-    total_row = await pg_query_one(count_sql, org_id, date_from_start, date_to_end, search_pattern)
-    total = total_row["total"] if total_row else 0
 
-    # Org-wide window (not filtered) — useful for the page subtitle
-    window_row = await pg_query_one(
-        """
-        SELECT MIN(received_at) AS earliest, MAX(received_at) AS latest,
-               COUNT(DISTINCT patient_id) FILTER (WHERE patient_id IS NOT NULL AND patient_id <> 'unknown')::int AS distinct_patients
-        FROM preauth_logs WHERE org_id = $1
-        """,
-        org_id,
+    # rows, total_row (pagination count), and window_row (org-wide date span
+    # for the page subtitle) are independent of each other - run concurrently
+    # instead of paying 3 sequential round trips.
+    rows, total_row, window_row = await asyncio.gather(
+        pg_query_all(base_sql, org_id, date_from_start, date_to_end, search_pattern, page_size, offset),
+        pg_query_one(count_sql, org_id, date_from_start, date_to_end, search_pattern),
+        pg_query_one(
+            """
+            SELECT MIN(received_at) AS earliest, MAX(received_at) AS latest,
+                   COUNT(DISTINCT patient_id) FILTER (WHERE patient_id IS NOT NULL AND patient_id <> 'unknown')::int AS distinct_patients
+            FROM preauth_logs WHERE org_id = $1
+            """,
+            org_id,
+        ),
     )
+    total = total_row["total"] if total_row else 0
 
     return {
         "filters": {
