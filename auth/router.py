@@ -2452,6 +2452,7 @@ async def qa_accuracy(
                 SELECT oe.raw_payload
                 FROM preauth_events oe
                 WHERE oe.org_id = $1
+                  AND oe.checkin_id = s.checkin_id
                   AND LOWER(COALESCE(oe.event_type, '')) <> 'pa.submitted'
                   AND oe.raw_payload ? 'line_outcomes'
                   AND (
