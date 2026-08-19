@@ -171,8 +171,21 @@ CREATE TABLE IF NOT EXISTS agent_logs (
     agent_name      VARCHAR(100) NOT NULL,
     status          VARCHAR(20) NOT NULL,
     result          JSONB,
+    model           TEXT,
+    input_tokens    INT,
+    output_tokens   INT,
+    total_tokens    INT,
+    estimated_cost_usd NUMERIC(12, 6),
+    model_usage     JSONB,
     logged_at       TIMESTAMPTZ DEFAULT NOW()
 );
+
+ALTER TABLE agent_logs ADD COLUMN IF NOT EXISTS model TEXT;
+ALTER TABLE agent_logs ADD COLUMN IF NOT EXISTS input_tokens INT;
+ALTER TABLE agent_logs ADD COLUMN IF NOT EXISTS output_tokens INT;
+ALTER TABLE agent_logs ADD COLUMN IF NOT EXISTS total_tokens INT;
+ALTER TABLE agent_logs ADD COLUMN IF NOT EXISTS estimated_cost_usd NUMERIC(12, 6);
+ALTER TABLE agent_logs ADD COLUMN IF NOT EXISTS model_usage JSONB;
 
 -- Append-only audit trail for compliance-sensitive UI actions (PDF exports,
 -- override events, drill-in viewing, etc.). One row per recorded event.

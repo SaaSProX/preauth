@@ -82,3 +82,44 @@ def send_invite_email(to: str, invite_link: str, org_name: str, inviter_name: st
     """
 
     return send_email(to=to, subject=subject, body=text, html=html)
+
+
+def send_slack_alert(text: str, blocks: list | None = None) -> dict | None:
+    """Post a best-effort alert to the configured Slack Incoming Webhook.
+
+    Slack alerting is a secondary side-channel: if the webhook is not configured,
+    or the request fails, we log and return instead of raising, so a failed alert
+    never breaks the request/business flow that triggered it.
+
+    Returns a small status dict, or None when Slack is not configured.
+    """
+    if not settings.slack_webhook_url:
+        # Not configured (e.g. local/dev) -> no-op.
+        return None
+
+    payload: dict = {"text": text}
+    if blocks:
+        payload["blocks"] = blocks
+
+    slack_request = request.Request(
+        settings.slack_webhook_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "saaspro-preauth/1.0",
+        },
+        method="POST",
+    )
+    ssl_context = ssl.create_default_context(cafile=certifi.where())
+
+    try:
+        with request.urlopen(slack_request, timeout=10, context=ssl_context) as response:
+            body = response.read().decode("utf-8")
+            return {"ok": True, "status": response.status, "response": body}
+    except error.HTTPError as exc:
+        detail = exc.read().decode("utf-8")
+        print(f"[notifier] Slack alert failed: HTTP {exc.code}: {detail}")
+        return {"ok": False, "status": exc.code, "error": detail}
+    except error.URLError as exc:
+        print(f"[notifier] Slack alert failed: {exc.reason}")
+        return {"ok": False, "error": str(exc.reason)}
