@@ -1214,6 +1214,8 @@ async def preauth_dashboard(
                 FROM agent_logs
                 WHERE request_id = p.request_id
                   AND agent_num = 1
+                  AND logged_at >= p.received_at
+                  AND COALESCE(p.agent_result->>'agent_skipped', 'false') <> 'true'
                   AND (p.processed_at IS NULL OR logged_at <= p.processed_at + INTERVAL '5 seconds')
             )
             SELECT run_start.first_log_at, MAX(al.logged_at) AS last_log_at
@@ -1452,6 +1454,8 @@ async def preauth_dashboard(
                 FROM agent_logs
                 WHERE request_id = p.request_id
                   AND agent_num = 1
+                  AND logged_at >= p.received_at
+                  AND COALESCE(p.agent_result->>'agent_skipped', 'false') <> 'true'
                   AND (p.processed_at IS NULL OR logged_at <= p.processed_at + INTERVAL '5 seconds')
             )
             SELECT run_start.first_log_at, MAX(al.logged_at) AS last_log_at
@@ -1538,6 +1542,8 @@ async def preauth_dashboard(
                 FROM agent_logs
                 WHERE request_id = p.request_id
                   AND agent_num = 1
+                  AND logged_at >= p.received_at
+                  AND COALESCE(p.agent_result->>'agent_skipped', 'false') <> 'true'
                   AND (p.processed_at IS NULL OR logged_at <= p.processed_at + INTERVAL '5 seconds')
             )
             SELECT run_start.first_log_at, MAX(al.logged_at) AS last_log_at
@@ -1839,9 +1845,9 @@ def _qa_partner_recommendation_to_decision(value) -> str | None:
 def _qa_aman_from_line_outcomes(line_outcomes: list[dict]) -> tuple[str | None, float, dict]:
     """Derive AMAN's final decision from explicit AMAN outcome events.
 
-    `pa.approved` / future final events carry `line_outcomes[]`; those are the
-    source of truth for the accuracy dashboard. Submitted payload snapshots are
-    only request context.
+    Any non-submission AMAN event carrying `line_outcomes[]` is an outcome
+    event. The per-line decisions are the source of truth for the accuracy
+    dashboard; the event-type label is descriptive only.
     """
     counts = {"pending": 0, "approved": 0, "queried": 0, "rejected": 0, "unknown": 0}
     approved_amount = 0.0
@@ -2063,9 +2069,9 @@ async def qa_accuracy(
 
     Where AMAN's finals come from:
         Submitted payloads remain the request/intake context. AMAN's final
-        truth comes from explicit outcome events such as `pa.approved` carrying
-        `line_outcomes[]`, where each line has the SaaSPro partner advisory and
-        AMAN's final decision side by side.
+        truth comes from any non-`pa.submitted` event carrying `line_outcomes[]`,
+        where each line has the SaaSPro partner advisory and AMAN's final
+        decision side by side. Event-type labels do not override line status.
 
     Multi-tenant via JWT org_id. Platform admins can pass ?org_id= to drill
     into a client org (same convention as /preauth-dashboard).
@@ -2163,7 +2169,7 @@ async def qa_accuracy(
             SELECT raw_payload, event_type, occurred_at, last_seen_at, created_at, event_sequence
             FROM preauth_events e
             WHERE e.org_id = submitted.org_id
-              AND LOWER(COALESCE(e.event_type, '')) IN ('pa.decided', 'pa.approved', 'pa.rejected', 'pa.finalized', 'pa.updated')
+              AND LOWER(COALESCE(e.event_type, '')) <> 'pa.submitted'
               AND e.raw_payload ? 'line_outcomes'
               AND e.checkin_id = submitted.checkin_id
               AND (
@@ -2226,6 +2232,8 @@ async def qa_accuracy(
         ) agentlog ON TRUE
         WHERE submitted.org_id = $1
           AND LOWER(COALESCE(submitted.event_type, '')) = 'pa.submitted'
+          AND LOWER(COALESCE(submitted.raw_payload->'meta'->>'source', '')) <> 'manual'
+          AND COALESCE(p.agent_result->>'agent_skipped', 'false') <> 'true'
           AND outcome.raw_payload IS NOT NULL
           AND COALESCE(submitted.occurred_at, submitted.submitted_at, submitted.last_seen_at, submitted.created_at, p.received_at) >= $2::timestamptz
           AND COALESCE(submitted.occurred_at, submitted.submitted_at, submitted.last_seen_at, submitted.created_at, p.received_at) < $3::timestamptz
@@ -2305,6 +2313,8 @@ async def qa_accuracy(
         ) agent_run ON TRUE
         WHERE e.org_id = $1
           AND LOWER(COALESCE(e.event_type, '')) = 'pa.submitted'
+          AND LOWER(COALESCE(e.raw_payload->'meta'->>'source', '')) <> 'manual'
+          AND COALESCE(p.agent_result->>'agent_skipped', 'false') <> 'true'
           AND COALESCE(e.occurred_at, e.submitted_at, e.last_seen_at, e.created_at) >= $2::timestamptz
           AND COALESCE(e.occurred_at, e.submitted_at, e.last_seen_at, e.created_at) < $3::timestamptz
           AND NOT EXISTS (
@@ -2312,7 +2322,7 @@ async def qa_accuracy(
             FROM preauth_events outcome
             WHERE outcome.org_id = e.org_id
               AND outcome.checkin_id = e.checkin_id
-              AND LOWER(COALESCE(outcome.event_type, '')) IN ('pa.decided', 'pa.approved', 'pa.rejected', 'pa.finalized', 'pa.updated')
+              AND LOWER(COALESCE(outcome.event_type, '')) <> 'pa.submitted'
               AND outcome.raw_payload ? 'line_outcomes'
               AND (
                 outcome.correlation_id = e.correlation_id
@@ -2355,6 +2365,8 @@ async def qa_accuracy(
             LEFT JOIN preauth_logs p ON p.id = e.preauth_log_id
             WHERE e.org_id = $1
               AND LOWER(COALESCE(e.event_type, '')) = 'pa.submitted'
+              AND LOWER(COALESCE(e.raw_payload->'meta'->>'source', '')) <> 'manual'
+              AND COALESCE(p.agent_result->>'agent_skipped', 'false') <> 'true'
               AND e.created_at >= $2::timestamptz
               AND e.created_at < $3::timestamptz
         ),
@@ -2437,7 +2449,7 @@ async def qa_accuracy(
                 SELECT oe.raw_payload
                 FROM preauth_events oe
                 WHERE oe.org_id = $1
-                  AND LOWER(COALESCE(oe.event_type, '')) IN ('pa.decided', 'pa.approved', 'pa.rejected', 'pa.finalized', 'pa.updated')
+                  AND LOWER(COALESCE(oe.event_type, '')) <> 'pa.submitted'
                   AND oe.raw_payload ? 'line_outcomes'
                   AND (
                     oe.correlation_id = s.submitted_correlation_id
@@ -3985,6 +3997,8 @@ async def patient_history(
                 FROM agent_logs
                 WHERE request_id = p.request_id
                   AND agent_num = 1
+                  AND logged_at >= p.received_at
+                  AND COALESCE(p.agent_result->>'agent_skipped', 'false') <> 'true'
                   AND (p.processed_at IS NULL OR logged_at <= p.processed_at + INTERVAL '5 seconds')
             )
             SELECT run_start.first_log_at, MAX(al.logged_at) AS last_log_at
