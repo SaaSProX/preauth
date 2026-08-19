@@ -406,9 +406,6 @@ CREATE INDEX IF NOT EXISTS idx_agent_logs_request_agent ON agent_logs(request_id
 CREATE INDEX IF NOT EXISTS idx_webhook_delivery_logs_db_status ON webhook_delivery_logs(db_insert_status);
 CREATE INDEX IF NOT EXISTS idx_webhook_delivery_logs_org_status_created ON webhook_delivery_logs(org_id, db_insert_status, created_at DESC);
 
--- Clients: login and authentication
-CREATE INDEX IF NOT EXISTS idx_clients_email ON clients(email);
-
--- API clients: key lookup
-CREATE INDEX IF NOT EXISTS idx_api_clients_api_key ON api_clients(api_key);
+-- Clients: email and api_clients.api_key are UNIQUE constraints already
+-- backed by auto-created unique indexes - no separate index needed.
 CREATE INDEX IF NOT EXISTS idx_api_clients_org_active ON api_clients(org_id, is_active);

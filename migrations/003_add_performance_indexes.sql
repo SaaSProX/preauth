@@ -74,9 +74,9 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_webhook_delivery_logs_org_status_cre
 -- CLIENTS INDEXES
 -- ============================================================================
 
--- Login queries (email lookup)
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_clients_email 
-    ON clients(email);
+-- Note: no separate email index needed here - clients.email has a UNIQUE
+-- constraint, which Postgres already backs with an auto-created unique
+-- btree index that serves `WHERE email = $1` lookups just as well.
 
 -- Active clients filter
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_clients_active 
@@ -86,9 +86,8 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_clients_active
 -- API_CLIENTS INDEXES
 -- ============================================================================
 
--- API key authentication
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_api_clients_api_key 
-    ON api_clients(api_key);
+-- Note: no separate api_key index needed here - api_clients.api_key has a
+-- UNIQUE constraint, already backed by an auto-created unique btree index.
 
 -- Active API clients
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_api_clients_org_active 
