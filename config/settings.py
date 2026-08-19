@@ -85,6 +85,16 @@ class Settings(BaseSettings):
     gmail_watch_label_ids: str = "INBOX"
     gmail_pubsub_verification_token: str = ""
 
+    # Rate limiting (SAA-84)
+    # Format: "X/minute" or "X/second" or "X/hour"
+    rate_limit_enabled: bool = True
+    rate_limit_default: str = "100/minute"      # Default for all endpoints
+    rate_limit_auth: str = "5/minute"           # Login/register (prevent brute force)
+    rate_limit_webhook: str = "300/minute"      # Incoming webhooks (high volume)
+    rate_limit_api: str = "60/minute"           # Standard API endpoints
+    rate_limit_dashboard: str = "30/minute"     # Dashboard queries (expensive)
+    rate_limit_storage_uri: str = "memory://"   # Use "redis://host:port" for distributed
+
     @field_validator(
         "aman_callback_enabled",
         "agent_enabled",

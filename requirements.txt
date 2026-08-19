@@ -12,6 +12,7 @@ pyjwt
 python-multipart
 certifi
 httpx
+slowapi
 
 # Testing (SAA-82)
 pytest>=8.0.0

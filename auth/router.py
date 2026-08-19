@@ -12,6 +12,7 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from agent import agent
 from config.settings import settings
+from middleware.rate_limit import limiter
 from services.db import pg_execute, pg_query_all, pg_query_one
 from services.json_utils import parse_json_field
 from services.gmail import (
@@ -313,7 +314,8 @@ def _dashboard_request(row):
 # ─────────────────────────────────────────────
 
 @router.post("/register")
-async def register(payload: RegisterPayload):
+@limiter.limit(settings.rate_limit_auth)
+async def register(request: Request, payload: RegisterPayload):
     # Validate invite
     invite = await pg_query_one(
         "SELECT * FROM invites WHERE token = $1 AND used = FALSE",
@@ -356,7 +358,8 @@ async def register(payload: RegisterPayload):
 # ─────────────────────────────────────────────
 
 @router.post("/login")
-async def login(payload: LoginPayload):
+@limiter.limit(settings.rate_limit_auth)
+async def login(request: Request, payload: LoginPayload):
     client = await pg_query_one(
         """
         SELECT clients.*, organizations.name AS org_name
@@ -1041,7 +1044,9 @@ async def list_preauth_payloads(claims: dict = Depends(verify_session_token)):
 
 
 @router.get("/preauth-dashboard")
+@limiter.limit(settings.rate_limit_dashboard)
 async def preauth_dashboard(
+    request: Request,
     date_from: date | None = None,
     date_to: date | None = None,
     org_id: int | None = None,
@@ -2042,7 +2047,9 @@ def _qa_percentile(values: list[float], p: int) -> float | None:
 
 
 @router.get("/qa/accuracy")
+@limiter.limit(settings.rate_limit_dashboard)
 async def qa_accuracy(
+    request: Request,
     date_from: date | None = None,
     date_to: date | None = None,
     org_id: int | None = None,

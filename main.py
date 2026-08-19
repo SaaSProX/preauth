@@ -6,6 +6,7 @@ from config.sentry import init_sentry
 from config.logging import configure_logging, get_logger
 from middleware.request_logging import RequestLoggingMiddleware
 from middleware.exception_handler import ExceptionHandlerMiddleware
+from middleware.rate_limit import limiter, rate_limit_exceeded_handler, RateLimitExceeded
 from services.db import init_pg_pool, close_pg_pool
 from webhook.router import router
 from auth.router import router as auth_router
@@ -22,6 +23,7 @@ app = FastAPI(title="Aman HMO Pre-Auth Agent")
 app.add_middleware(ExceptionHandlerMiddleware)
 app.add_middleware(RequestLoggingMiddleware)
 
+# CORS middleware
 _allowed_origins = [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
@@ -31,6 +33,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Rate limiting middleware (SAA-84)
+app.state.limiter = limiter
+if settings.rate_limit_enabled:
+    from slowapi.middleware import SlowAPIMiddleware
+
+    app.add_exception_handler(RateLimitExceeded, rate_limit_exceeded_handler)
+    # SlowAPIMiddleware is what actually applies `rate_limit_default` to every
+    # route - without it, only routes with an explicit @limiter.limit(...)
+    # decorator are protected, leaving every other endpoint unlimited despite
+    # the "default limit for all endpoints" setting existing.
+    app.add_middleware(SlowAPIMiddleware)
+
+# Include routers
 app.include_router(router)
 app.include_router(auth_router)
 
@@ -55,8 +70,9 @@ async def shutdown_event():
 
 
 @app.get("/health")
+@limiter.exempt
 def health():
-    """Shallow health check - just confirms app is running."""
+    """Shallow health check - just confirms app is running. Exempt from rate limiting."""
     return {"status": "ok"}
 
 
