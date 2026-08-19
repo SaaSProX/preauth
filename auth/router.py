@@ -2100,7 +2100,12 @@ async def qa_accuracy(
     # One row per submitted event that has an explicit AMAN outcome. AMAN batch
     # approvals can include line outcomes for multiple submitted events in one
     # payload, so matching must look inside line_outcomes[].partner_advisory.
-    rows = await pg_query_all(
+    (
+        rows,
+        pending_followup_rows,
+        value_rows,
+    ) = await asyncio.gather(
+        pg_query_all(
         """
         SELECT
             p.request_id,
@@ -2240,9 +2245,8 @@ async def qa_accuracy(
         ORDER BY COALESCE(submitted.occurred_at, submitted.submitted_at, submitted.last_seen_at, submitted.created_at, p.received_at) DESC
         """,
         org_id, date_from_start, date_to_end,
-    )
-
-    pending_followup_rows = await pg_query_all(
+        ),
+        pg_query_all(
         """
         SELECT
             p.request_id,
@@ -2343,9 +2347,8 @@ async def qa_accuracy(
         ORDER BY e.created_at DESC, e.event_sequence DESC
         """,
         org_id, date_from_start, date_to_end,
-    )
-
-    value_rows = await pg_query_all(
+        ),
+        pg_query_all(
         """
         WITH submitted AS (
             SELECT
@@ -2515,6 +2518,7 @@ async def qa_accuracy(
         LEFT JOIN outcome_values ov ON ov.mode = ev.mode
         """,
         org_id, date_from_start, date_to_end,
+        ),
     )
 
     def _maybe_load(value):
