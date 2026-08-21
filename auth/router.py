@@ -2,179 +2,81 @@ import json
 import secrets
 import asyncio
 from datetime import date, datetime, time, timedelta, timezone
-from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
-import httpx
-import jwt
-from fastapi import APIRouter, HTTPException, Depends, Request, BackgroundTasks
-from fastapi.responses import RedirectResponse
+from fastapi import APIRouter, HTTPException, Depends, Request
 from pydantic import BaseModel
 from agent import agent
 from config.settings import settings
+from middleware.rate_limit import limiter
 from services.db import pg_execute, pg_query_all, pg_query_one
 from services.json_utils import parse_json_field
-from services.gmail import (
-    GmailIntegrationError,
-    create_notification_log,
-    decode_pubsub_data,
-    gmail_connections_for_email,
-    start_gmail_watch,
-    sync_gmail_history,
-)
 from services.invites import build_invite_link
 from services.notifier import EmailDeliveryError, send_invite_email
-from auth.utils import (
-    hash_password, verify_password,
-    generate_api_key, generate_session_token,
-    verify_session_token
+from auth.utils import verify_session_token
+
+# SAA-81: incrementally extracted route modules. Each sub-router still
+# lives under this router's "/auth" prefix via include_router() below.
+from auth.routes.auth import router as auth_routes_router
+from auth.routes.api_keys import router as api_keys_router
+from auth.routes.gmail import router as gmail_router
+from auth.routes.support import router as support_router
+from auth.routes.preauth import router as preauth_ops_router
+
+# Schemas and helpers used by endpoints that remain in this file (the
+# rest live in auth/schemas.py and auth/helpers.py respectively).
+from auth.schemas import (
+    CreateMismatchReviewPayload,
+    CreateOrgPayload,
+    TeamInvitePayload,
+    UpdateMismatchReviewPayload,
+    UpdateOrgPayload,
+)
+from auth.helpers import (
+    _dashboard_org_id,
+    _dashboard_request,
+    _nested_value,
+    _number,
+    _resolve_read_org_id,
+    is_platform_admin,
 )
 
 router = APIRouter(prefix="/auth")
+router.include_router(auth_routes_router)
+router.include_router(api_keys_router)
+router.include_router(gmail_router)
+router.include_router(support_router)
+router.include_router(preauth_ops_router)
 
-GOOGLE_OAUTH_AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
-GOOGLE_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
-GOOGLE_GMAIL_PROFILE_URL = "https://gmail.googleapis.com/gmail/v1/users/me/profile"
-GMAIL_READONLY_SCOPES = [
-    "openid",
-    "email",
-    "profile",
-    "https://www.googleapis.com/auth/gmail.readonly",
-]
 
 
 # ─────────────────────────────────────────────
 # Schemas
 # ─────────────────────────────────────────────
 
-class RegisterPayload(BaseModel):
-    invite_token: str
-    email: str
-    name: str
-    password: str
-
-class LoginPayload(BaseModel):
-    email: str
-    password: str
-
-class TeamInvitePayload(BaseModel):
-    email: str
-
-class CreateOrgPayload(BaseModel):
-    org_name: str
-    admin_email: str
 
 
-def _first_item(fields):
-    items = _items_from_payload(fields)
-    if items and isinstance(items[0], dict):
-        return items[0]
-    return {}
 
 
-def _items_from_payload(fields):
-    if not isinstance(fields, dict):
-        return []
-
-    items = (
-        fields.get("pa_items")
-        or fields.get("items")
-        or fields.get("requested_items")
-        or fields.get("requestedItems")
-        or fields.get("services")
-        or fields.get("procedures")
-        or fields.get("line_items")
-        or []
-    )
-    items = parse_json_field(items)
-
-    if isinstance(items, list):
-        return [item for item in items if isinstance(item, dict)]
-    return []
 
 
-def _number(value):
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
 
 
-def _item_requested_cost(item):
-    amount = (
-        _number(item.get("requested_cost"))
-        or _number(item.get("estimated_cost"))
-        or _number(item.get("cost"))
-        or _number(item.get("amount"))
-    )
-    if amount is not None:
-        return amount
-
-    unit_cost = _number(item.get("unit_cost"))
-    quantity = _number(item.get("quantity")) or 1
-    return unit_cost * quantity if unit_cost is not None else 0
 
 
-def _total_requested_cost(fields):
-    if not isinstance(fields, dict):
-        return None
-
-    total = _number(fields.get("total_requested_cost"))
-    if total is not None:
-        return total
-
-    items = _items_from_payload(fields)
-    if not items:
-        return None
-
-    return sum(_item_requested_cost(item) for item in items)
 
 
-def _has_dashboard_data(fields):
-    if not isinstance(fields, dict):
-        return False
-
-    scalar_fields = ("request_id", "patient_id", "plan", "facility", "submitted_by", "total_requested_cost")
-    if any(fields.get(key) not in (None, "", []) for key in scalar_fields):
-        return True
-
-    return bool(_items_from_payload(fields))
 
 
-def _nested_value(fields, *path):
-    current = fields
-    for key in path:
-        if not isinstance(current, dict):
-            return None
-        current = current.get(key)
-    return current
 
 
-def _provider_label(value):
-    if isinstance(value, dict):
-        return value.get("name") or value.get("role") or value.get("email") or json.dumps(value)
-    return value
 
 
-def _dashboard_org_id(claims):
-    return claims["org_id"]
 
 
-async def is_platform_admin(claims):
-    """SaaSPro platform admin = admin of the platform org named 'SAASPRO'.
 
-    There is no separate role tier for "super-admin"; the only thing this
-    helper checks is "are you an admin of the org we use to run the
-    platform". An admin of a client org (e.g. AMAN) is NOT a platform
-    admin and cannot create/edit other orgs or drill into them.
-    """
-    if claims.get("role") != "admin":
-        return False
-    row = await pg_query_one(
-        "SELECT 1 FROM organizations WHERE id = $1 AND LOWER(name) = 'saaspro' AND is_active = TRUE",
-        claims["org_id"],
-    )
-    return bool(row)
+
+
 
 
 # NOTE (merge): kalycoding added _preauth_dashboard_org_id() on origin/main to
@@ -183,865 +85,84 @@ async def is_platform_admin(claims):
 # resolve, BUT the dashboard endpoint deliberately does NOT use it — it would
 # silently override the JWT's org and break per-tenant isolation. The dashboard
 # uses claims["org_id"] + the explicit platform-admin ?org_id= drill-in instead.
-async def _preauth_dashboard_org_id(claims):
-    fallback = await pg_query_one(
-        """
-        SELECT org_id
-        FROM preauth_events
-        WHERE org_id IS NOT NULL
-        GROUP BY org_id
-        ORDER BY COUNT(*) DESC, MAX(created_at) DESC NULLS LAST
-        LIMIT 1
-        """
-    )
-    if fallback:
-        return fallback["org_id"]
-
-    fallback = await pg_query_one(
-        """
-        SELECT org_id
-        FROM preauth_logs
-        WHERE org_id IS NOT NULL
-        GROUP BY org_id
-        ORDER BY COUNT(*) DESC, MAX(received_at) DESC NULLS LAST
-        LIMIT 1
-        """
-    )
-    return fallback["org_id"] if fallback else claims["org_id"]
 
 
-def _dashboard_request(row):
-    raw_payload = parse_json_field(row["raw_payload"]) if row["raw_payload"] else None
-    extracted_fields = parse_json_field(row["extracted_fields"]) if row["extracted_fields"] else None
-    agent_result = parse_json_field(row["agent_result"]) if row["agent_result"] else None
-    agent_logs = parse_json_field(row["agent_logs"]) if row["agent_logs"] else []
-
-    source = extracted_fields if _has_dashboard_data(extracted_fields) else raw_payload
-    source = source if isinstance(source, dict) else {}
-    raw_source = raw_payload if isinstance(raw_payload, dict) else {}
-    item_count = len(_items_from_payload(source))
-    item = _first_item(source)
-    item_description = (
-        f"{item_count} requested items"
-        if item_count > 1
-        else item.get("description") or item.get("name") or item.get("item_name")
-    )
-    patient_id = row["patient_id"]
-    if not patient_id or patient_id == "unknown":
-        patient_id = _nested_value(raw_source, "enrollee", "insurance_no") or patient_id
-
-    reason = None
-    confidence = None
-    amount_approved = None
-    if isinstance(agent_result, dict):
-        reason = (
-            agent_result.get("reasoning")
-            or agent_result.get("denial_reason")
-            or agent_result.get("escalation_reason")
-        )
-        confidence = agent_result.get("confidence")
-        amount_approved = agent_result.get("amount_approved")
-
-    processing_seconds = None
-    if "agent_runtime_seconds" in row.keys() and row["agent_runtime_seconds"] is not None:
-        processing_seconds = max(0, int(round(row["agent_runtime_seconds"])))
-    elif row["processed_at"] and row["received_at"]:
-        processed_at = row["processed_at"]
-        received_at = row["received_at"]
-        if processed_at.tzinfo and not received_at.tzinfo:
-            processed_at = processed_at.replace(tzinfo=None)
-        processing_seconds = max(0, int((processed_at - received_at).total_seconds()))
-
-    return {
-        "request_id": row["request_id"],
-        "display_request_id": _nested_value(raw_source, "encounter", "checkin_id") or row["request_id"],
-        "patient_id": patient_id,
-        "patient_name": " ".join(
-            value.strip()
-            for value in [
-                _nested_value(raw_source, "enrollee", "first_name") or "",
-                _nested_value(raw_source, "enrollee", "surname") or "",
-            ]
-            if value and value.strip()
-        ),
-        "status": row["status"],
-        "decision": row["decision"],
-        "agent_step": row["agent_step"],
-        "received_at": row["received_at"],
-        "processed_at": row["processed_at"],
-        "processing_seconds": processing_seconds,
-        "callback_status": (row["callback_status"] if "callback_status" in row.keys() else None),
-        "callback_http_status": (row["callback_http_status"] if "callback_http_status" in row.keys() else None),
-        "callback_sent_at": (row["callback_sent_at"] if "callback_sent_at" in row.keys() else None),
-        "callback_error": (row["callback_error"] if "callback_error" in row.keys() else None),
-        "error_message": row["error_message"],
-        "plan": source.get("plan") or _nested_value(raw_source, "policy", "plan_name") or _nested_value(raw_source, "policy", "insurance_package"),
-        "item_type": item.get("type") or item.get("category_id"),
-        "item_description": item_description,
-        "estimated_cost": _total_requested_cost(source),
-        "line_item_count": item_count,
-        # Event-history fields come from the LATERAL join in /preauth-dashboard.
-        # Other callers (e.g. /patient-history) don't include them — fall back
-        # to defaults instead of raising KeyError.
-        "event_count": (row["event_count"] if "event_count" in row.keys() else 0),
-        "latest_event_sequence": (row["latest_event_sequence"] if "latest_event_sequence" in row.keys() else None),
-        "latest_event_id": (row["latest_event_id"] if "latest_event_id" in row.keys() else None),
-        "latest_items_added_count": (row["latest_items_added_count"] if "latest_items_added_count" in row.keys() else 0),
-        "latest_items_added_total": (row["latest_items_added_total"] if "latest_items_added_total" in row.keys() else 0),
-        "duplicate_event_attempts": (row["duplicate_event_attempts"] if "duplicate_event_attempts" in row.keys() else 0),
-        "total_intake_value": (row["total_intake_value"] if "total_intake_value" in row.keys() else 0),
-        "facility": item.get("facility") or source.get("facility") or _nested_value(raw_source, "encounter", "facility_name"),
-        "requesting_provider": _provider_label(
-            item.get("requesting_provider")
-            or item.get("provider")
-            or source.get("submitted_by")
-            or _nested_value(raw_source, "submission", "submitted_by")
-        ),
-        "reason": reason or row["error_message"],
-        "confidence": confidence,
-        "amount_approved": amount_approved,
-        "raw_payload": raw_payload,
-        "extracted_fields": extracted_fields,
-        "agent_result": agent_result,
-        "agent_logs": agent_logs or [],
-        "patient_pa_count": (row["patient_pa_count"] if "patient_pa_count" in row.keys() else None),
-    }
 
 
 # ─────────────────────────────────────────────
 # Register (via invite link)
 # ─────────────────────────────────────────────
 
-@router.post("/register")
-async def register(payload: RegisterPayload):
-    # Validate invite
-    invite = await pg_query_one(
-        "SELECT * FROM invites WHERE token = $1 AND used = FALSE",
-        payload.invite_token
-    )
-    if not invite:
-        raise HTTPException(status_code=400, detail="Invalid or expired invite token")
-
-    if invite["email"] != payload.email:
-        raise HTTPException(status_code=400, detail="Email does not match invite")
-
-    # Check not already registered
-    existing = await pg_query_one("SELECT id FROM clients WHERE email = $1", payload.email)
-    if existing:
-        raise HTTPException(status_code=400, detail="Email already registered")
-
-    # Create client
-    password_hash = hash_password(payload.password)
-    await pg_execute(
-        """
-        INSERT INTO clients (org_id, name, email, password_hash, role)
-        VALUES ($1, $2, $3, $4, $5)
-        """,
-        invite["org_id"], payload.name, payload.email, password_hash, invite["role"]
-    )
-
-    # Mark invite used
-    await pg_execute("UPDATE invites SET used = TRUE WHERE token = $1", payload.invite_token)
-
-    org = await pg_query_one("SELECT name FROM organizations WHERE id = $1", invite["org_id"])
-
-    return {
-        "message": "Registration successful",
-        "org_name": org["name"] if org else None
-    }
 
 
 # ─────────────────────────────────────────────
 # Login
 # ─────────────────────────────────────────────
 
-@router.post("/login")
-async def login(payload: LoginPayload):
-    client = await pg_query_one(
-        """
-        SELECT clients.*, organizations.name AS org_name
-        FROM clients
-        LEFT JOIN organizations ON organizations.id = clients.org_id
-        WHERE clients.email = $1
-        """,
-        payload.email
-    )
-
-    if not client or not verify_password(payload.password, client["password_hash"]):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-
-    if not client["is_active"]:
-        raise HTTPException(status_code=403, detail="Account disabled")
-
-    token = generate_session_token(client["id"], client["email"], client["org_id"], client["role"])
-
-    return {
-        "token": token,
-        "role": client["role"],
-        "name": client["name"],
-        "org_name": client["org_name"]
-    }
 
 
 # ─────────────────────────────────────────────
 # API keys (user-owned, multiple per user)
 # ─────────────────────────────────────────────
 
-class GenerateKeyPayload(BaseModel):
-    name: str | None = None
 
 
-class GmailDisconnectPayload(BaseModel):
-    connection_id: int | None = None
-    email: str | None = None
 
 
-class GmailWatchStartPayload(BaseModel):
-    connection_id: int | None = None
-    org_id: int | None = None
 
 
-def _mask_key(k: str) -> str:
-    if not k or len(k) < 4:
-        return "••••"
-    return "••••" + k[-4:]
 
 
-def _gmail_oauth_configured() -> bool:
-    return bool(settings.google_oauth_client_id and settings.google_oauth_client_secret)
 
 
-def _gmail_redirect_uri(request: Request) -> str:
-    configured = (settings.google_oauth_redirect_uri or "").strip()
-    if configured:
-        return configured
-    return str(request.url_for("gmail_oauth_callback"))
 
 
-def _dashboard_redirect_url(status: str, detail: str | None = None) -> str:
-    params = {"nav": "support", "gmail": status}
-    if detail:
-        params["detail"] = detail[:140]
-    return f"{settings.dashboard_base_url.rstrip('/')}/?{urlencode(params)}"
 
 
-def _build_gmail_state(claims: dict, org_id: int | None = None) -> str:
-    now = datetime.now(timezone.utc)
-    return jwt.encode(
-        {
-            "sub": str(claims["sub"]),
-            "email": claims.get("email"),
-            "org_id": org_id if org_id is not None else claims["org_id"],
-            "role": claims.get("role"),
-            "nonce": secrets.token_urlsafe(18),
-            "iat": int(now.timestamp()),
-            "exp": now + timedelta(minutes=15),
-        },
-        settings.jwt_secret,
-        algorithm="HS256",
-    )
 
 
-def _decode_gmail_state(state: str) -> dict:
-    try:
-        return jwt.decode(state, settings.jwt_secret, algorithms=["HS256"])
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=400, detail="Gmail connection expired. Please try again.")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=400, detail="Invalid Gmail connection state")
 
 
-async def _resolve_read_org_id(claims: dict, requested_org_id: int | None = None) -> int:
-    if requested_org_id is None or requested_org_id == claims["org_id"]:
-        return claims["org_id"]
-    if not await is_platform_admin(claims):
-        raise HTTPException(status_code=403, detail="Only SaaSPro platform admins can view another organization")
-    return requested_org_id
 
 
-def _gmail_connection_row(row):
-    return {
-        "id": row["id"],
-        "email": row["email"],
-        "provider": row["provider"],
-        "status": row["status"],
-        "scopes": parse_json_field(row["scopes"]) or [],
-        "token_expiry": row["token_expiry"],
-        "watch_history_id": row["watch_history_id"],
-        "watch_expiration": row["watch_expiration"],
-        "watch_status": row["watch_status"],
-        "watch_started_at": row["watch_started_at"],
-        "watch_last_notification_at": row["watch_last_notification_at"],
-        "watch_error": row["watch_error"],
-        "last_sync_at": row["last_sync_at"],
-        "last_error": row["last_error"],
-        "support_message_count": row.get("support_message_count", 0) if hasattr(row, "get") else row["support_message_count"],
-        "last_message_received_at": row.get("last_message_received_at") if hasattr(row, "get") else row["last_message_received_at"],
-        "connected_by_email": row["connected_by_email"],
-        "created_at": row["created_at"],
-        "updated_at": row["updated_at"],
-    }
 
 
-def _support_message_row(row):
-    received_at = row["received_at"] or row["internal_date"] or row["created_at"]
-    return {
-        "id": row["id"],
-        "provider": row["provider"],
-        "channel": "gmail" if row["provider"] == "google" else row["provider"],
-        "mailbox_email": row["mailbox_email"],
-        "message_id": row["gmail_message_id"],
-        "thread_id": row["gmail_thread_id"],
-        "from_email": row["from_email"],
-        "to_email": row["to_email"],
-        "subject": row["subject"] or "(No subject)",
-        "snippet": row["snippet"],
-        "body_text": row["body_text"],
-        "received_at": received_at,
-        "label_ids": parse_json_field(row["label_ids"]) or [],
-        "status": row["status"],
-        "created_at": row["created_at"],
-        "updated_at": row["updated_at"],
-        "agent_activity": [
-            {
-                "step": "Intake",
-                "status": "done",
-                "title": "Message captured",
-                "detail": "Inbound message received from Gmail and stored in the support inbox.",
-                "at": row["created_at"],
-            },
-            {
-                "step": "Normalize",
-                "status": "done",
-                "title": "Headers and body extracted",
-                "detail": "Sender, recipient, subject, snippet, labels, and readable body text were extracted.",
-                "at": row["updated_at"],
-            },
-            {
-                "step": "Agent review",
-                "status": "pending",
-                "title": "Waiting for support agent workflow",
-                "detail": "Next step is classification, routing, answer drafting, and escalation rules.",
-                "at": None,
-            },
-        ],
-    }
 
 
-@router.get("/api-key")
-async def list_user_api_keys(claims: dict = Depends(verify_session_token)):
-    last_used_column = await pg_query_one(
-        """
-        SELECT EXISTS (
-            SELECT 1
-            FROM information_schema.columns
-            WHERE table_schema = 'public'
-              AND table_name = 'api_clients'
-              AND column_name = 'last_used_at'
-        ) AS exists
-        """
-    )
-    last_used_expr = (
-        "last_used_at"
-        if last_used_column and last_used_column["exists"]
-        else "NULL::timestamptz AS last_used_at"
-    )
-    rows = await pg_query_all(
-        f"""
-        SELECT id, client_name, api_key, created_at, {last_used_expr}
-        FROM api_clients
-        WHERE org_id = $1 AND user_id = $2 AND is_active = TRUE
-        ORDER BY created_at DESC
-        """,
-        claims["org_id"], int(claims["sub"])
-    )
-    return {
-        "keys": [
-            {
-                "id": r["id"],
-                "name": r["client_name"],
-                "masked_api_key": _mask_key(r["api_key"]),
-                "created_at": r["created_at"],
-                "last_used_at": r["last_used_at"],
-            }
-            for r in rows
-        ]
-    }
 
 
-@router.post("/api-key/generate")
-async def generate_user_api_key(payload: GenerateKeyPayload, claims: dict = Depends(verify_session_token)):
-    if claims.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Only admins can generate API keys")
-    org_id = claims["org_id"]
-    user_id = int(claims["sub"])
-    client = await pg_query_one(
-        """
-        SELECT clients.name, clients.email
-        FROM clients
-        JOIN organizations ON organizations.id = clients.org_id
-        WHERE clients.id = $1 AND clients.org_id = $2
-          AND clients.is_active = TRUE AND organizations.is_active = TRUE
-        """,
-        user_id, org_id
-    )
-    if not client:
-        raise HTTPException(status_code=404, detail="User or organization not found")
-
-    name = ((payload.name or "").strip()) or f"{client['name']} ({client['email']})"
-
-    api_key = generate_api_key()
-    row = await pg_query_one(
-        """
-        INSERT INTO api_clients (org_id, user_id, client_name, api_key)
-        VALUES ($1, $2, $3, $4)
-        RETURNING id, client_name, created_at
-        """,
-        org_id, user_id, name, api_key
-    )
-
-    return {
-        "message": "API key generated",
-        "id": row["id"],
-        "name": row["client_name"],
-        "api_key": api_key,
-        "masked_api_key": _mask_key(api_key),
-        "created_at": row["created_at"],
-        "note": "Save your API key — it won't be shown again",
-    }
 
 
-@router.delete("/api-key/{key_id}")
-async def revoke_user_api_key(key_id: int, claims: dict = Depends(verify_session_token)):
-    if claims.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Only admins can revoke API keys")
-    # Revoke any key in the caller's org (not just keys the caller created
-    # themselves). Org admins manage org-level credentials. The previous
-    # `AND user_id = $3` clause made revocation impossible for keys issued
-    # by a different admin.
-    await pg_execute(
-        "DELETE FROM api_clients WHERE id = $1 AND org_id = $2",
-        key_id, claims["org_id"]
-    )
-    return {"message": "API key revoked"}
 
 
 # ─────────────────────────────────────────────
 # Gmail / Google Workspace support inbox integration
 # ─────────────────────────────────────────────
 
-@router.get("/integrations/gmail")
-async def gmail_connection_status(org_id: int | None = None, claims: dict = Depends(verify_session_token)):
-    resolved_org_id = await _resolve_read_org_id(claims, org_id)
-    rows = await pg_query_all(
-        """
-        SELECT
-            gc.id,
-            gc.provider,
-            gc.email,
-            gc.scopes,
-            gc.token_expiry,
-            gc.status,
-            gc.watch_history_id,
-            gc.watch_expiration,
-            gc.watch_status,
-            gc.watch_started_at,
-            gc.watch_last_notification_at,
-            gc.watch_error,
-            gc.last_sync_at,
-            gc.last_error,
-            gc.created_at,
-            gc.updated_at,
-            clients.email AS connected_by_email,
-            COALESCE(msgs.support_message_count, 0)::int AS support_message_count,
-            msgs.last_message_received_at
-        FROM gmail_connections gc
-        LEFT JOIN clients ON clients.id = gc.connected_by
-        LEFT JOIN LATERAL (
-            SELECT
-                COUNT(*)::int AS support_message_count,
-                MAX(received_at) AS last_message_received_at
-            FROM support_messages sm
-            WHERE sm.gmail_connection_id = gc.id
-        ) msgs ON TRUE
-        WHERE gc.org_id = $1
-        ORDER BY gc.updated_at DESC, gc.created_at DESC
-        """,
-        resolved_org_id,
-    )
-    connections = [_gmail_connection_row(row) for row in rows]
-    return {
-        "configured": _gmail_oauth_configured(),
-        "connected": any(row["status"] == "connected" for row in connections),
-        "connections": connections,
-        "scopes_required": GMAIL_READONLY_SCOPES,
-    }
 
 
-@router.get("/integrations/gmail/connect")
-async def gmail_connect(request: Request, org_id: int | None = None, claims: dict = Depends(verify_session_token)):
-    if claims.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Only admins can connect Gmail")
-    if not _gmail_oauth_configured():
-        raise HTTPException(status_code=503, detail="Google OAuth is not configured yet")
-
-    resolved_org_id = await _resolve_read_org_id(claims, org_id)
-    redirect_uri = _gmail_redirect_uri(request)
-    params = {
-        "client_id": settings.google_oauth_client_id,
-        "redirect_uri": redirect_uri,
-        "response_type": "code",
-        "scope": " ".join(GMAIL_READONLY_SCOPES),
-        "access_type": "offline",
-        "prompt": "consent",
-        "state": _build_gmail_state(claims, resolved_org_id),
-    }
-    return {
-        "auth_url": f"{GOOGLE_OAUTH_AUTHORIZE_URL}?{urlencode(params)}",
-        "redirect_uri": redirect_uri,
-        "scopes": GMAIL_READONLY_SCOPES,
-    }
 
 
-@router.get("/integrations/gmail/callback", name="gmail_oauth_callback")
-async def gmail_oauth_callback(request: Request, code: str | None = None, state: str | None = None, error: str | None = None):
-    if error:
-        return RedirectResponse(_dashboard_redirect_url("error", error))
-    if not code or not state:
-        return RedirectResponse(_dashboard_redirect_url("error", "Missing Google OAuth callback code or state"))
-    if not _gmail_oauth_configured():
-        return RedirectResponse(_dashboard_redirect_url("error", "Google OAuth is not configured yet"))
-
-    try:
-        state_claims = _decode_gmail_state(state)
-    except HTTPException as exc:
-        return RedirectResponse(_dashboard_redirect_url("error", str(exc.detail)))
-
-    redirect_uri = _gmail_redirect_uri(request)
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            token_response = await client.post(
-                GOOGLE_OAUTH_TOKEN_URL,
-                data={
-                    "code": code,
-                    "client_id": settings.google_oauth_client_id,
-                    "client_secret": settings.google_oauth_client_secret,
-                    "redirect_uri": redirect_uri,
-                    "grant_type": "authorization_code",
-                },
-            )
-            token_response.raise_for_status()
-            token_data = token_response.json()
-
-            access_token = token_data.get("access_token")
-            if not access_token:
-                return RedirectResponse(_dashboard_redirect_url("error", "Google did not return an access token"))
-
-            profile_response = await client.get(
-                GOOGLE_GMAIL_PROFILE_URL,
-                headers={"Authorization": f"Bearer {access_token}"},
-            )
-            profile_response.raise_for_status()
-            profile = profile_response.json()
-    except httpx.HTTPStatusError as exc:
-        detail = exc.response.text[:140] if exc.response is not None else str(exc)
-        return RedirectResponse(_dashboard_redirect_url("error", detail))
-    except httpx.HTTPError as exc:
-        return RedirectResponse(_dashboard_redirect_url("error", str(exc)))
-
-    mailbox = (profile.get("emailAddress") or state_claims.get("email") or "").strip().lower()
-    if not mailbox:
-        return RedirectResponse(_dashboard_redirect_url("error", "Could not identify connected Gmail mailbox"))
-
-    expires_in = token_data.get("expires_in")
-    token_expiry = None
-    if expires_in is not None:
-        try:
-            token_expiry = datetime.now(timezone.utc) + timedelta(seconds=int(expires_in))
-        except (TypeError, ValueError):
-            token_expiry = None
-
-    scopes = (token_data.get("scope") or " ".join(GMAIL_READONLY_SCOPES)).split()
-    refresh_token = token_data.get("refresh_token")
-    connected_by = int(state_claims["sub"])
-    org_id = int(state_claims["org_id"])
-
-    await pg_execute(
-        """
-        INSERT INTO gmail_connections (
-            org_id,
-            connected_by,
-            provider,
-            email,
-            scopes,
-            access_token,
-            refresh_token,
-            token_expiry,
-            status,
-            last_error
-        )
-        VALUES ($1, $2, 'google', $3, $4::jsonb, $5, $6, $7, 'connected', NULL)
-        ON CONFLICT (org_id, provider, email)
-        DO UPDATE SET
-            connected_by = EXCLUDED.connected_by,
-            scopes = EXCLUDED.scopes,
-            access_token = EXCLUDED.access_token,
-            refresh_token = COALESCE(EXCLUDED.refresh_token, gmail_connections.refresh_token),
-            token_expiry = EXCLUDED.token_expiry,
-            status = 'connected',
-            last_error = NULL,
-            updated_at = NOW()
-        """,
-        org_id,
-        connected_by,
-        mailbox,
-        json.dumps(scopes),
-        access_token,
-        refresh_token,
-        token_expiry,
-    )
-
-    return RedirectResponse(_dashboard_redirect_url("connected", mailbox))
 
 
-@router.post("/integrations/gmail/watch/start")
-async def gmail_start_watch(payload: GmailWatchStartPayload, claims: dict = Depends(verify_session_token)):
-    if claims.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Only admins can start Gmail listener")
-
-    resolved_org_id = await _resolve_read_org_id(claims, payload.org_id)
-    connection_id = payload.connection_id
-    if connection_id is None:
-        row = await pg_query_one(
-            """
-            SELECT id
-            FROM gmail_connections
-            WHERE org_id = $1
-              AND provider = 'google'
-              AND status = 'connected'
-            ORDER BY updated_at DESC, created_at DESC
-            LIMIT 1
-            """,
-            resolved_org_id,
-        )
-        if not row:
-            raise HTTPException(status_code=404, detail="No connected Gmail mailbox found")
-        connection_id = row["id"]
-
-    try:
-        watch = await start_gmail_watch(connection_id, resolved_org_id)
-    except GmailIntegrationError as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-    except httpx.HTTPStatusError as exc:
-        detail = exc.response.text[:500] if exc.response is not None else str(exc)
-        await pg_execute(
-            """
-            UPDATE gmail_connections
-            SET watch_status = 'error',
-                watch_error = $3,
-                last_error = $3,
-                updated_at = NOW()
-            WHERE id = $1
-              AND org_id = $2
-            """,
-            connection_id,
-            resolved_org_id,
-            detail,
-        )
-        raise HTTPException(status_code=502, detail=detail)
-    except httpx.HTTPError as exc:
-        detail = str(exc)
-        await pg_execute(
-            """
-            UPDATE gmail_connections
-            SET watch_status = 'error',
-                watch_error = $3,
-                last_error = $3,
-                updated_at = NOW()
-            WHERE id = $1
-              AND org_id = $2
-            """,
-            connection_id,
-            resolved_org_id,
-            detail,
-        )
-        raise HTTPException(status_code=502, detail=detail)
-
-    return {"message": "Gmail realtime listener started", "watch": watch}
 
 
-@router.post("/integrations/gmail/pubsub")
-async def gmail_pubsub_push(request: Request, background: BackgroundTasks):
-    expected_token = (settings.gmail_pubsub_verification_token or "").strip()
-    if expected_token:
-        provided_token = (
-            request.query_params.get("token")
-            or request.headers.get("X-Saaspro-Webhook-Token")
-            or ""
-        ).strip()
-        if provided_token != expected_token:
-            raise HTTPException(status_code=403, detail="Invalid Gmail Pub/Sub token")
-
-    try:
-        payload = await request.json()
-    except Exception:
-        return {"ok": True, "status": "ignored", "reason": "invalid_json"}
-
-    message = payload.get("message") if isinstance(payload, dict) else {}
-    try:
-        decoded = decode_pubsub_data(message.get("data") if isinstance(message, dict) else None)
-    except GmailIntegrationError as exc:
-        await create_notification_log(None, payload if isinstance(payload, dict) else {}, {"error": str(exc)}, "ignored")
-        return {"ok": True, "status": "ignored", "reason": str(exc)}
-
-    email = (decoded.get("emailAddress") or "").strip().lower()
-    history_id = str(decoded.get("historyId") or "").strip()
-    if not email or not history_id:
-        await create_notification_log(None, payload, decoded, "ignored_missing_fields")
-        return {"ok": True, "status": "ignored", "reason": "missing_email_or_history_id"}
-
-    connections = await gmail_connections_for_email(email)
-    if not connections:
-        await create_notification_log(None, payload, decoded, "no_connection")
-        return {"ok": True, "status": "no_connection"}
-
-    for connection in connections:
-        log_id = await create_notification_log(connection, payload, decoded)
-        background.add_task(sync_gmail_history, connection["id"], history_id, log_id)
-
-    return {"ok": True, "status": "queued", "connections": len(connections)}
 
 
-@router.post("/integrations/gmail/disconnect")
-async def gmail_disconnect(payload: GmailDisconnectPayload, claims: dict = Depends(verify_session_token)):
-    if claims.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Only admins can disconnect Gmail")
-
-    if payload.connection_id is None and not payload.email:
-        raise HTTPException(status_code=400, detail="connection_id or email is required")
-
-    email = (payload.email or "").strip().lower() or None
-    row = await pg_query_one(
-        """
-        UPDATE gmail_connections
-        SET status = 'disconnected',
-            access_token = NULL,
-            refresh_token = NULL,
-            last_error = NULL,
-            updated_at = NOW()
-        WHERE org_id = $1
-          AND ($2::int IS NULL OR id = $2::int)
-          AND ($3::text IS NULL OR LOWER(email) = $3::text)
-        RETURNING id, email, status
-        """,
-        claims["org_id"],
-        payload.connection_id,
-        email,
-    )
-    if not row:
-        raise HTTPException(status_code=404, detail="Gmail connection not found")
-
-    return {"message": f"Disconnected {row['email']}", "connection": dict(row)}
 
 
-@router.get("/support/messages")
-async def list_support_messages(
-    org_id: int | None = None,
-    provider: str = "all",
-    status: str = "all",
-    page: int = 1,
-    page_size: int = 25,
-    claims: dict = Depends(verify_session_token),
-):
-    resolved_org_id = await _resolve_read_org_id(claims, org_id)
-    page = max(1, page)
-    page_size = max(1, min(100, page_size))
-    offset = (page - 1) * page_size
-    provider_filter = (provider or "all").strip().lower()
-    status_filter = (status or "all").strip().lower()
-
-    rows = await pg_query_all(
-        """
-        SELECT
-            id,
-            provider,
-            mailbox_email,
-            gmail_message_id,
-            gmail_thread_id,
-            from_email,
-            to_email,
-            subject,
-            snippet,
-            body_text,
-            internal_date,
-            received_at,
-            label_ids,
-            status,
-            created_at,
-            updated_at,
-            COUNT(*) OVER()::int AS total_count
-        FROM support_messages
-        WHERE org_id = $1
-          AND ($2 = 'all' OR provider = $2)
-          AND ($3 = 'all' OR status = $3)
-        ORDER BY COALESCE(received_at, internal_date, created_at) DESC, id DESC
-        LIMIT $4 OFFSET $5
-        """,
-        resolved_org_id,
-        provider_filter,
-        status_filter,
-        page_size,
-        offset,
-    )
-    total = rows[0]["total_count"] if rows else 0
-    return {
-        "messages": [_support_message_row(row) for row in rows],
-        "pagination": {
-            "page": page,
-            "page_size": page_size,
-            "total": total,
-            "total_pages": max(1, (total + page_size - 1) // page_size) if total else 0,
-        },
-    }
 
 
 # ─────────────────────────────────────────────
 # Incoming pre-auth payloads (admin only)
 # ─────────────────────────────────────────────
 
-@router.get("/preauth-payloads")
-async def list_preauth_payloads(claims: dict = Depends(verify_session_token)):
-    if claims["role"] != "admin":
-        raise HTTPException(status_code=403, detail="Only admins can view incoming payloads")
-
-    rows = await pg_query_all(
-        """
-        SELECT request_id, patient_id, status, received_at, raw_payload, extracted_fields
-        FROM preauth_logs
-        WHERE org_id = $1
-        ORDER BY received_at DESC
-        LIMIT 20
-        """,
-        claims["org_id"]
-    )
-
-    return {
-        "payloads": [
-            {
-                "request_id": row["request_id"],
-                "patient_id": row["patient_id"],
-                "status": row["status"],
-                "received_at": row["received_at"],
-                "raw_payload": parse_json_field(row["raw_payload"]) if row["raw_payload"] else None,
-                "extracted_fields": parse_json_field(row["extracted_fields"]) if row["extracted_fields"] else None,
-            }
-            for row in rows
-        ]
-    }
 
 
 @router.get("/preauth-dashboard")
+@limiter.limit(settings.rate_limit_dashboard)
 async def preauth_dashboard(
+    request: Request,
     date_from: date | None = None,
     date_to: date | None = None,
     org_id: int | None = None,
@@ -1684,60 +805,18 @@ async def preauth_dashboard(
     }
 
 
-class AuditEventPayload(BaseModel):
-    event_type: str
-    target_kind: str | None = None
-    target_id: str | None = None
-    metadata: dict | None = None
 
 
-class RetryPreauthPayload(BaseModel):
-    request_id: str
-    org_id: int | None = None
 
 
-class RetryPendingPreauthPayload(BaseModel):
-    org_id: int | None = None
-    date_from: date | None = None
-    date_to: date | None = None
-    q: str | None = None
-    limit: int = 20
 
 
-class SendPreauthDecisionPayload(BaseModel):
-    request_id: str
-    org_id: int | None = None
 
 
-RETRYABLE_PREAUTH_STATUSES = {"pending", "processing", "received", "error"}
 
 
-async def _resolve_mutation_org_id(claims: dict, requested_org_id: int | None = None) -> int:
-    if claims.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Only admins can perform this action")
-    if requested_org_id is None:
-        return claims["org_id"]
-    if requested_org_id != claims["org_id"] and not await is_platform_admin(claims):
-        raise HTTPException(status_code=403, detail="Only platform admins (SaaSPro org) can act on another org")
-    return requested_org_id
 
 
-async def _enqueue_preauth_retry(background: BackgroundTasks, row) -> None:
-    await pg_execute("DELETE FROM agent_logs WHERE request_id = $1", row["request_id"])
-    await pg_execute(
-        """
-        UPDATE preauth_logs
-        SET status = 'pending',
-            agent_step = 'retry_queued',
-            decision = NULL,
-            agent_result = NULL,
-            error_message = NULL,
-            processed_at = NULL
-        WHERE id = $1
-        """,
-        row["id"],
-    )
-    background.add_task(agent.run, str(row["patient_id"]), str(row["request_id"]))
 
 
 def _qa_norm_dec(value: str | None) -> str | None:
@@ -2048,7 +1127,9 @@ def _qa_percentile(values: list[float], p: int) -> float | None:
 
 
 @router.get("/qa/accuracy")
+@limiter.limit(settings.rate_limit_dashboard)
 async def qa_accuracy(
+    request: Request,
     date_from: date | None = None,
     date_to: date | None = None,
     org_id: int | None = None,
@@ -3319,24 +2400,8 @@ async def check_applied_mode_eligibility(
 # Mismatch Review Workflow (SAA-54)
 # ─────────────────────────────────────────────
 
-class CreateMismatchReviewPayload(BaseModel):
-    request_id: str
-    checkin_id: str | None = None
-    mismatch_type: str
-    cause_category: str
-    agent_decision: str | None = None
-    agent_amount: float | None = None
-    aman_decision: str | None = None
-    aman_amount: float | None = None
-    notes: str | None = None
-    follow_up_action: str | None = None
 
 
-class UpdateMismatchReviewPayload(BaseModel):
-    cause_category: str | None = None
-    notes: str | None = None
-    follow_up_action: str | None = None
-    fix_status: str | None = None
 
 
 @router.get("/mismatch-reviews")
@@ -3440,153 +2505,12 @@ async def get_mismatch_categories(
     }
 
 
-@router.post("/preauth/retry")
-async def retry_preauth(payload: RetryPreauthPayload, background: BackgroundTasks, claims: dict = Depends(verify_session_token)):
-    org_id = await _resolve_mutation_org_id(claims, payload.org_id)
-    request_id = payload.request_id.strip()
-    if not request_id:
-        raise HTTPException(status_code=400, detail="request_id is required")
-
-    row = await pg_query_one(
-        """
-        SELECT id, request_id, patient_id, status
-        FROM preauth_logs
-        WHERE org_id = $1 AND request_id = $2
-        """,
-        org_id, request_id,
-    )
-    if not row:
-        raise HTTPException(status_code=404, detail="Pre-auth request not found")
-
-    current_status = (row["status"] or "").lower()
-    if current_status not in RETRYABLE_PREAUTH_STATUSES:
-        raise HTTPException(status_code=409, detail=f"Only pending, processing, received, or error requests can be retried. Current status: {row['status']}")
-
-    await _enqueue_preauth_retry(background, row)
-    return {
-        "status": "queued",
-        "request_id": row["request_id"],
-        "previous_status": row["status"],
-    }
 
 
-@router.post("/preauth/retry-pending")
-async def retry_pending_preauths(payload: RetryPendingPreauthPayload, background: BackgroundTasks, claims: dict = Depends(verify_session_token)):
-    org_id = await _resolve_mutation_org_id(claims, payload.org_id)
-    if payload.date_from and payload.date_to and payload.date_from > payload.date_to:
-        raise HTTPException(status_code=400, detail="Start date cannot be after end date")
-
-    safe_limit = min(max(payload.limit, 1), 20)
-    date_from_start = datetime.combine(payload.date_from, time.min) if payload.date_from else None
-    date_to_end = datetime.combine(payload.date_to + timedelta(days=1), time.min) if payload.date_to else None
-    search_q = payload.q.strip() if payload.q and payload.q.strip() else None
-    search_pattern = f"%{search_q}%" if search_q else None
-
-    rows = await pg_query_all(
-        """
-        SELECT id, request_id, patient_id, status
-        FROM preauth_logs
-        WHERE org_id = $1
-          AND LOWER(status) = ANY($2::text[])
-          AND ($3::timestamp IS NULL OR received_at >= $3::timestamp)
-          AND ($4::timestamp IS NULL OR received_at < $4::timestamp)
-          AND ($5::text IS NULL OR (
-                patient_id ILIKE $5
-                OR request_id ILIKE $5
-                OR COALESCE(decision, '') ILIKE $5
-                OR raw_payload::text ILIKE $5
-          ))
-        ORDER BY received_at DESC
-        LIMIT $6
-        """,
-        org_id,
-        sorted(RETRYABLE_PREAUTH_STATUSES),
-        date_from_start,
-        date_to_end,
-        search_pattern,
-        safe_limit,
-    )
-
-    for row in rows:
-        await _enqueue_preauth_retry(background, row)
-
-    return {
-        "status": "queued",
-        "queued_count": len(rows),
-        "limit": safe_limit,
-        "request_ids": [row["request_id"] for row in rows],
-    }
 
 
-@router.post("/preauth/send-decision")
-async def send_preauth_decision(payload: SendPreauthDecisionPayload, claims: dict = Depends(verify_session_token)):
-    org_id = await _resolve_mutation_org_id(claims, payload.org_id)
-    request_id = payload.request_id.strip()
-    if not request_id:
-        raise HTTPException(status_code=400, detail="request_id is required")
-
-    row = await pg_query_one(
-        """
-        SELECT id, request_id, decision, agent_result, processed_at
-        FROM preauth_logs
-        WHERE org_id = $1 AND request_id = $2
-        """,
-        org_id, request_id,
-    )
-    if not row:
-        raise HTTPException(status_code=404, detail="Pre-auth request not found")
-    if not row["processed_at"] or not row["decision"] or not row["agent_result"]:
-        raise HTTPException(status_code=409, detail="No completed agent decision is available to send yet")
-
-    from services.aman_callback import send_decision_to_aman
-
-    result = await send_decision_to_aman(str(row["request_id"]), force=True)
-    updated = await pg_query_one(
-        """
-        SELECT callback_status, callback_http_status, callback_sent_at, callback_error
-        FROM preauth_logs
-        WHERE id = $1
-        """,
-        row["id"],
-    )
-    return {
-        "request_id": row["request_id"],
-        "result": result,
-        "callback": {
-            "status": updated["callback_status"] if updated else result.get("status"),
-            "http_status": updated["callback_http_status"] if updated else result.get("http_status"),
-            "sent_at": updated["callback_sent_at"] if updated else None,
-            "error": updated["callback_error"] if updated else result.get("error"),
-        },
-    }
 
 
-@router.post("/audit/log-event")
-async def log_audit_event(payload: AuditEventPayload, claims: dict = Depends(verify_session_token)):
-    """Append-only record of compliance-sensitive UI actions.
-
-    The client posts here when an operator does something we want a trail for
-    (PDF export, drill-in view, override, etc.). Org-scoped via the JWT — a
-    client can't write an event into a different org's audit log.
-    """
-    org_id = _dashboard_org_id(claims)
-    try:
-        user_id = int(claims["sub"])
-    except (KeyError, TypeError, ValueError):
-        user_id = None
-    user_email = claims.get("email")
-    await pg_execute(
-        """
-        INSERT INTO audit_events (org_id, user_id, user_email, event_type, target_kind, target_id, metadata)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        """,
-        org_id, user_id, user_email,
-        payload.event_type[:50],
-        (payload.target_kind or None) and payload.target_kind[:50],
-        (payload.target_id or None) and payload.target_id[:200],
-        json.dumps(payload.metadata or {}),
-    )
-    return {"status": "logged"}
 
 
 @router.get("/audit/events")
@@ -4816,9 +3740,6 @@ async def onboarding_create_org(payload: CreateOrgPayload, claims: dict = Depend
     }
 
 
-class UpdateOrgPayload(BaseModel):
-    name: str | None = None
-    is_active: bool | None = None
 
 
 @router.patch("/onboarding/orgs/{org_id}")
@@ -4887,63 +3808,8 @@ async def me(claims: dict = Depends(verify_session_token)):
 # PA Comments / Feedback
 # ─────────────────────────────────────────────
 
-class AddPACommentPayload(BaseModel):
-    request_id: str
-    comment_text: str
-    org_id: int | None = None
 
 
-@router.post("/pa-comments")
-async def add_pa_comment(payload: AddPACommentPayload, claims: dict = Depends(verify_session_token)):
-    """Add a comment/feedback to a pre-auth request."""
-    org_id = await _resolve_read_org_id(claims, payload.org_id)
-    request_id = payload.request_id.strip()
-    comment_text = payload.comment_text.strip()
-
-    if not request_id:
-        raise HTTPException(status_code=400, detail="request_id is required")
-    if not comment_text:
-        raise HTTPException(status_code=400, detail="comment_text is required")
-
-    # Verify the PA exists and belongs to this org
-    pa = await pg_query_one(
-        "SELECT id FROM preauth_logs WHERE org_id = $1 AND request_id = $2",
-        org_id, request_id
-    )
-    if not pa:
-        raise HTTPException(status_code=404, detail="Pre-auth request not found")
-
-    # Get user info
-    user_id = int(claims["sub"])
-    user = await pg_query_one(
-        "SELECT name, email FROM clients WHERE id = $1",
-        user_id
-    )
-
-    # Insert comment
-    row = await pg_query_one(
-        """
-        INSERT INTO pa_comments (org_id, request_id, user_id, user_email, user_name, comment_text)
-        VALUES ($1, $2, $3, $4, $5, $6)
-        RETURNING id, created_at
-        """,
-        org_id,
-        request_id,
-        user_id,
-        user["email"] if user else claims.get("email"),
-        user["name"] if user else None,
-        comment_text
-    )
-
-    return {
-        "id": row["id"],
-        "org_id": org_id,
-        "request_id": request_id,
-        "user_name": user["name"] if user else None,
-        "user_email": user["email"] if user else claims.get("email"),
-        "comment_text": comment_text,
-        "created_at": row["created_at"].isoformat() if row["created_at"] else None,
-    }
 
 
 async def _list_pa_comments_response(request_id: str, claims: dict, org_id: int | None = None):
