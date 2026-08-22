@@ -957,9 +957,17 @@ def _normalize_clinical_review(pa: dict, retrieval: dict, result: dict) -> dict:
                 (row for row_key, row in assessment_by_item.items() if row_key[1] == key[1]),
                 {},
             )
+        candidates = evidence_row.get("diagnosis_candidates", [])
+        candidate_by_code = {
+            str(candidate.get("diagnosis_code") or "").upper(): candidate
+            for candidate in candidates if isinstance(candidate, dict)
+        }
+        selected_code = str(raw.get("diagnosis_code") or "").upper()
+        selected_candidate = candidate_by_code.get(selected_code)
+        selected_resolved = bool(selected_candidate and selected_candidate.get("resolved"))
         available = {
             evidence["section_id"]: evidence
-            for evidence in evidence_row.get("evidence", [])
+            for evidence in (selected_candidate or {}).get("evidence", [])
             if isinstance(evidence, dict) and evidence.get("section_id")
         }
         requested_ids = raw.get("evidence_section_ids") if isinstance(raw.get("evidence_section_ids"), list) else []
@@ -967,8 +975,14 @@ def _normalize_clinical_review(pa: dict, retrieval: dict, result: dict) -> dict:
         status = str(raw.get("clinical_status") or "INSUFFICIENT_INFORMATION").upper()
         if status not in allowed_statuses:
             status = "UNCLEAR"
-        if not references and status in {"SUPPORTED", "NOT_SUPPORTED"}:
+        if not selected_resolved or (not references and status in {"SUPPORTED", "NOT_SUPPORTED"}):
             status = "INSUFFICIENT_INFORMATION"
+        linked_diagnosis = None
+        if selected_candidate:
+            linked_diagnosis = {
+                "code": selected_candidate.get("diagnosis_code"),
+                "description": selected_candidate.get("diagnosis_description"),
+            }
         assessments.append({
             "claim_item_id": _item_id(item),
             "item_name": _item_name(item),
@@ -977,6 +991,7 @@ def _normalize_clinical_review(pa: dict, retrieval: dict, result: dict) -> dict:
             "missing_information": raw.get("missing_information") if isinstance(raw.get("missing_information"), list) else [],
             "confidence": str(raw.get("confidence") or "LOW").upper(),
             "references": references,
+            "linked_diagnosis": linked_diagnosis,
             "guideline": "NHIA Book 3",
         })
 
@@ -987,6 +1002,7 @@ def _normalize_clinical_review(pa: dict, retrieval: dict, result: dict) -> dict:
         "affects_decision": True,
         "document_id": retrieval.get("document_id"),
         "diagnoses": retrieval.get("diagnoses", []),
+        "resolved_diagnoses": retrieval.get("resolved_diagnoses", []),
         "summary": dict(counts),
         "item_assessments": assessments,
         "__model_usage": result.get("__model_usage"),
@@ -1021,15 +1037,25 @@ async def agent_nhia_clinical_review(pa: dict) -> dict:
 
     item_queries = []
     for item in evidence_rows:
-        section_ids = [
-            evidence.get("section_id")
-            for evidence in item.get("evidence", [])
-            if isinstance(evidence, dict) and evidence.get("section_id") in evidence_catalog
-        ]
+        diagnosis_candidates = []
+        for candidate in item.get("diagnosis_candidates", []):
+            if not isinstance(candidate, dict):
+                continue
+            section_ids = [
+                evidence.get("section_id")
+                for evidence in candidate.get("evidence", [])
+                if isinstance(evidence, dict) and evidence.get("section_id") in evidence_catalog
+            ]
+            diagnosis_candidates.append({
+                "diagnosis_code": candidate.get("diagnosis_code"),
+                "diagnosis_description": candidate.get("diagnosis_description"),
+                "resolved": candidate.get("resolved"),
+                "candidate_section_ids": section_ids,
+            })
         item_queries.append({
             "claim_item_id": item.get("claim_item_id"),
             "item_name": item.get("item_name"),
-            "candidate_section_ids": section_ids,
+            "diagnosis_candidates": diagnosis_candidates,
         })
 
     if not item_queries:
@@ -1046,6 +1072,7 @@ patient context is inadequate, use UNCLEAR or INSUFFICIENT_INFORMATION. This is 
 diagnosis. Return only strict JSON."""
     patient_context = {
         "diagnoses": retrieval.get("diagnoses", []),
+        "resolved_diagnoses": retrieval.get("resolved_diagnoses", []),
         "age": pa.get("age"),
         "gender": pa.get("gender"),
         "care_type": pa.get("care_type"),
@@ -1065,14 +1092,17 @@ NHIA EVIDENCE CATALOG:
 {json.dumps(list(evidence_catalog.values()), indent=2)}
 
 Rules:
-1. Use only evidence IDs listed for that line item.
-2. SUPPORTED means the evidence affirmatively supports the service for the supplied clinical context.
-3. NOT_SUPPORTED requires explicit contrary evidence; absence from retrieved text is not enough.
-4. Use UNCLEAR for conflicting/ambiguous evidence and INSUFFICIENT_INFORMATION when clinical details are missing.
-5. Cite at least one evidence_section_id for SUPPORTED or NOT_SUPPORTED.
-6. The cited evidence must directly support the requested service. A matching condition/history section alone
+1. Select exactly one supplied, resolved diagnosis for each line item and return its exact diagnosis_code.
+2. Use only evidence IDs listed inside that selected diagnosis candidate group. Evidence from another diagnosis
+   is invalid even if it appears elsewhere in the catalog.
+3. SUPPORTED means the evidence affirmatively supports the service for the supplied clinical context.
+4. NOT_SUPPORTED requires explicit contrary evidence; absence from retrieved text is not enough.
+5. If no diagnosis has a clear relationship to the line, or a diagnosis code is unresolved, use UNCLEAR or
+   INSUFFICIENT_INFORMATION; never guess the association.
+6. Cite at least one evidence_section_id for SUPPORTED or NOT_SUPPORTED.
+7. The cited evidence must directly support the requested service. A matching condition/history section alone
    cannot support an investigation, drug, procedure, or treatment claim.
-7. Your structured assessment will be combined with coverage and utilization by deterministic production rules.
+8. Your structured assessment will be combined with coverage and utilization by deterministic production rules.
 
 Return only:
 {{
@@ -1080,6 +1110,8 @@ Return only:
     {{
       "claim_item_id": number or string or null,
       "item_name": "exact item name",
+      "diagnosis_code": "exact selected code from a diagnosis candidate",
+      "diagnosis_description": "exact supplied description or null",
       "clinical_status": "SUPPORTED" or "NOT_SUPPORTED" or "UNCLEAR" or "INSUFFICIENT_INFORMATION",
       "rationale": "one concise evidence-based sentence",
       "missing_information": ["specific missing clinical facts"],

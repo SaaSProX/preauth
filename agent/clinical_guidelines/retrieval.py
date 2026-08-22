@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 import math
 import re
@@ -11,6 +12,7 @@ from pathlib import Path
 
 
 GUIDELINE_PATH = Path(__file__).with_name("nhia_book3") / "clinical_sections.jsonl"
+ICD_CODES_PATH = Path(__file__).with_name("icd10cm") / "icd10cm-codes-2026.txt.gz"
 TOKEN_RE = re.compile(r"[a-z0-9]+")
 STOP_WORDS = {
     "and", "are", "for", "from", "has", "have", "into", "item", "items",
@@ -113,6 +115,45 @@ def _diagnosis_values(pa: dict) -> list[str]:
     return [str(value).strip() for value in diagnosis if str(value or "").strip()]
 
 
+@lru_cache(maxsize=1)
+def load_icd_descriptions() -> dict[str, str]:
+    """Load the pinned official FY2026 ICD-10-CM short code descriptions."""
+    descriptions: dict[str, str] = {}
+    with gzip.open(ICD_CODES_PATH, mode="rt", encoding="utf-8") as handle:
+        for line in handle:
+            parts = line.strip().split(maxsplit=1)
+            if len(parts) == 2:
+                descriptions[parts[0].upper()] = parts[1].strip()
+    return descriptions
+
+
+def _extract_icd_code(value: str) -> tuple[str, str] | None:
+    match = re.search(r"\b([A-TV-Z]\d{2}(?:\.?[A-Z0-9]{1,4})?)\b", value.upper())
+    if not match:
+        return None
+    code_key = match.group(1).replace(".", "")
+    code = f"{code_key[:3]}.{code_key[3:]}" if len(code_key) > 3 else code_key
+    return code, code_key
+
+
+def resolve_diagnoses(pa: dict) -> list[dict]:
+    descriptions = load_icd_descriptions()
+    resolved = []
+    for raw in _diagnosis_values(pa):
+        parsed = _extract_icd_code(raw)
+        code, code_key = parsed if parsed else (raw.upper(), "")
+        description = descriptions.get(code_key)
+        resolved.append({
+            "raw": raw,
+            "code": code,
+            "code_key": code_key or None,
+            "description": description,
+            "resolved": bool(description),
+            "source": "CDC ICD-10-CM FY2026" if description else None,
+        })
+    return resolved
+
+
 def _icd_chapter_hints(diagnoses: list[str]) -> set[int]:
     chapters: set[int] = set()
     for diagnosis in diagnoses:
@@ -150,6 +191,7 @@ class GuidelineIndex:
         query: str,
         *,
         chapter_hints: set[int] | None = None,
+        restrict_chapters: bool = False,
         limit: int = 6,
     ) -> list[dict]:
         query_terms = Counter(_tokens(query))
@@ -162,6 +204,8 @@ class GuidelineIndex:
         scored = []
         k1, b = 1.5, 0.75
         for document, frequency, length in self.documents:
+            if restrict_chapters and chapter_hints and document.get("chapter_number") not in chapter_hints:
+                continue
             score = 0.0
             for term, query_count in query_terms.items():
                 tf = frequency.get(term, 0)
@@ -211,6 +255,7 @@ def get_guideline_index() -> GuidelineIndex:
 
 def retrieve_guidance_for_pa(pa: dict, *, per_item_limit: int = 6) -> dict:
     diagnoses = _diagnosis_values(pa)
+    resolved_diagnoses = resolve_diagnoses(pa)
     chapter_hints = _icd_chapter_hints(diagnoses)
     clinical_context = " ".join(str(pa.get(key) or "") for key in (
         "presenting_complaint", "clinical_notes", "symptoms", "care_category", "checkin_type",
@@ -220,15 +265,39 @@ def retrieve_guidance_for_pa(pa: dict, *, per_item_limit: int = 6) -> dict:
     item_evidence = []
     for item in items:
         name = _item_name(item)
-        query = " ".join((*diagnoses, clinical_context, name))
+        diagnosis_candidates = []
+        flattened_evidence = []
+        for diagnosis in resolved_diagnoses:
+            evidence = []
+            if diagnosis["resolved"]:
+                query = " ".join(filter(None, (
+                    diagnosis["code"], diagnosis["description"], clinical_context, name,
+                )))
+                evidence = index.search(
+                    query,
+                    chapter_hints=_icd_chapter_hints([diagnosis["code"]]),
+                    restrict_chapters=True,
+                    limit=per_item_limit,
+                )
+                evidence = [dict(row, diagnosis_code=diagnosis["code"],
+                                 diagnosis_description=diagnosis["description"]) for row in evidence]
+                flattened_evidence.extend(evidence)
+            diagnosis_candidates.append({
+                "diagnosis_code": diagnosis["code"],
+                "diagnosis_description": diagnosis["description"],
+                "resolved": diagnosis["resolved"],
+                "evidence": evidence,
+            })
         item_evidence.append({
             "claim_item_id": _item_id(item),
             "item_name": name,
-            "evidence": index.search(query, chapter_hints=chapter_hints, limit=per_item_limit),
+            "diagnosis_candidates": diagnosis_candidates,
+            "evidence": flattened_evidence,
         })
     return {
         "document_id": "nhia-book-3-2025",
         "diagnoses": diagnoses,
+        "resolved_diagnoses": resolved_diagnoses,
         "icd_chapter_hints": sorted(chapter_hints),
         "item_evidence": item_evidence,
     }
