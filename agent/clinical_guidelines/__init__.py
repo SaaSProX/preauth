@@ -1,4 +1,4 @@
-"""Clinical guideline retrieval and shadow-review support."""
+"""Clinical guideline retrieval and production-review support."""
 
 from .retrieval import retrieve_guidance_for_pa
 

@@ -35,9 +35,8 @@ class Settings(BaseSettings):
     # Agent control — set to false to pause automated decisions during stabilization.
     agent_enabled: bool = False
 
-    # NHIA Book 3 clinical review. Shadow mode records clinical evidence and
-    # assessments but cannot alter PA recommendations.
-    nhia_clinical_shadow_enabled: bool = True
+    # NHIA Book 3 clinical review contributes to production line decisions.
+    nhia_clinical_review_enabled: bool = True
 
     # Applied mode guardrails (SAA-61)
     # When applied_mode_enabled is True, decisions within guardrails are enforced.
@@ -102,7 +101,7 @@ class Settings(BaseSettings):
     @field_validator(
         "aman_callback_enabled",
         "agent_enabled",
-        "nhia_clinical_shadow_enabled",
+        "nhia_clinical_review_enabled",
         mode="before",
     )
     @classmethod

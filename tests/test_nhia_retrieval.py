@@ -59,17 +59,35 @@ class NHIARetrievalTests(unittest.TestCase):
         references = normalized["item_assessments"][0]["references"]
         self.assertEqual([reference["section_id"] for reference in references], [valid_id])
 
-    def test_shadow_attachment_does_not_change_insurance_decision(self):
+    def test_supported_review_keeps_approval_and_adds_rationale(self):
         decisions = [{"claim_item_id": 5, "item_name": "FBC", "decision": "APPROVE"}]
-        agent._attach_clinical_review(decisions, {"item_assessments": [{
+        agent._apply_clinical_review(decisions, {"item_assessments": [{
             "claim_item_id": 5,
             "item_name": "FBC",
-            "clinical_status": "UNCLEAR",
-            "shadow_only": True,
-            "references": [],
+            "clinical_status": "SUPPORTED",
+            "rationale": "FBC is listed as an investigation.",
+            "references": [{"chapter": "Respiratory System Conditions", "printed_page": 260}],
         }]})
         self.assertEqual(decisions[0]["decision"], "APPROVE")
-        self.assertEqual(decisions[0]["nhia_clinical_review"]["clinical_status"], "UNCLEAR")
+        self.assertIn("NHIA Book 3", decisions[0]["reason"])
+
+    def test_not_supported_review_rejects_line(self):
+        decisions = [{"claim_item_id": 6, "item_name": "Unsupported test", "decision": "APPROVE", "recommended_approved_cost": 1000}]
+        agent._apply_clinical_review(decisions, {"item_assessments": [{
+            "claim_item_id": 6, "item_name": "Unsupported test", "clinical_status": "NOT_SUPPORTED",
+            "rationale": "The guideline explicitly advises against this test.", "references": [],
+        }]})
+        self.assertEqual(decisions[0]["decision"], "DENY")
+        self.assertEqual(decisions[0]["recommended_approved_cost"], 0)
+
+    def test_insufficient_information_escalates_approvable_line(self):
+        decisions = [{"claim_item_id": 7, "item_name": "MRI", "decision": "APPROVE", "recommended_approved_cost": 5000}]
+        agent._apply_clinical_review(decisions, {"item_assessments": [{
+            "claim_item_id": 7, "item_name": "MRI", "clinical_status": "INSUFFICIENT_INFORMATION",
+            "rationale": "The indication is not present.", "missing_information": ["clinical indication"], "references": [],
+        }]})
+        self.assertEqual(decisions[0]["decision"], "ESCALATE")
+        self.assertIn("clinical indication", decisions[0]["reason"])
 
 
 if __name__ == "__main__":

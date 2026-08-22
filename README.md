@@ -38,7 +38,7 @@ PreAuth is an intelligent agent that automates the pre-authorization workflow fo
 - **Instant Decisions** — Sub-minute processing vs hours of manual review
 - **Configurable Rules** — Each HMO defines their own plans, limits, and exclusions
 - **Full Audit Trail** — Every decision logged with reasoning for compliance
-- **NHIA Clinical Shadow Review** — Line-level clinical evidence from NHIA Book 3 with source-page citations; does not alter insurance decisions while under validation
+- **NHIA Clinical Review** — Line-level medical-appropriateness decisions from NHIA Book 3 with source-page citations and integrated rationales
 - **Escalation Handling** — Edge cases flagged for human review
 - **Multi-HMO Support** — Single deployment, multiple HMO configurations
 
@@ -74,7 +74,7 @@ preauth/
 ├── requirements.txt       # Python deps (FastAPI, asyncpg, anthropic, httpx, …)
 ├── migrate.sql            # Postgres schema — run on prod DB before deploy
 ├── agent/
-│   ├── agent.py           # Eligibility → Coverage → NHIA shadow review → Limits → Decision
+│   ├── agent.py           # Eligibility → Coverage → NHIA clinical review → Limits → Decision
 │   └── clinical_guidelines/ # OCR-derived NHIA Book 3 retrieval artifacts and local search
 ├── auth/
 │   ├── router.py          # All /auth/* endpoints (dashboard, login, onboarding, team, api keys, patient-history, preauth-events)

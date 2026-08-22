@@ -919,7 +919,7 @@ If an item is uncertain, mark that item ESCALATE inside item_results instead of 
 
 
 # ---------------------------------------------------------------------------
-# NHIA CLINICAL REVIEW — SHADOW MODE
+# NHIA CLINICAL REVIEW
 # ---------------------------------------------------------------------------
 def _clinical_item_key(claim_item_id, item_name: str | None = None) -> tuple[str, str]:
     return (
@@ -977,14 +977,14 @@ def _normalize_clinical_review(pa: dict, retrieval: dict, result: dict) -> dict:
             "missing_information": raw.get("missing_information") if isinstance(raw.get("missing_information"), list) else [],
             "confidence": str(raw.get("confidence") or "LOW").upper(),
             "references": references,
-            "shadow_only": True,
+            "guideline": "NHIA Book 3",
         })
 
     counts = Counter(item["clinical_status"] for item in assessments)
     return {
         "enabled": True,
-        "mode": "shadow",
-        "affects_decision": False,
+        "mode": "production",
+        "affects_decision": True,
         "document_id": retrieval.get("document_id"),
         "diagnoses": retrieval.get("diagnoses", []),
         "summary": dict(counts),
@@ -994,7 +994,7 @@ def _normalize_clinical_review(pa: dict, retrieval: dict, result: dict) -> dict:
 
 
 async def agent_nhia_clinical_review(pa: dict) -> dict:
-    if not settings.nhia_clinical_shadow_enabled:
+    if not settings.nhia_clinical_review_enabled:
         return {"enabled": False, "mode": "disabled", "affects_decision": False, "item_assessments": []}
 
     retrieval = retrieve_guidance_for_pa(pa)
@@ -1034,12 +1034,12 @@ async def agent_nhia_clinical_review(pa: dict) -> dict:
 
     if not item_queries:
         return {
-            "enabled": True, "mode": "shadow", "affects_decision": False,
+            "enabled": True, "mode": "production", "affects_decision": True,
             "document_id": retrieval.get("document_id"), "diagnoses": retrieval.get("diagnoses", []),
             "summary": {}, "item_assessments": [],
         }
 
-    system_prompt = """You are the NHIA clinical-guideline shadow reviewer for a health-insurance PA pipeline.
+    system_prompt = """You are the NHIA clinical-guideline reviewer for a health-insurance PA pipeline.
 Assess clinical appropriateness only from the supplied NHIA Book 3 evidence. Do not assess benefit coverage,
 prices, eligibility, waiting periods, or utilization. Never invent a guideline statement. If the evidence or
 patient context is inadequate, use UNCLEAR or INSUFFICIENT_INFORMATION. This is decision support, not a
@@ -1072,7 +1072,7 @@ Rules:
 5. Cite at least one evidence_section_id for SUPPORTED or NOT_SUPPORTED.
 6. The cited evidence must directly support the requested service. A matching condition/history section alone
    cannot support an investigation, drug, procedure, or treatment claim.
-7. Do not let this shadow assessment change the insurance decision.
+7. Your structured assessment will be combined with coverage and utilization by deterministic production rules.
 
 Return only:
 {{
@@ -1092,7 +1092,7 @@ Return only:
         result = await _call_claude(system_prompt, user_message, max_tokens=5000)
         return _normalize_clinical_review(pa, retrieval, result)
     except Exception as exc:
-        logger.warning("nhia_clinical_shadow_failed", error=str(exc))
+        logger.warning("nhia_clinical_review_failed", error=str(exc))
         fallback = {"item_assessments": []}
         normalized = _normalize_clinical_review(pa, retrieval, fallback)
         normalized["status"] = "unavailable"
@@ -1100,7 +1100,17 @@ Return only:
         return normalized
 
 
-def _attach_clinical_review(item_decisions: list[dict], clinical_review: dict) -> None:
+def _clinical_reference_text(assessment: dict) -> str:
+    references = assessment.get("references") if isinstance(assessment.get("references"), list) else []
+    if not references:
+        return ""
+    reference = references[0]
+    chapter = reference.get("chapter") or "clinical guideline"
+    page = reference.get("printed_page") or reference.get("pdf_page")
+    return f"NHIA Book 3, {chapter}, page {page}"
+
+
+def _apply_clinical_review(item_decisions: list[dict], clinical_review: dict) -> None:
     assessments = clinical_review.get("item_assessments") if isinstance(clinical_review, dict) else []
     by_key = {
         _clinical_item_key(item.get("claim_item_id"), item.get("item_name")): item
@@ -1114,6 +1124,34 @@ def _attach_clinical_review(item_decisions: list[dict], clinical_review: dict) -
             assessment = next((row for row_key, row in by_key.items() if row_key[1] == key[1]), None)
         if assessment is not None:
             item["nhia_clinical_review"] = assessment
+            status = str(assessment.get("clinical_status") or "INSUFFICIENT_INFORMATION").upper()
+            rationale = str(assessment.get("rationale") or "Clinical appropriateness could not be established.").strip()
+            reference_text = _clinical_reference_text(assessment)
+            clinical_reason = f"Clinical review: {rationale}"
+            if reference_text:
+                clinical_reason += f" ({reference_text})."
+            elif not clinical_reason.endswith("."):
+                clinical_reason += "."
+
+            current_decision = str(item.get("decision") or "").upper()
+            if status == "NOT_SUPPORTED":
+                item["decision"] = "DENY"
+                item["recommendation"] = "reject"
+                item["recommended_approved_cost"] = 0
+                item["reason"] = clinical_reason
+                item["clinical_decision_applied"] = True
+            elif status in {"UNCLEAR", "INSUFFICIENT_INFORMATION"} and current_decision == "APPROVE":
+                item["decision"] = "ESCALATE"
+                item["recommendation"] = "review"
+                item["recommended_approved_cost"] = 0
+                missing = assessment.get("missing_information") if isinstance(assessment.get("missing_information"), list) else []
+                missing_text = f" Missing information: {'; '.join(str(value) for value in missing)}." if missing else ""
+                item["reason"] = clinical_reason + missing_text
+                item["clinical_decision_applied"] = True
+            elif status == "SUPPORTED":
+                existing_reason = str(item.get("reason") or "").strip()
+                item["reason"] = f"{clinical_reason} {existing_reason}".strip()
+                item["clinical_decision_applied"] = True
 
 
 # ---------------------------------------------------------------------------
@@ -1528,7 +1566,7 @@ def _summarize_item_utilization(item_decisions: list[dict], fallback_reason: str
         reason = fallback_reason or "One or more items require human review."
     elif denied:
         passed = False
-        reason = "One or more items failed coverage or utilization checks."
+        reason = "One or more items failed clinical, coverage, or utilization checks."
     else:
         passed = True
         reason = "All items passed coverage and utilization checks."
@@ -1603,9 +1641,9 @@ def _build_final_decision_from_items(pa: dict, agent1: dict, agent2: dict, agent
     elif denied:
         decision = "DENY"
         confidence = "HIGH"
-        denial_reason = "All requested line items failed coverage or utilization checks."
+        denial_reason = "All requested line items failed clinical, coverage, or utilization checks."
         escalation_reason = None
-        reasoning = "All requested line items failed coverage or utilization checks."
+        reasoning = "All requested line items failed clinical, coverage, or utilization checks."
     else:
         decision = "APPROVE"
         confidence = "HIGH"
@@ -1860,16 +1898,13 @@ async def run(patient_id: str, request_id: str):
             }
         await _log_agent(request_id, 2, "Plan & Coverage", result_2)
 
-        # ── NHIA clinical review (shadow only) ───────────────────────────
-        # This result is persisted for audit and dashboard display, but is
-        # intentionally not provided to coverage/utilization/final decision
-        # logic while the feature is being clinically validated.
+        # ── NHIA clinical review ─────────────────────────────────────────
         await pg_execute(
-            "UPDATE preauth_logs SET agent_step = 'nhia_clinical_shadow' WHERE request_id = $1",
+            "UPDATE preauth_logs SET agent_step = 'nhia_clinical_review' WHERE request_id = $1",
             str(request_id)
         )
         clinical_review = await agent_nhia_clinical_review(decision_pa)
-        await _log_agent(request_id, 5, "NHIA Clinical Review (Shadow)", clinical_review)
+        await _log_agent(request_id, 5, "NHIA Clinical Review", clinical_review)
 
         # ── Agent 3: Utilization & Limits ─────────────────────────────────
         await pg_execute(
@@ -1877,7 +1912,10 @@ async def run(patient_id: str, request_id: str):
             str(request_id)
         )
         result_3 = agent_item_utilization(pa, result_2)
-        _attach_clinical_review(result_3.get("item_decisions", []), clinical_review)
+        _apply_clinical_review(result_3.get("item_decisions", []), clinical_review)
+        refreshed_summary = _summarize_item_utilization(result_3.get("item_decisions", []))
+        refreshed_summary["aman_prior_context"] = result_3.get("aman_prior_context") or {}
+        result_3.update(refreshed_summary)
         await _log_agent(request_id, 3, "Item Utilization & Limits", result_3)
 
         # ── Agent 4: Final Decision ───────────────────────────────────────
@@ -1888,7 +1926,7 @@ async def run(patient_id: str, request_id: str):
         result_4 = _build_final_decision_from_items(decision_pa, result_1, result_2, result_3)
         result_4["nhia_clinical_review"] = {
             "mode": clinical_review.get("mode"),
-            "affects_decision": False,
+            "affects_decision": True,
             "summary": clinical_review.get("summary", {}),
         }
         await _log_agent(request_id, 4, "Final Decision", result_4)
