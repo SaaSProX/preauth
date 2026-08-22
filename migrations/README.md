@@ -11,12 +11,12 @@ For existing deployments, run migrations in order:
 psql $DATABASE_URL
 
 # Run migration
-\i migrations/003_add_performance_indexes.sql
+\i migrations/004_add_patient_received_index.sql
 ```
 
 Or via command line:
 ```bash
-psql $DATABASE_URL -f migrations/003_add_performance_indexes.sql
+psql $DATABASE_URL -f migrations/004_add_patient_received_index.sql
 ```
 
 ## Migration Files
@@ -24,6 +24,7 @@ psql $DATABASE_URL -f migrations/003_add_performance_indexes.sql
 | File | Description |
 |------|-------------|
 | `003_add_performance_indexes.sql` | SAA-85: Adds indexes for dashboard and QA query performance |
+| `004_add_patient_received_index.sql` | Composite index for the /auth/patients "latest payload per patient" lookup |
 
 ## New Deployments
 

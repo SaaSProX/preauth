@@ -2749,7 +2749,8 @@ async def patients_list(
             COALESCE(
                 e.latest_payload->'policy'->>'plan_name',
                 e.latest_payload->'policy'->>'insurance_package'
-            ) AS plan
+            ) AS plan,
+            COUNT(*) OVER()::int AS total_count
         FROM enriched e
         WHERE ($4::text IS NULL OR (
             e.patient_id ILIKE $4
@@ -2799,12 +2800,14 @@ async def patients_list(
         ))
     """
 
-    # rows, total_row (pagination count), and window_row (org-wide date span
-    # for the page subtitle) are independent of each other - run concurrently
-    # instead of paying 3 sequential round trips.
-    rows, total_row, window_row = await asyncio.gather(
+    # rows carries its own pagination total via COUNT(*) OVER(), so the
+    # separate count_sql round trip (which re-runs the whole costing CTE) is
+    # only needed when the requested page comes back empty - e.g. offset
+    # past the end of the result set - and the window function has nothing
+    # to count from. window_row (org-wide date span for the page subtitle)
+    # is independent of rows, so it still runs concurrently with it.
+    rows, window_row = await asyncio.gather(
         pg_query_all(base_sql, org_id, date_from_start, date_to_end, search_pattern, page_size, offset),
-        pg_query_one(count_sql, org_id, date_from_start, date_to_end, search_pattern),
         pg_query_one(
             """
             SELECT MIN(received_at) AS earliest, MAX(received_at) AS latest,
@@ -2814,7 +2817,11 @@ async def patients_list(
             org_id,
         ),
     )
-    total = total_row["total"] if total_row else 0
+    if rows:
+        total = rows[0]["total_count"]
+    else:
+        total_row = await pg_query_one(count_sql, org_id, date_from_start, date_to_end, search_pattern)
+        total = total_row["total"] if total_row else 0
 
     return {
         "filters": {
