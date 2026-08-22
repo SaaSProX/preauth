@@ -1,0 +1,22 @@
+{
+  "document_id": "nhia-book-3-2025",
+  "title": "NHIA Standard Treatment Guideline and Referral Protocol - Book 3",
+  "publisher": "National Health Insurance Authority (Nigeria)",
+  "edition_year": 2025,
+  "source_file": "NHIA Book-3.pdf",
+  "source_url": "https://www.nhia.gov.ng/download/nhia-book-3",
+  "source_sha256": "70391d4dabbb9557f1066a6665538a4940ab59494d787f3ac9e004df91575efa",
+  "pdf_pages": 359,
+  "clinical_table_pdf_pages": [
+    39,
+    325
+  ],
+  "ocr_engine": "Apple Vision accurate recognition",
+  "generated_at": "2026-08-22T14:19:11.755470+00:00",
+  "artifacts": {
+    "pages": 359,
+    "clinical_sections": 1613,
+    "condition_index_entries": 228
+  },
+  "safety": "OCR-derived decision support. Verify cited source page; do not treat as autonomous clinical authority."
+}

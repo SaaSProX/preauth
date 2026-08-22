@@ -2,6 +2,7 @@ import asyncio
 import json
 import re
 import time
+from collections import Counter
 from datetime import date
 from anthropic import AsyncAnthropic
 from config.settings import settings
@@ -16,6 +17,7 @@ from agent.knowledge_bases.registry import (
     get_plan_limits_by_plan_code,
 )
 from agent.knowledge_bases.routing import resolve_plan_code, resolve_plan_context
+from agent.clinical_guidelines import retrieve_guidance_for_pa
 
 client = AsyncAnthropic(api_key=settings.anthropic_api_key)
 
@@ -917,6 +919,204 @@ If an item is uncertain, mark that item ESCALATE inside item_results instead of 
 
 
 # ---------------------------------------------------------------------------
+# NHIA CLINICAL REVIEW — SHADOW MODE
+# ---------------------------------------------------------------------------
+def _clinical_item_key(claim_item_id, item_name: str | None = None) -> tuple[str, str]:
+    return (
+        str(claim_item_id) if claim_item_id is not None else "",
+        re.sub(r"[^a-z0-9]+", " ", str(item_name or "").lower()).strip(),
+    )
+
+
+def _normalize_clinical_review(pa: dict, retrieval: dict, result: dict) -> dict:
+    allowed_statuses = {"SUPPORTED", "NOT_SUPPORTED", "UNCLEAR", "INSUFFICIENT_INFORMATION"}
+    evidence_by_item = {
+        _clinical_item_key(item.get("claim_item_id"), item.get("item_name")): item
+        for item in retrieval.get("item_evidence", [])
+        if isinstance(item, dict)
+    }
+    raw_assessments = result.get("item_assessments") if isinstance(result.get("item_assessments"), list) else []
+    assessment_by_item = {
+        _clinical_item_key(item.get("claim_item_id"), item.get("item_name")): item
+        for item in raw_assessments
+        if isinstance(item, dict)
+    }
+
+    assessments = []
+    for item in _current_submission_items(pa):
+        key = _clinical_item_key(_item_id(item), _item_name(item))
+        evidence_row = evidence_by_item.get(key)
+        if evidence_row is None:
+            evidence_row = next(
+                (row for row_key, row in evidence_by_item.items() if row_key[1] == key[1]),
+                {"evidence": []},
+            )
+        raw = assessment_by_item.get(key)
+        if raw is None:
+            raw = next(
+                (row for row_key, row in assessment_by_item.items() if row_key[1] == key[1]),
+                {},
+            )
+        available = {
+            evidence["section_id"]: evidence
+            for evidence in evidence_row.get("evidence", [])
+            if isinstance(evidence, dict) and evidence.get("section_id")
+        }
+        requested_ids = raw.get("evidence_section_ids") if isinstance(raw.get("evidence_section_ids"), list) else []
+        references = [available[section_id] for section_id in requested_ids if section_id in available]
+        status = str(raw.get("clinical_status") or "INSUFFICIENT_INFORMATION").upper()
+        if status not in allowed_statuses:
+            status = "UNCLEAR"
+        if not references and status in {"SUPPORTED", "NOT_SUPPORTED"}:
+            status = "INSUFFICIENT_INFORMATION"
+        assessments.append({
+            "claim_item_id": _item_id(item),
+            "item_name": _item_name(item),
+            "clinical_status": status,
+            "rationale": str(raw.get("rationale") or "No validated NHIA evidence was selected for this line item."),
+            "missing_information": raw.get("missing_information") if isinstance(raw.get("missing_information"), list) else [],
+            "confidence": str(raw.get("confidence") or "LOW").upper(),
+            "references": references,
+            "shadow_only": True,
+        })
+
+    counts = Counter(item["clinical_status"] for item in assessments)
+    return {
+        "enabled": True,
+        "mode": "shadow",
+        "affects_decision": False,
+        "document_id": retrieval.get("document_id"),
+        "diagnoses": retrieval.get("diagnoses", []),
+        "summary": dict(counts),
+        "item_assessments": assessments,
+        "__model_usage": result.get("__model_usage"),
+    }
+
+
+async def agent_nhia_clinical_review(pa: dict) -> dict:
+    if not settings.nhia_clinical_shadow_enabled:
+        return {"enabled": False, "mode": "disabled", "affects_decision": False, "item_assessments": []}
+
+    retrieval = retrieve_guidance_for_pa(pa)
+    evidence_catalog = {}
+    evidence_rows = [item for item in retrieval.get("item_evidence", []) if isinstance(item, dict)]
+    # Round-robin selection prevents large PAs from letting the first few
+    # lines consume the entire prompt budget. Duplicated evidence is stored
+    # once and referenced by section ID.
+    max_catalog_sections = 60
+    max_rank = max((len(item.get("evidence", [])) for item in evidence_rows), default=0)
+    for rank in range(max_rank):
+        for item in evidence_rows:
+            candidates = item.get("evidence", [])
+            if rank >= len(candidates):
+                continue
+            evidence = candidates[rank]
+            section_id = evidence.get("section_id") if isinstance(evidence, dict) else None
+            if section_id:
+                evidence_catalog.setdefault(section_id, evidence)
+            if len(evidence_catalog) >= max_catalog_sections:
+                break
+        if len(evidence_catalog) >= max_catalog_sections:
+            break
+
+    item_queries = []
+    for item in evidence_rows:
+        section_ids = [
+            evidence.get("section_id")
+            for evidence in item.get("evidence", [])
+            if isinstance(evidence, dict) and evidence.get("section_id") in evidence_catalog
+        ]
+        item_queries.append({
+            "claim_item_id": item.get("claim_item_id"),
+            "item_name": item.get("item_name"),
+            "candidate_section_ids": section_ids,
+        })
+
+    if not item_queries:
+        return {
+            "enabled": True, "mode": "shadow", "affects_decision": False,
+            "document_id": retrieval.get("document_id"), "diagnoses": retrieval.get("diagnoses", []),
+            "summary": {}, "item_assessments": [],
+        }
+
+    system_prompt = """You are the NHIA clinical-guideline shadow reviewer for a health-insurance PA pipeline.
+Assess clinical appropriateness only from the supplied NHIA Book 3 evidence. Do not assess benefit coverage,
+prices, eligibility, waiting periods, or utilization. Never invent a guideline statement. If the evidence or
+patient context is inadequate, use UNCLEAR or INSUFFICIENT_INFORMATION. This is decision support, not a
+diagnosis. Return only strict JSON."""
+    patient_context = {
+        "diagnoses": retrieval.get("diagnoses", []),
+        "age": pa.get("age"),
+        "gender": pa.get("gender"),
+        "care_type": pa.get("care_type"),
+        "checkin_type": pa.get("checkin_type"),
+        "presenting_complaint": pa.get("presenting_complaint"),
+        "clinical_notes": pa.get("clinical_notes"),
+    }
+    user_message = f"""Review each requested line item against the candidate NHIA evidence.
+
+PATIENT CONTEXT:
+{json.dumps(patient_context, indent=2)}
+
+LINE ITEMS AND ALLOWED EVIDENCE IDS:
+{json.dumps(item_queries, indent=2)}
+
+NHIA EVIDENCE CATALOG:
+{json.dumps(list(evidence_catalog.values()), indent=2)}
+
+Rules:
+1. Use only evidence IDs listed for that line item.
+2. SUPPORTED means the evidence affirmatively supports the service for the supplied clinical context.
+3. NOT_SUPPORTED requires explicit contrary evidence; absence from retrieved text is not enough.
+4. Use UNCLEAR for conflicting/ambiguous evidence and INSUFFICIENT_INFORMATION when clinical details are missing.
+5. Cite at least one evidence_section_id for SUPPORTED or NOT_SUPPORTED.
+6. The cited evidence must directly support the requested service. A matching condition/history section alone
+   cannot support an investigation, drug, procedure, or treatment claim.
+7. Do not let this shadow assessment change the insurance decision.
+
+Return only:
+{{
+  "item_assessments": [
+    {{
+      "claim_item_id": number or string or null,
+      "item_name": "exact item name",
+      "clinical_status": "SUPPORTED" or "NOT_SUPPORTED" or "UNCLEAR" or "INSUFFICIENT_INFORMATION",
+      "rationale": "one concise evidence-based sentence",
+      "missing_information": ["specific missing clinical facts"],
+      "confidence": "HIGH" or "MEDIUM" or "LOW",
+      "evidence_section_ids": ["allowed section id"]
+    }}
+  ]
+}}"""
+    try:
+        result = await _call_claude(system_prompt, user_message, max_tokens=5000)
+        return _normalize_clinical_review(pa, retrieval, result)
+    except Exception as exc:
+        logger.warning("nhia_clinical_shadow_failed", error=str(exc))
+        fallback = {"item_assessments": []}
+        normalized = _normalize_clinical_review(pa, retrieval, fallback)
+        normalized["status"] = "unavailable"
+        normalized["error"] = type(exc).__name__
+        return normalized
+
+
+def _attach_clinical_review(item_decisions: list[dict], clinical_review: dict) -> None:
+    assessments = clinical_review.get("item_assessments") if isinstance(clinical_review, dict) else []
+    by_key = {
+        _clinical_item_key(item.get("claim_item_id"), item.get("item_name")): item
+        for item in assessments
+        if isinstance(item, dict)
+    }
+    for item in item_decisions:
+        key = _clinical_item_key(item.get("claim_item_id"), item.get("item_name"))
+        assessment = by_key.get(key)
+        if assessment is None:
+            assessment = next((row for row_key, row in by_key.items() if row_key[1] == key[1]), None)
+        if assessment is not None:
+            item["nhia_clinical_review"] = assessment
+
+
+# ---------------------------------------------------------------------------
 # AGENT 3 — Utilization & Limits
 # ---------------------------------------------------------------------------
 async def agent_utilization(pa: dict, benefit_category: str) -> dict:
@@ -1660,12 +1860,24 @@ async def run(patient_id: str, request_id: str):
             }
         await _log_agent(request_id, 2, "Plan & Coverage", result_2)
 
+        # ── NHIA clinical review (shadow only) ───────────────────────────
+        # This result is persisted for audit and dashboard display, but is
+        # intentionally not provided to coverage/utilization/final decision
+        # logic while the feature is being clinically validated.
+        await pg_execute(
+            "UPDATE preauth_logs SET agent_step = 'nhia_clinical_shadow' WHERE request_id = $1",
+            str(request_id)
+        )
+        clinical_review = await agent_nhia_clinical_review(decision_pa)
+        await _log_agent(request_id, 5, "NHIA Clinical Review (Shadow)", clinical_review)
+
         # ── Agent 3: Utilization & Limits ─────────────────────────────────
         await pg_execute(
             "UPDATE preauth_logs SET agent_step = 'utilization' WHERE request_id = $1",
             str(request_id)
         )
         result_3 = agent_item_utilization(pa, result_2)
+        _attach_clinical_review(result_3.get("item_decisions", []), clinical_review)
         await _log_agent(request_id, 3, "Item Utilization & Limits", result_3)
 
         # ── Agent 4: Final Decision ───────────────────────────────────────
@@ -1674,11 +1886,17 @@ async def run(patient_id: str, request_id: str):
             str(request_id)
         )
         result_4 = _build_final_decision_from_items(decision_pa, result_1, result_2, result_3)
+        result_4["nhia_clinical_review"] = {
+            "mode": clinical_review.get("mode"),
+            "affects_decision": False,
+            "summary": clinical_review.get("summary", {}),
+        }
         await _log_agent(request_id, 4, "Final Decision", result_4)
 
         await _save_decision(request_id, result_4.get("decision", "ESCALATE"), {
             "agent1": result_1, "agent2": result_2, "agent3": result_3, "agent4": result_4,
             **result_4,
+            "clinical_review": clinical_review,
             "item_decisions": result_3.get("item_decisions", []),
         })
 

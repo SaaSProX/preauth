@@ -87,8 +87,6 @@ router.include_router(preauth_ops_router)
 # uses claims["org_id"] + the explicit platform-admin ?org_id= drill-in instead.
 
 
-
-
 # ─────────────────────────────────────────────
 # Register (via invite link)
 # ─────────────────────────────────────────────

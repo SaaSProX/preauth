@@ -247,6 +247,11 @@ def _dashboard_request(row):
         "raw_payload": raw_payload,
         "extracted_fields": extracted_fields,
         "agent_result": agent_result,
+        "clinical_review": (
+            agent_result.get("clinical_review")
+            if isinstance(agent_result, dict) and isinstance(agent_result.get("clinical_review"), dict)
+            else None
+        ),
         "agent_logs": agent_logs or [],
         "patient_pa_count": (row["patient_pa_count"] if "patient_pa_count" in row.keys() else None),
     }
