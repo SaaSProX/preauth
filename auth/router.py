@@ -1240,7 +1240,10 @@ async def qa_accuracy(
             submitted.extracted_fields                              AS submitted_extracted_fields,
             COALESCE(submitted.occurred_at, submitted.submitted_at, submitted.last_seen_at, submitted.created_at) AS submitted_event_at,
             submitted.created_at                                     AS submitted_webhook_received_at,
-            agentlog.agent_logs                                      AS agent_logs
+            next_sub.next_submitted_at                               AS agentlog_next_submitted_at,
+            (CASE WHEN outcome.raw_payload IS NOT NULL
+                  THEN COALESCE(outcome.occurred_at, outcome.last_seen_at, outcome.created_at) + INTERVAL '5 seconds'
+             END)                                                    AS agentlog_outcome_bound
         FROM preauth_events submitted
         JOIN preauth_logs p ON p.id = submitted.preauth_log_id
         LEFT JOIN LATERAL (
@@ -1290,32 +1293,6 @@ async def qa_accuracy(
             ORDER BY al.logged_at DESC
             LIMIT 1
         ) agent3 ON TRUE
-        LEFT JOIN LATERAL (
-            SELECT COALESCE(
-                jsonb_agg(
-                    jsonb_build_object(
-                        'agent_num', al.agent_num,
-                        'agent_name', al.agent_name,
-                        'status', al.status,
-                        'result', al.result,
-                        'logged_at', al.logged_at
-                    )
-                    ORDER BY al.logged_at, al.agent_num
-                ) FILTER (WHERE al.id IS NOT NULL),
-                '[]'::jsonb
-            ) AS agent_logs
-            FROM agent_logs al
-            WHERE al.request_id = p.request_id
-              AND al.logged_at >= submitted.created_at - INTERVAL '3 minutes'
-              AND (
-                next_sub.next_submitted_at IS NULL
-                OR al.logged_at < next_sub.next_submitted_at
-              )
-              AND (
-                outcome.raw_payload IS NULL
-                OR al.logged_at <= COALESCE(outcome.occurred_at, outcome.last_seen_at, outcome.created_at) + INTERVAL '5 seconds'
-              )
-        ) agentlog ON TRUE
         WHERE submitted.org_id = $1
           AND LOWER(COALESCE(submitted.event_type, '')) = 'pa.submitted'
           AND LOWER(COALESCE(submitted.raw_payload->'meta'->>'source', '')) <> 'manual'
@@ -1350,7 +1327,7 @@ async def qa_accuracy(
             EXTRACT(EPOCH FROM (agent3.logged_at - e.created_at))::float AS agent_latency_s,
             agent3.result AS agent3_result,
             agent3.logged_at AS agent3_logged_at,
-            agent_run.agent_logs AS agent_logs
+            next_sub.next_submitted_at AS agentlog_next_submitted_at
         FROM preauth_events e
         JOIN preauth_logs p ON p.id = e.preauth_log_id
         LEFT JOIN LATERAL (
@@ -1374,28 +1351,6 @@ async def qa_accuracy(
             ORDER BY al.logged_at DESC
             LIMIT 1
         ) agent3 ON TRUE
-        LEFT JOIN LATERAL (
-            SELECT COALESCE(
-                jsonb_agg(
-                    jsonb_build_object(
-                        'agent_num', al.agent_num,
-                        'agent_name', al.agent_name,
-                        'status', al.status,
-                        'result', al.result,
-                        'logged_at', al.logged_at
-                    )
-                    ORDER BY al.logged_at, al.agent_num
-                ) FILTER (WHERE al.id IS NOT NULL),
-                '[]'::jsonb
-            ) AS agent_logs
-            FROM agent_logs al
-            WHERE al.request_id = p.request_id
-              AND al.logged_at >= e.created_at - INTERVAL '3 minutes'
-              AND (
-                next_sub.next_submitted_at IS NULL
-                OR al.logged_at < next_sub.next_submitted_at
-              )
-        ) agent_run ON TRUE
         WHERE e.org_id = $1
           AND LOWER(COALESCE(e.event_type, '')) = 'pa.submitted'
           AND LOWER(COALESCE(e.raw_payload->'meta'->>'source', '')) <> 'manual'
@@ -1689,9 +1644,17 @@ async def qa_accuracy(
         agent_result_obj = _maybe_load(r.get("agent_result")) or {}
         if not isinstance(agent_result_obj, dict):
             agent_result_obj = {}
-        agent_logs = _maybe_load(r.get("agent_logs")) or []
-        if not isinstance(agent_logs, list):
-            agent_logs = []
+        # agent_logs (full per-run history) is display-only - never used in
+        # classification below - so it's hydrated later for just the rows
+        # that survive sorting/truncation instead of for the whole date range.
+        agentlog_since = r.get("submitted_webhook_received_at")
+        agentlog_since = agentlog_since - timedelta(minutes=3) if agentlog_since else None
+        agentlog_hydration_key = (
+            r["request_id"],
+            agentlog_since,
+            r.get("agentlog_next_submitted_at"),
+            r.get("agentlog_outcome_bound"),
+        )
         agent_item_decisions = agent_result_obj.get("item_decisions") if isinstance(agent_result_obj.get("item_decisions"), list) else []
         intake_items_list = _list_of_dicts(intake_payload.get("pa_items"))
 
@@ -1911,7 +1874,8 @@ async def qa_accuracy(
             "items_compare": item_compare,
             "aman_items": aman_items,
             "consumption": aman_consumption,
-            "agent_logs": agent_logs,
+            "agent_logs": [],
+            "_agentlog_key": agentlog_hydration_key,
         })
 
     for r in pending_followup_rows:
@@ -1927,9 +1891,14 @@ async def qa_accuracy(
         agent3_result = _maybe_load(r.get("agent3_result")) or {}
         if not isinstance(agent3_result, dict):
             agent3_result = {}
-        agent_logs = _maybe_load(r.get("agent_logs")) or []
-        if not isinstance(agent_logs, list):
-            agent_logs = []
+        agentlog_since = r.get("submitted_webhook_received_at")
+        agentlog_since = agentlog_since - timedelta(minutes=3) if agentlog_since else None
+        agentlog_hydration_key = (
+            r["request_id"],
+            agentlog_since,
+            r.get("agentlog_next_submitted_at"),
+            None,
+        )
 
         submitted_enrollee = _dict(submitted_payload.get("enrollee"))
         latest_enrollee = _dict(latest_payload.get("enrollee"))
@@ -2045,7 +2014,8 @@ async def qa_accuracy(
             "items_compare": item_compare,
             "aman_items": [],
             "consumption": consumption,
-            "agent_logs": agent_logs,
+            "agent_logs": [],
+            "_agentlog_key": agentlog_hydration_key,
         })
 
     def _blank_value_totals() -> dict:
@@ -2190,6 +2160,48 @@ async def qa_accuracy(
         return int(digits) if digits else 0
 
     enriched_sorted = sorted(enriched, key=lambda r: (_rank(r["bucket"]), -_ts(r.get("submitted_at") or r.get("received_at"))))[:record_limit]
+
+    # agent_logs (full per-run history, display-only) was skipped in the main
+    # scan above - hydrate it now for just the rows that survived sorting and
+    # truncation, reproducing the exact per-row time window each record's
+    # original query would have used.
+    if enriched_sorted:
+        agentlog_rows = await pg_query_all(
+            """
+            SELECT v.idx,
+                   COALESCE(
+                       jsonb_agg(
+                           jsonb_build_object(
+                               'agent_num', al.agent_num,
+                               'agent_name', al.agent_name,
+                               'status', al.status,
+                               'result', al.result,
+                               'logged_at', al.logged_at
+                           )
+                           ORDER BY al.logged_at, al.agent_num
+                       ) FILTER (WHERE al.id IS NOT NULL),
+                       '[]'::jsonb
+                   ) AS agent_logs
+            FROM unnest($1::int[], $2::text[], $3::timestamptz[], $4::timestamptz[], $5::timestamptz[])
+                AS v(idx, request_id, since_ts, next_ts, outcome_bound)
+            LEFT JOIN agent_logs al
+                ON al.request_id = v.request_id
+               AND al.logged_at >= v.since_ts
+               AND (v.next_ts IS NULL OR al.logged_at < v.next_ts)
+               AND (v.outcome_bound IS NULL OR al.logged_at <= v.outcome_bound)
+            GROUP BY v.idx
+            """,
+            list(range(len(enriched_sorted))),
+            [r["_agentlog_key"][0] for r in enriched_sorted],
+            [r["_agentlog_key"][1] for r in enriched_sorted],
+            [r["_agentlog_key"][2] for r in enriched_sorted],
+            [r["_agentlog_key"][3] for r in enriched_sorted],
+        )
+        agentlog_by_idx = {row["idx"]: _list_of_dicts(row["agent_logs"]) for row in agentlog_rows}
+        for i, r in enumerate(enriched_sorted):
+            r["agent_logs"] = agentlog_by_idx.get(i, [])
+    for r in enriched_sorted:
+        r.pop("_agentlog_key", None)
 
     label_from = date_from.strftime("%b %-d") if hasattr(date_from, "strftime") else str(date_from)
     label_to = date_to.strftime("%b %-d, %Y") if hasattr(date_to, "strftime") else str(date_to)
